@@ -1,0 +1,375 @@
+{
+ "description": "emullm dev config -- exercises every schema key offline (no network, no real processes).",
+ "mode": "recruit,mock",
+ "validation_interval_default": "never",
+ "validation_interval": null,
+ "validation_interval_override": null,
+ "subagent_launch": "copilot",
+ "capability_fallback": "stub",
+ "services": {
+  "embeddings": {
+   "fallback": "stub",
+   "description": "Deterministic pseudo-vectors -- never real embeddings."
+  },
+  "images": {
+   "fallback": "error",
+   "description": "Not offered here -- the backend has no image models."
+  },
+  "moderations": {
+   "fallback": "stub",
+   "description": "Never flags unless an agent opts in."
+  },
+  "audio": {
+   "fallback": "stub",
+   "description": "Synthetic/stub audio unless an agent opts in."
+  },
+  "model": "google/gemma-4-31b-it",
+  "models": [
+   "google/gemma-4-31b-it",
+   "openai/gpt-oss-20b",
+   "myself/same"
+  ]
+ },
+ "agents": [
+  {
+   "kind": "agent",
+   "id": "alice",
+   "launch": "subagent",
+   "description": "Auto-configured Copilot worker (spawned only when mode includes 'auto').",
+   "role": "trusted",
+   "command": "copilot",
+   "cwd": "subagents/alice",
+   "services": {
+    "chat": "serve",
+    "embeddings": "stub",
+    "images": {
+     "behavior": "error",
+     "description": "alice does not draw"
+    }
+   },
+   "model": "gpt-5.4"
+  },
+  {
+   "kind": "agent",
+   "id": "bob",
+   "launch": "recruit",
+   "description": "Interactive recruit -- a human-driven Copilot that connects itself.",
+   "role": "trusted",
+   "observe": [
+    "chat"
+   ],
+   "services": {
+    "chat": "serve"
+   }
+  },
+  {
+   "kind": "agent",
+   "id": "carol",
+   "launch": "mock",
+   "description": "Deterministic fake used for offline testing. if carol moks here then that means we pretend carol impomented or error or whatever",
+   "role": "mock",
+   "reply": "hi from carol",
+   "template": "carol says: {prompt}",
+   "capabilities": [
+    "images"
+   ],
+   "models": {
+    "same": {
+     "display_name": "carol (mock)"
+    }
+   },
+   "services": {
+    "chat": "serve"
+   }
+  },
+  {
+   "kind": "agent",
+   "id": "openai",
+   "launch": "proxy",
+   "name": "snet",
+   "validation_interval": "1week",
+   "description": "Real OpenAI-compatible upstream (used only when mode includes 'proxy').",
+   "base_url": "https://llm.c.singularitynet.io/v1",
+   "api_key_env": "SNET_API_KEY",
+   "api_key": null,
+   "model": "google/gemma-4-31b-it",
+   "default": true,
+   "services": {
+    "chat": {
+     "behavior": "aggregate",
+     "strategy": "failover",
+     "catalog": [
+      "google/gemma-4-26b-a4b-it",
+      "deepseek/deepseek-v4-flash-0731",
+      "openai/gpt-oss-20b",
+      "minimax/minimax-m2.5",
+      "meta-llama/llama-3.3-70b-instruct",
+      "openai/gpt-oss-120b",
+      "minimax/minimax-m2.7",
+      "qwen/qwen3.8-27b",
+      "asi1-mini",
+      "minimax/minimax-m3",
+      "google/gemma-4-31b-it",
+      "asi1",
+      "minimax/minimax-m3-f"
+     ],
+     "description": "13 live chat model(s): google/gemma-4-26b-a4b-it, deepseek/deepseek-v4-flash-0731, openai/gpt-oss-20b..."
+    },
+    "embeddings": {
+     "behavior": "aggregate",
+     "strategy": "failover",
+     "catalog": [
+      "WhereIsAI/UAE-Large-V1",
+      "BAAI/bge-base-en-v1.5"
+     ],
+     "description": "2 live embedding model(s): WhereIsAI/UAE-Large-V1, BAAI/bge-base-en-v1.5"
+    },
+    "images": {
+     "behavior": "aggregate",
+     "strategy": "failover",
+     "catalog": [
+      "google/gemma-4-26b-a4b-it",
+      "google/gemma-4-31b-it"
+     ],
+     "description": "2 live image/vision model(s): google/gemma-4-26b-a4b-it, google/gemma-4-31b-it"
+    },
+    "moderations": {
+     "behavior": "error",
+     "description": "No moderation endpoint at this backend -- moderation requests fail here."
+    },
+    "audio": {
+     "behavior": "error",
+     "description": "No live audio models at this backend -- audio requests fail here."
+    },
+    "models": {
+     "behavior": "aggregate",
+     "validation_interval": "1day",
+     "description": "How this agent's model list is advertised and refreshed (fetched per validation_interval + cached, else the config list).",
+     "catalog": [
+      {
+       "id": "google/gemma-4-26b-a4b-it",
+       "validation_startedAt": "2026-08-23T14:27:39+00:00",
+       "validation_doneAt": "2026-08-23T14:27:43+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": true,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I am a large language model, trained by Google.",
+       "notes": "served: chat, vision"
+      },
+      {
+       "id": "deepseek/deepseek-v4-flash-0731",
+       "validation_startedAt": "2026-08-23T14:27:43+00:00",
+       "validation_doneAt": "2026-08-23T14:27:56+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I'm DeepSeek.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "openai/gpt-oss-20b",
+       "validation_startedAt": "2026-08-23T14:27:56+00:00",
+       "validation_doneAt": "2026-08-23T14:28:00+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "ChatGPT \u2013 built on OpenAI\u2019s GPT\u20114 architecture.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "minimax/minimax-m2.5",
+       "validation_startedAt": "2026-08-23T14:28:00+00:00",
+       "validation_doneAt": "2026-08-23T14:28:05+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I'm Claude, an AI assistant created by Anthropic. I'm based on their Claude 3.5 model.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "WhereIsAI/UAE-Large-V1",
+       "validation_startedAt": "2026-08-23T14:28:05+00:00",
+       "validation_doneAt": "2026-08-23T14:28:09+00:00",
+       "status": "live",
+       "chat": false,
+       "vision": false,
+       "embeddings": true,
+       "image": false,
+       "audio": false,
+       "identity": null,
+       "notes": "served: embeddings"
+      },
+      {
+       "id": "BAAI/bge-base-en-v1.5",
+       "validation_startedAt": "2026-08-23T14:28:09+00:00",
+       "validation_doneAt": "2026-08-23T14:28:13+00:00",
+       "status": "live",
+       "chat": false,
+       "vision": false,
+       "embeddings": true,
+       "image": false,
+       "audio": false,
+       "identity": null,
+       "notes": "served: embeddings"
+      },
+      {
+       "id": "meta-llama/llama-3.3-70b-instruct",
+       "validation_startedAt": "2026-08-23T14:28:13+00:00",
+       "validation_doneAt": "2026-08-23T14:28:16+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I'm a Llama model.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "openai/gpt-oss-120b",
+       "validation_startedAt": "2026-08-23T14:28:16+00:00",
+       "validation_doneAt": "2026-08-23T14:28:20+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I\u2019m ChatGPT, built on the GPT\u20114 architecture.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "minimax/minimax-m2.7",
+       "validation_startedAt": "2026-08-23T14:28:20+00:00",
+       "validation_doneAt": "2026-08-23T14:28:27+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I\u2019m MiniMax\u2011M2.7.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "qwen/qwen3.8-27b",
+       "validation_startedAt": "2026-08-23T14:28:27+00:00",
+       "validation_doneAt": "2026-08-23T14:28:36+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I\u2019m Qwen, a large language model.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "asi1-mini",
+       "validation_startedAt": "2026-08-23T14:28:36+00:00",
+       "validation_doneAt": "2026-08-23T14:28:41+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I am ASI1, an agentic orchestration model by Fetch.ai.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "minimax/minimax-m3",
+       "validation_startedAt": "2026-08-23T14:28:41+00:00",
+       "validation_doneAt": "2026-08-23T14:28:47+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I'm MiniMax-M3, developed by MiniMax.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "google/gemma-4-31b-it",
+       "validation_startedAt": "2026-08-23T14:28:47+00:00",
+       "validation_doneAt": "2026-08-23T14:28:52+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": true,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I am a large language model, trained by Google.",
+       "notes": "served: chat, vision"
+      },
+      {
+       "id": "asi1",
+       "validation_startedAt": "2026-08-23T14:28:52+00:00",
+       "validation_doneAt": "2026-08-23T14:28:57+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I'm ASI1, an agentic orchestration model by Fetch.ai.",
+       "notes": "served: chat"
+      },
+      {
+       "id": "minimax/minimax-m3-f",
+       "validation_startedAt": "2026-08-23T14:28:57+00:00",
+       "validation_doneAt": "2026-08-23T14:29:04+00:00",
+       "status": "live",
+       "chat": true,
+       "vision": false,
+       "embeddings": false,
+       "image": false,
+       "audio": false,
+       "identity": "I'm MiniMax-M3, developed by MiniMax.",
+       "notes": "served: chat"
+      }
+     ]
+    }
+   }
+  }
+ ],
+ "workers": [],
+ "mock_workers": [],
+ "backends": [],
+ "mock": {
+  "reply": null,
+  "template": "mock: {prompt}"
+ },
+ "subagent_model": "claude-sonnet-4.5",
+ "model_routes": {
+  "google/gemma-4-31b-it": "codex-ide-1",
+  "google/gemma-4-26b-a4b-it": "codex-ide-1",
+  "deepseek/deepseek-v4-flash-0731": "codex-ide-1",
+  "openai/gpt-oss-20b": "codex-ide-1",
+  "openai/gpt-oss-120b": "codex-ide-1",
+  "minimax/minimax-m2.5": "codex-ide-1",
+  "minimax/minimax-m2.7": "codex-ide-1",
+  "minimax/minimax-m3": "codex-ide-1",
+  "minimax/minimax-m3-f": "codex-ide-1",
+  "meta-llama/llama-3.3-70b-instruct": "codex-ide-1",
+  "qwen/qwen3.8-27b": "codex-ide-1",
+  "asi1": "codex-ide-1",
+  "asi1-mini": "codex-ide-1",
+  "WhereIsAI/UAE-Large-V1": "codex-ide-1",
+  "BAAI/bge-base-en-v1.5": "codex-ide-1",
+  "zira/for_sol": "test-copilot"
+ }
+}

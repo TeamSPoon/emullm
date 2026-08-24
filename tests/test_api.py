@@ -1,0 +1,2175 @@
+"""Lightweight smoke tests for every emulated /v1 surface in emullm_api.
+
+These deliberately stay small: for endpoints that don't need a connected
+worker (models listing, embeddings, moderations, images, audio stubs, and
+the files/assistants/threads/fine_tuning CRUD stubs) we just check a 200
+and the expected shape. For the worker-relayed endpoints (chat
+completions, completions, responses), no worker is connected in this test
+process; the relay is designed to wait (not fail fast) for one, so these
+tests monkeypatch a short timeout and just assert the eventual 504 --
+the actual relay round-trip (including the /emullm/{worker_id}/ws
+handshake) is exercised manually via scripts/emullm_worker.py against a
+live server.
+
+Multi-worker routing, capability-gated "pretend" modes, and rate
+limiting are exercised directly against the module's internal state
+(registering a FakeWorker under _connected_workers), since driving a real
+websocket handshake end-to-end isn't worth the weight for a smoke suite.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from emullm import api as emullm_api
+
+
+class FakeWorker:
+    """A worker double: records every payload sent to it and can be told
+    to answer with a canned reply."""
+
+    def __init__(self, reply: str | None = None) -> None:
+        self.sent: list[dict] = []
+        self.reply = reply
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+        future = emullm_api._pending.get(payload["id"])  # noqa: SLF001
+        if future and not future.done() and self.reply is not None:
+            future.set_result(self.reply)
+
+
+@pytest.fixture()
+def client() -> TestClient:
+    app = FastAPI()
+    app.include_router(emullm_api.router)
+    return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The files/assistants/threads/fine_tuning-job stubs (and the tokens
+    # store) persist to disk (see _JsonRecordStore) so they survive a
+    # real server restart; for tests, redirect each store to a throwaway
+    # tmp_path dir instead of touching the real
+    # workbench/server/runtime/emullm/ directory.
+    for store in (
+        emullm_api._files_store,
+        emullm_api._assistants_store,
+        emullm_api._threads_store,
+        emullm_api._fine_tuning_jobs_store,
+        emullm_api._fine_tuning_events_store,
+        emullm_api._tokens_store,
+    ):
+        monkeypatch.setattr(store, "_dir", tmp_path / store._dir.name)
+
+    # Reset all module-level relay/routing/usage state so tests don't leak
+    # into each other (e.g. rate-limit counters accumulating across tests,
+    # or a FakeWorker registered by one test still being "connected" for
+    # the next one).
+    monkeypatch.setattr(emullm_api, "_connected_workers", {})
+    monkeypatch.setattr(emullm_api, "_worker_models", {})
+    monkeypatch.setattr(emullm_api, "_worker_capabilities", {})
+    monkeypatch.setattr(emullm_api, "_worker_roles", {})
+    monkeypatch.setattr(emullm_api, "_worker_usage", {})
+    monkeypatch.setattr(emullm_api, "_pending", {})
+    monkeypatch.setattr(emullm_api, "_DOC_ALIASES", {})
+    # No managed-worker supervisor by default (auto mode sets one).
+    emullm_api._sup.set_supervisor(None)  # noqa: SLF001
+    # Reset config-derived per-agent/service policy so tests don't leak.
+    emullm_api.clear_agent_policies()
+    emullm_api._model_fetch_cache.clear()
+    emullm_api._round_robin_state.clear()
+    # /emullm/storage/* derives its root from _RUNTIME_DIR directly, so
+    # isolate that too instead of touching the real runtime/emullm/ dir.
+    monkeypatch.setattr(emullm_api, "_RUNTIME_DIR", tmp_path / "runtime")
+    monkeypatch.setattr(emullm_api, "_CONFIG_PATH", tmp_path / "config.json")
+
+
+def test_list_models_includes_personas(client: TestClient) -> None:
+    data = client.get("/v1/models").json()["data"]
+    ids = {entry["id"] for entry in data}
+    assert ids == {
+        "yourself/same",
+        "yourself/percent125",
+        "yourself/percent100",
+        "yourself/percent75",
+        "yourself/percent25",
+        "yourself/percent10",
+    }
+
+
+def test_get_single_model(client: TestClient) -> None:
+    response = client.get("/v1/models/yourself/percent25")
+    assert response.status_code == 200
+    assert response.json()["id"] == "yourself/percent25"
+    # A bare/unknown worker_id still resolves (falls back to the default
+    # persona menu -- see _models_for), but an unknown SUFFIX never does.
+    assert client.get("/v1/models/yourself/no-such-suffix").status_code == 404
+
+
+@pytest.fixture()
+def short_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without this, "no worker connected" would wait the full (900s)
+    # production timeout before giving up -- these tests want that to
+    # happen almost instantly instead.
+    monkeypatch.setattr(emullm_api, "_REQUEST_TIMEOUT_SECONDS", 0.3)
+
+
+def test_chat_completions_without_worker_waits_then_504(client: TestClient, short_timeout: None) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 504
+
+
+def test_completions_without_worker_waits_then_504(client: TestClient, short_timeout: None) -> None:
+    response = client.post("/v1/completions", json={"model": "yourself/same", "prompt": "hi"})
+    assert response.status_code == 504
+
+
+def test_responses_without_worker_waits_then_504(client: TestClient, short_timeout: None) -> None:
+    response = client.post("/v1/responses", json={"model": "yourself/same", "input": "hi"})
+    assert response.status_code == 504
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "expected_marker"),
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            "chat.completion.chunk",
+        ),
+        ("/v1/completions", {"prompt": "hello", "stream": True}, "text_completion"),
+        ("/v1/responses", {"input": "hello", "stream": True}, "response.output_text.delta"),
+    ],
+)
+def test_text_endpoints_support_server_sent_event_streams(
+    client: TestClient,
+    path: str,
+    body: dict[str, object],
+    expected_marker: str,
+) -> None:
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="streamed answer")  # noqa: SLF001
+
+    response = client.post(path, json=body)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert expected_marker in response.text
+    assert "streamed answer" in response.text
+
+
+def test_unknown_models_fail_before_waiting_for_a_worker(client: TestClient) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/not-real", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 404
+
+
+def test_mock_mode_answers_without_a_worker(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "mock")
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi there"}]},
+    )
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    # default deterministic echo; chat flattens messages to "[role] text"
+    assert content == "mock: [user] hi there"
+
+
+def test_mock_mode_fixed_reply_via_env(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "mock")
+    monkeypatch.setenv("EMULLM_MOCK_REPLY", "canned test answer")
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "anything"}]},
+    )
+    assert response.json()["choices"][0]["message"]["content"] == "canned test answer"
+
+
+def test_mock_mode_template_from_config(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "mock")
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"mock": {"template": "[{model}] echo={prompt}"}}), encoding="utf-8"
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert response.json()["choices"][0]["message"]["content"] == "[yourself/same] echo=[user] ping"
+
+
+def test_error_when_empty_mode_fails_fast(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "error-when-empty")
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 503
+
+
+def test_error_when_empty_mode_relays_when_worker_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "error-when-empty")
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="hi back")  # noqa: SLF001
+    assert asyncio.run(emullm_api._relay("yourself/same", "hi")) == "hi back"
+
+
+def test_proxy_mode_forwards_to_backend(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "proxy")
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"backends": [{"name": "x", "base_url": "http://backend.test/v1", "model": "gpt-x"}]}),
+        encoding="utf-8",
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "backend says hi"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "backend says hi"
+    assert calls["url"] == "http://backend.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "gpt-x"  # backend model overrides the client's model id
+
+
+def test_proxy_mode_502_without_backend(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "proxy")
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+
+
+def test_proxy_forwards_model_and_persona_instruction(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "proxy")
+    monkeypatch.setattr(
+        emullm_api, "_select_backend", lambda: {"name": "b", "base_url": "http://b/v1", "model": "backend-default"}
+    )
+    captured = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        captured["payload"] = payload
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    # an unknown (real backend) model id is accepted in proxy mode and forwarded as-is
+    r = client.post(
+        "/v1/chat/completions", json={"model": "real/model-x", "messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert r.status_code == 200
+    assert captured["payload"]["model"] == "real/model-x"
+    assert captured["payload"]["messages"][0]["role"] == "user"  # no persona -> no system msg
+
+    # a persona dial (percentNN) -> backend default model + a system instruction
+    client.post(
+        "/v1/chat/completions", json={"model": "smart/percent10", "messages": [{"role": "user", "content": "hi"}]}
+    )
+    payload = captured["payload"]
+    assert payload["model"] == "backend-default"
+    assert payload["messages"][0]["role"] == "system"
+    assert "10%" in payload["messages"][0]["content"]
+
+
+def test_proxy_observe_mirrors_exchange_to_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "proxy-observe")
+    monkeypatch.setenv("EMULLM_PROXY_BASE_URL", "http://backend.test/v1")
+    monkeypatch.setattr(
+        emullm_api,
+        "_http_post_json",
+        lambda *a, **k: {"choices": [{"message": {"content": "real answer"}}]},
+    )
+
+    class ObserverWorker:
+        def __init__(self) -> None:
+            self.sent: list = []
+
+        async def send_json(self, payload) -> None:
+            self.sent.append(payload)
+
+    obs = ObserverWorker()
+    emullm_api._connected_workers["yourself"] = obs  # noqa: SLF001
+
+    reply = asyncio.run(emullm_api._relay("yourself/same", "hello"))
+
+    assert reply == "real answer"
+    assert obs.sent and obs.sent[0]["type"] == "observe"
+    assert obs.sent[0]["reply"] == "real answer"
+    assert obs.sent[0]["prompt"] == "hello"
+
+
+def test_mock_workers_simulate_a_set_of_copilots(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "mock")
+    emullm_api.register_mock_workers(  # noqa: SLF001
+        [
+            {"id": "alice", "reply": "hi from alice", "capabilities": ["images"], "role": "trusted"},
+            {"id": "bob", "template": "[bob] {prompt}"},
+        ]
+    )
+
+    # both pretend copilots show up in /v1/models
+    ids = {m["id"] for m in client.get("/v1/models").json()["data"]}
+    assert "alice/same" in ids
+    assert "bob/same" in ids
+
+    # each is routed to independently
+    a = client.post(
+        "/v1/chat/completions",
+        json={"model": "alice/same", "messages": [{"role": "user", "content": "hey"}]},
+    )
+    assert a.json()["choices"][0]["message"]["content"] == "hi from alice"
+    b = client.post(
+        "/v1/chat/completions",
+        json={"model": "bob/same", "messages": [{"role": "user", "content": "yo"}]},
+    )
+    assert b.json()["choices"][0]["message"]["content"] == "[bob] [user] yo"
+
+    # an unregistered worker_id still gets the global mock fallback
+    other = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert other.json()["choices"][0]["message"]["content"] == "mock: [user] ping"
+
+    # admin state reflects the simulated copilots
+    state = client.get("/admin/emullm/state").json()
+    assert "alice" in state["connected_worker_ids"]
+    assert "bob" in state["connected_worker_ids"]
+    assert state["worker_roles"]["bob"] == "mock"
+    assert state["worker_capabilities"]["alice"] == {"images": True}
+
+
+def test_specific_worker_routes_to_a_mock_copilot(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "mock")
+    emullm_api.register_mock_workers([{"id": "alice", "reply": "alice here"}])  # noqa: SLF001
+    response = client.post(
+        "/emullm/specific_worker/alice/v1/chat/completions",
+        json={"model": "whatever/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "alice here"
+
+
+def test_modes_are_parsed_as_a_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "recruit, proxy , mock")
+    assert emullm_api._current_modes() == ["recruit", "proxy", "mock"]
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", ["recruit", "mock"])
+    assert emullm_api._current_modes() == ["recruit", "mock"]
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "")
+    assert emullm_api._current_modes() == ["relay"]
+
+
+def test_chain_recruit_then_mock_falls_back_when_empty(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # No worker connected: recruit passes, mock answers.
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "recruit,mock")
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "mock: [user] hi"
+
+
+def test_chain_recruit_prefers_a_connected_worker_over_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "recruit,mock")
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="real worker answer")  # noqa: SLF001
+    # recruit finds the worker, so we never reach the mock fallback.
+    assert asyncio.run(emullm_api._relay("yourself/same", "hi")) == "real worker answer"
+
+
+def test_chain_recruit_then_proxy_falls_back_to_backend(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "recruit,proxy")
+    monkeypatch.setenv("EMULLM_PROXY_BASE_URL", "http://backend.test/v1")
+    monkeypatch.setattr(
+        emullm_api, "_http_post_json",
+        lambda *a, **k: {"choices": [{"message": {"content": "from backend"}}]},
+    )
+    # nobody connected -> recruit passes -> proxy answers
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "from backend"
+
+
+def test_recruit_alone_returns_504_when_empty(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # recruit doesn't wait and has no fallback -> chain exhausts -> 504.
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "recruit")
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 504
+
+
+# --- Every run mode is selectable and exercised, using a good-enough mock ---
+WORKER_BACKED_MODES = ["relay", "wait", "wait-then-serve", "self", "recruit", "auto", "error-when-empty"]
+
+
+@pytest.mark.parametrize("mode", WORKER_BACKED_MODES)
+def test_every_worker_mode_relays_to_a_connected_mock(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """With a mock agent connected, every worker-backed mode relays to it."""
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", mode)
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply=f"ok:{mode}")  # noqa: SLF001
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200, mode
+    assert response.json()["choices"][0]["message"]["content"] == f"ok:{mode}"
+
+
+@pytest.mark.parametrize(
+    "mode,expected_status",
+    [
+        ("error-when-empty", 503),
+        ("recruit", 504),
+        ("self", 504),
+        ("auto", 504),
+        ("wait", 504),
+        ("wait-then-serve", 504),
+        ("relay", 504),
+    ],
+)
+def test_every_worker_mode_without_a_worker(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, short_timeout: None, mode: str, expected_status: int
+) -> None:
+    """With no agent connected, each mode fails as designed (fast 503 for
+    error-when-empty, otherwise 504)."""
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", mode)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == expected_status, mode
+
+
+def test_mock_mode_is_selectable_and_always_answers(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "mock")
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "mock: [user] hi"
+
+
+def test_relay_waits_for_late_worker_instead_of_failing_fast() -> None:
+    """Simulates a request landing while no worker is connected: _relay
+    must NOT fail fast -- it should wait (like a slow API server) and
+    succeed once a worker connects and replies."""
+
+    async def scenario() -> str:
+        async def connect_worker_after_delay() -> None:
+            await asyncio.sleep(0.2)
+            worker = FakeWorker(reply="answered late")
+            emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+
+        relay_task = asyncio.create_task(emullm_api._relay("yourself/same", "hello"))
+        connector_task = asyncio.create_task(connect_worker_after_delay())
+        result = await relay_task
+        await connector_task
+        return result
+
+    original_timeout = emullm_api._REQUEST_TIMEOUT_SECONDS
+    emullm_api._REQUEST_TIMEOUT_SECONDS = 5
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        emullm_api._REQUEST_TIMEOUT_SECONDS = original_timeout
+
+    assert result == "answered late"
+
+
+def test_relay_routes_to_the_worker_matching_the_model_prefix() -> None:
+    """Two different worker_ids can be "logged in" at once; a request for
+    "alice/same" must go to alice's connection, not bob's (or "yourself")."""
+    alice = FakeWorker(reply="alice answered")
+    bob = FakeWorker(reply="bob answered")
+    emullm_api._connected_workers["alice"] = alice  # noqa: SLF001
+    emullm_api._connected_workers["bob"] = bob  # noqa: SLF001
+
+    result = asyncio.run(emullm_api._relay("alice/same", "hi"))
+
+    assert result == "alice answered"
+    assert len(alice.sent) == 1
+    assert not bob.sent
+
+
+def test_list_models_aggregates_every_connected_worker(client: TestClient) -> None:
+    emullm_api._connected_workers["alice"] = FakeWorker()  # noqa: SLF001
+    emullm_api._worker_models["alice"] = {"same": {"display_name": "(alice)", "instruction": "Be alice."}}
+
+    ids = {entry["id"] for entry in client.get("/v1/models").json()["data"]}
+    assert "alice/same" in ids
+    assert "yourself/same" in ids  # the default identity is always advertised
+
+
+def test_worker_caps_lookup(client: TestClient) -> None:
+    assert client.get("/emullm/caps/yourself").json() == {
+        "worker_id": "yourself",
+        "connected": False,
+        "models": sorted(emullm_api._PERSONA_SUFFIXES.keys()),
+        "capabilities": {},
+    }
+
+    emullm_api._connected_workers["alice"] = FakeWorker()  # noqa: SLF001
+    emullm_api._worker_capabilities["alice"] = {"images": True}
+
+    result = client.get("/emullm/caps/alice").json()
+    assert result["connected"] is True
+    assert result["capabilities"] == {"images": True}
+
+
+def test_serve_doc_returns_a_real_markdown_file(client: TestClient) -> None:
+    response = client.get("/emullm/docs/EMULLM_RELAY.md")
+    assert response.status_code == 200
+    assert "text/markdown" in response.headers["content-type"]
+    assert "emullm" in response.text.lower()
+
+
+def test_serve_join_as_worker_doc(client: TestClient) -> None:
+    response = client.get("/emullm/docs/EMULLM_ONBOARD.md")
+    assert response.status_code == 200
+    assert "text/markdown" in response.headers["content-type"]
+    assert "worker" in response.text.lower()
+
+
+def test_serve_doc_404s_for_missing_file(client: TestClient) -> None:
+    assert client.get("/emullm/docs/no-such-file.md").status_code == 404
+
+
+def test_serve_doc_rejects_path_traversal(client: TestClient) -> None:
+    assert client.get("/emullm/docs/../server/emullm_api.py").status_code in (400, 404)
+
+
+def test_serve_doc_file_alias_from_another_directory(client: TestClient, tmp_path) -> None:
+    external = tmp_path / "elsewhere" / "external_note.md"
+    external.parent.mkdir(parents=True)
+    external.write_text("# External\nlives outside the docs tree", encoding="utf-8")
+    emullm_api.register_doc_alias("aliased/note.md", external)
+
+    response = client.get("/emullm/docs/aliased/note.md")
+    assert response.status_code == 200
+    assert "lives outside the docs tree" in response.text
+    # a non-aliased missing path still 404s normally
+    assert client.get("/emullm/docs/aliased/missing.md").status_code == 404
+
+
+def test_serve_doc_directory_alias_mounts_a_whole_subtree(client: TestClient, tmp_path) -> None:
+    ext_dir = tmp_path / "ext_docs"
+    (ext_dir / "sub").mkdir(parents=True)
+    (ext_dir / "sub" / "page.md").write_text("subtree page", encoding="utf-8")
+    emullm_api.register_doc_alias("mounted", ext_dir)
+
+    assert client.get("/emullm/docs/mounted/sub/page.md").text == "subtree page"
+    # traversal out of an aliased directory is refused
+    assert client.get("/emullm/docs/mounted/../secret").status_code in (400, 404)
+
+
+def test_serve_doc_alias_does_not_shadow_real_docs(client: TestClient) -> None:
+    # With no alias registered for it, the real on-disk doc still serves.
+    assert client.get("/emullm/docs/EMULLM_RELAY.md").status_code == 200
+
+
+def test_all_docs_served_only_under_the_emullm_docs_prefix(client: TestClient) -> None:
+    # Every doc is reachable at the single canonical /emullm/docs/ prefix...
+    for name in (
+        "EMULLM_ONBOARD.md",
+        "EMULLM_RELAY.md",
+    ):
+        response = client.get(f"/emullm/docs/{name}")
+        assert response.status_code == 200, name
+        assert "text/markdown" in response.headers["content-type"]
+
+    # ...and the old bare-root / /docs/ / /workbench/docs/ aliases are gone.
+    for alias in (
+        "/EMULLM_ONBOARD.md",
+        "/docs/EMULLM_ONBOARD.md",
+        "/workbench/docs/EMULLM_ONBOARD.md",
+        "/EMULLM_RELAY.md",
+        "/workbench/docs/EMULLM_RELAY.md",
+    ):
+        assert client.get(alias).status_code == 404, alias
+
+    # The old design/ subpath is gone too; the file lives at the top level.
+    assert client.get("/emullm/docs/design/EMULLM_RELAY.md").status_code == 404
+
+
+def test_static_html_served_at_namespaced_and_root_paths(client: TestClient) -> None:
+    namespaced = client.get("/emullm/static/index.html")
+    assert namespaced.status_code == 200
+    assert "text/html" in namespaced.headers["content-type"]
+    assert "emullm" in namespaced.text
+
+    root = client.get("/index.html")
+    assert root.status_code == 200
+    assert root.text == namespaced.text
+
+
+def test_static_missing_and_traversal(client: TestClient) -> None:
+    assert client.get("/emullm/static/nope.html").status_code == 404
+    assert client.get("/does-not-exist.html").status_code == 404
+    assert client.get("/emullm/static/../api.py").status_code in (400, 404)
+
+
+def test_specific_worker_prefix_pins_worker_regardless_of_model_field(client: TestClient, short_timeout: None) -> None:
+    """A client hitting /emullm/specific_worker/alice/v1/chat/completions
+    must be routed to alice even if it sends a "model" naming someone
+    else (or the default) -- only the persona suffix is kept."""
+    alice = FakeWorker(reply="alice's real answer")
+    emullm_api._connected_workers["alice"] = alice  # noqa: SLF001
+    bob = FakeWorker(reply="bob would never see this")
+    emullm_api._connected_workers["bob"] = bob  # noqa: SLF001
+
+    response = client.post(
+        "/emullm/specific_worker/alice/v1/chat/completions",
+        json={"model": "bob/percent25", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "alice's real answer"
+    assert not bob.sent
+    assert alice.sent[0]["model"] == "alice/percent25"  # worker_id forced, suffix kept
+
+
+def test_specific_worker_models_listing_is_scoped_to_that_worker(client: TestClient) -> None:
+    emullm_api._worker_models["alice"] = {"same": {"display_name": "(alice)", "instruction": "Be alice."}}
+
+    data = client.get("/emullm/specific_worker/alice/v1/models").json()["data"]
+
+    assert {entry["id"] for entry in data} == {"alice/same"}
+
+
+def test_specific_worker_get_model_and_404(client: TestClient) -> None:
+    assert client.get("/emullm/specific_worker/alice/v1/models/anything/same").status_code == 200
+    assert client.get("/emullm/specific_worker/alice/v1/models/anything/no-such-suffix").status_code == 404
+
+
+def test_rate_limit_returns_429_with_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once a worker_id has been used up to the configured limit within
+    the window, further requests for it fail fast with 429 and a
+    Retry-After, instead of queuing more work onto a busy worker."""
+    monkeypatch.setattr(emullm_api, "_USAGE_MAX_PER_WINDOW", 2)
+    monkeypatch.setattr(emullm_api, "_USAGE_WINDOW_SECONDS", 60.0)
+    worker = FakeWorker(reply="ok")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+
+    asyncio.run(emullm_api._relay("yourself/same", "one"))
+    asyncio.run(emullm_api._relay("yourself/same", "two"))
+
+    with pytest.raises(emullm_api.HTTPException) as excinfo:
+        asyncio.run(emullm_api._relay("yourself/same", "three"))
+    assert excinfo.value.status_code == 429
+    assert "Retry-After" in excinfo.value.headers
+
+
+def test_rate_limit_is_independent_per_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A different worker_id isn't affected by another one being maxed
+    out -- so an idle worker can pick up slack for a busy one."""
+    monkeypatch.setattr(emullm_api, "_USAGE_MAX_PER_WINDOW", 1)
+    monkeypatch.setattr(emullm_api, "_USAGE_WINDOW_SECONDS", 60.0)
+    emullm_api._connected_workers["alice"] = FakeWorker(reply="a")  # noqa: SLF001
+    emullm_api._connected_workers["bob"] = FakeWorker(reply="b")  # noqa: SLF001
+
+    asyncio.run(emullm_api._relay("alice/same", "hi"))
+    with pytest.raises(emullm_api.HTTPException):
+        asyncio.run(emullm_api._relay("alice/same", "hi again"))
+
+    # bob is untouched by alice's limit
+    assert asyncio.run(emullm_api._relay("bob/same", "hi")) == "b"
+
+
+def test_embeddings_is_deterministic_without_pretend_capability(client: TestClient) -> None:
+    first = client.post("/v1/embeddings", json={"input": "hello", "dimensions": 64}).json()
+    second = client.post("/v1/embeddings", json={"input": "hello", "dimensions": 64}).json()
+    assert first["data"][0]["embedding"] == second["data"][0]["embedding"]
+    assert len(first["data"][0]["embedding"]) == 64
+    assert first["usage"]["total_tokens"] == 1
+
+
+def test_embeddings_pretend_mode_routes_to_the_capable_worker(client: TestClient) -> None:
+    worker = FakeWorker(reply="a vector about greetings")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"embeddings": True}
+
+    client.post("/v1/embeddings", json={"input": "hello"})
+
+    assert len(worker.sent) == 1
+    assert "pretend-embeddings" in worker.sent[0]["prompt"]
+
+
+def test_embeddings_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
+    worker = FakeWorker(reply="should never be used")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"embeddings": False}  # explicit decline
+
+    response = client.post("/v1/embeddings", json={"input": "hello"})
+
+    assert response.status_code == 501
+    assert not worker.sent  # never even asked
+
+
+def test_capability_fallback_error_fails_fast(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # No capable worker + capability_fallback=error -> 503, no stub.
+    monkeypatch.setattr(emullm_api, "_CAPABILITY_FALLBACK", "error")
+    response = client.post("/v1/embeddings", json={"input": "hello"})
+    assert response.status_code == 503
+
+
+def test_capability_fallback_wait_times_out(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # No capable worker + capability_fallback=wait -> hold, then 504 on timeout.
+    monkeypatch.setattr(emullm_api, "_CAPABILITY_FALLBACK", "wait")
+    monkeypatch.setattr(emullm_api, "_REQUEST_TIMEOUT_SECONDS", 0.3)
+    response = client.post("/v1/embeddings", json={"input": "hello"})
+    assert response.status_code == 504
+
+
+def test_capability_fallback_stub_is_default(client: TestClient) -> None:
+    # Default (stub) still answers immediately with the deterministic fake.
+    assert emullm_api._capability_fallback() == "stub"
+    assert client.post("/v1/embeddings", json={"input": "hello"}).status_code == 200
+
+
+def test_per_agent_service_behavior_overrides_fallback(client: TestClient) -> None:
+    # An agent's per-service behavior wins over the global/server fallback.
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "alice",
+                    "launch": "subagent",
+                    "services": {"images": "error", "embeddings": "stub", "moderations": "decline"},
+                }
+            ]
+        }
+    )
+    assert client.post("/v1/images/generations", json={"model": "alice/same", "prompt": "x"}).status_code == 503
+    assert client.post("/v1/embeddings", json={"model": "alice/same", "input": "hi"}).status_code == 200
+    assert client.post("/v1/moderations", json={"model": "alice/same", "input": "hi"}).status_code == 501
+
+
+def test_server_level_service_fallback_applies(client: TestClient) -> None:
+    # server-level services fallback is used when no agent serves it.
+    emullm_api.apply_agent_policies({"services": {"images": {"fallback": "error"}}})
+    assert client.post("/v1/images/generations", json={"model": "yourself/same", "prompt": "x"}).status_code == 503
+
+
+def test_server_fallback_chain(client: TestClient) -> None:
+    # A chain "round-robin, error": no agent volunteered for images -> the
+    # strategy token passes, then error terminates with 503.
+    emullm_api.apply_agent_policies({"services": {"images": {"fallback": "round-robin, error"}}})
+    assert emullm_api._service_fallback["images"] == ["round-robin", "error"]
+    assert client.post("/v1/images/generations", json={"model": "yourself/same", "prompt": "x"}).status_code == 503
+    # "round-robin, stub": strategy passes, stub answers (200)
+    emullm_api.apply_agent_policies({"services": {"images": {"fallback": ["round-robin", "stub"]}}})
+    assert client.post("/v1/images/generations", json={"model": "yourself/same", "prompt": "x"}).status_code == 200
+
+
+def test_agent_aggregate_is_a_volunteer(client: TestClient) -> None:
+    # an agent-level aggregate service = "I volunteer" -> served (relayed).
+    worker = FakeWorker(reply="desc")
+    emullm_api._connected_workers["o"] = worker  # noqa: SLF001
+    emullm_api.apply_agent_policies(
+        {"agents": [{"kind": "agent", "id": "o", "launch": "proxy", "services": {"images": {"behavior": "aggregate"}}}]}
+    )
+    result = client.post("/v1/images/generations", json={"model": "o/same", "prompt": "a cat"}).json()
+    assert result["data"][0].get("pretend_description") == "desc"  # volunteered -> asked the worker
+
+
+def test_observer_receives_mirrored_exchange(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api, "_SERVER_MODE", "mock")
+    observer = FakeWorker()
+    emullm_api._connected_workers["bob"] = observer  # noqa: SLF001
+    emullm_api.apply_agent_policies(
+        {"agents": [{"kind": "agent", "id": "bob", "launch": "recruit", "observe": ["chat"]}]}
+    )
+    client.post("/v1/chat/completions", json={"model": "carol/same", "messages": [{"role": "user", "content": "hi"}]})
+    assert any(payload.get("type") == "observe" for payload in observer.sent)
+
+
+def test_parse_interval() -> None:
+    assert emullm_api._parse_interval("1day") == 86400.0
+    assert emullm_api._parse_interval(None) is None
+    assert emullm_api._parse_interval("never") is None
+    assert emullm_api._parse_interval("12h") == 43200.0
+    assert emullm_api._parse_interval("30m") == 1800.0
+    assert emullm_api._parse_interval("always") == 0.0
+
+
+def test_advertise_models_aggregates_and_fetches(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        emullm_api, "_http_get_json", lambda url, headers, timeout=15.0: {"data": [{"id": "m1"}, {"id": "m2"}]}
+    )
+    emullm_api.apply_agent_policies(
+        {
+            "services": {"model": "base-1", "models": ["base-1"]},
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "up",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["cfg-fallback"],
+                    "services": {"models": {"behavior": "aggregate", "update_interval": "1day"}},
+                }
+            ],
+        }
+    )
+    cat = emullm_api.advertised_catalog()
+    assert cat["model"] == "base-1"
+    assert cat["models"] == ["base-1", "m1", "m2"]  # base + live fetch, deduped in order
+
+
+def test_update_interval_null_uses_config_models_without_fetching(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"n": 0}
+
+    def fake_get(url, headers, timeout=15.0):
+        calls["n"] += 1
+        return {"data": [{"id": "live"}]}
+
+    monkeypatch.setattr(emullm_api, "_http_get_json", fake_get)
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "noref",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["cfg-a", "cfg-b"],
+                    "services": {"models": {"behavior": "aggregate", "update_interval": None}},
+                }
+            ]
+        }
+    )
+    cat = emullm_api.advertised_catalog()
+    assert cat["models"] == ["cfg-a", "cfg-b"]  # null interval -> config models
+    assert calls["n"] == 0  # and no live fetch happened
+
+
+def test_advertise_and_interval_via_services_models_entry(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"n": 0}
+
+    def fake_get(url, headers, timeout=15.0):
+        calls["n"] += 1
+        return {"data": [{"id": "live-1"}]}
+
+    monkeypatch.setattr(emullm_api, "_http_get_json", fake_get)
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "o",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["cfg-1"],
+                    "services": {
+                        "chat": "serve",
+                        "models": {"behavior": "aggregate", "update_interval": None, "description": "catalog"},
+                    },
+                }
+            ]
+        }
+    )
+    cat = emullm_api.advertised_catalog()
+    assert cat["models"] == ["cfg-1"]  # advertised via services.models; null interval -> config list
+    assert calls["n"] == 0
+    # the reserved "models" catalog entry is NOT a routable service behavior
+    behaviors = emullm_api._worker_service_behavior.get("o", {})
+    assert "models" not in behaviors
+    assert behaviors.get("chat") == "serve"
+
+
+def test_moderations_never_flags_without_pretend_capability(client: TestClient) -> None:
+    result = client.post("/v1/moderations", json={"input": "anything"}).json()
+    assert result["results"][0]["flagged"] is False
+
+
+def test_moderations_pretend_mode_uses_worker_verdict(client: TestClient) -> None:
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="FLAG")  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"moderations": True}
+
+    result = client.post("/v1/moderations", json={"input": "anything"}).json()
+
+    assert result["results"][0]["flagged"] is True
+
+
+def test_moderations_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
+    worker = FakeWorker(reply="should never be used")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"moderations": False}
+
+    response = client.post("/v1/moderations", json={"input": "anything"})
+
+    assert response.status_code == 501
+    assert not worker.sent
+
+
+def test_images_generations_returns_stub_url(client: TestClient) -> None:
+    result = client.post("/v1/images/generations", json={"prompt": "a cat"}).json()
+    assert result["data"][0]["url"].startswith("data:image/png;base64,")
+    assert "pretend_description" not in result["data"][0]
+
+    base64_result = client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "response_format": "b64_json"},
+    ).json()
+    assert base64_result["data"][0]["b64_json"]
+    assert "url" not in base64_result["data"][0]
+
+
+def test_images_generations_pretend_mode_adds_description(client: TestClient) -> None:
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="a fluffy orange cat")  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"images": True}
+
+    result = client.post("/v1/images/generations", json={"prompt": "a cat"}).json()
+
+    assert result["data"][0]["pretend_description"] == "a fluffy orange cat"
+
+
+def test_images_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
+    worker = FakeWorker(reply="should never be used")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"images": False}
+
+    response = client.post("/v1/images/generations", json={"prompt": "a cat"})
+
+    assert response.status_code == 501
+    assert not worker.sent
+
+
+def test_audio_transcriptions_is_stub(client: TestClient) -> None:
+    result = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "yourself/same"},
+        files={"file": ("sample.wav", b"RIFF synthetic audio", "audio/wav")},
+    ).json()
+    assert "not implemented" in result["text"]
+    assert client.post("/v1/audio/transcriptions").status_code == 415
+
+
+def test_audio_transcriptions_pretend_mode_uses_worker_text(client: TestClient) -> None:
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="hello there")  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"audio_transcription": True}
+
+    result = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("sample.wav", b"RIFF synthetic audio", "audio/wav")},
+    ).json()
+
+    assert result["text"] == "hello there"
+
+
+def test_audio_transcriptions_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
+    worker = FakeWorker(reply="should never be used")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"audio_transcription": False}
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("sample.wav", b"RIFF synthetic audio", "audio/wav")},
+    )
+
+    assert response.status_code == 501
+    assert not worker.sent
+
+
+def test_audio_speech_returns_valid_synthetic_wav(client: TestClient) -> None:
+    result = client.post("/v1/audio/speech", json={"input": "hi"})
+    assert result.status_code == 200
+    assert result.headers["content-type"].startswith("audio/wav")
+    assert result.headers["x-emullm-synthetic"] == "true"
+    assert result.content[:4] == b"RIFF"
+    assert result.content[8:12] == b"WAVE"
+
+
+def test_audio_speech_pretend_mode_adds_description(client: TestClient) -> None:
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="said cheerfully")  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"audio_speech": True}
+
+    result = client.post("/v1/audio/speech", json={"input": "hi"})
+
+    assert result.headers["x-emullm-description"] == "said cheerfully"
+
+
+# --- two-way real media pass-through + shared cloud files --------------------
+def test_cloud_files_roundtrip_both_spellings(client: TestClient) -> None:
+    record = emullm_api._store_cloud_bytes(b"hello-cloud", "note.txt", purpose="output")  # noqa: SLF001
+    url = emullm_api._cloud_file_url(record["id"])  # noqa: SLF001
+    assert url.startswith("/emullm/cloud/files/")
+    got = client.get(url)
+    assert got.status_code == 200 and got.content == b"hello-cloud"
+    alias = client.get(url.replace("/emullm/", "/emullm/"))
+    assert alias.status_code == 200 and alias.content == b"hello-cloud"
+
+
+def test_images_two_way_returns_worker_image_via_cloud_file(client: TestClient) -> None:
+    import base64
+
+    raw = b"\x89PNG\r\n\x1a\nFAKE-IMAGE-BYTES"
+    b64 = base64.b64encode(raw).decode()
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply={"content": "", "image_b64": b64})  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"images": True}
+
+    entry = client.post("/v1/images/generations", json={"model": "yourself", "prompt": "a red bike"}).json()["data"][0]
+    assert entry["source"] == "worker"
+    assert entry["url"].startswith("/emullm/cloud/files/")
+    assert entry["file_id"]
+    got = client.get(entry["url"])
+    assert got.status_code == 200 and got.content == raw  # the real bytes came back through the cloud store
+
+
+def test_images_two_way_b64_json_returns_worker_bytes(client: TestClient) -> None:
+    import base64
+
+    raw = b"REAL-IMG"
+    b64 = base64.b64encode(raw).decode()
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply={"content": "", "image_b64": b64})  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"images": True}
+
+    entry = client.post(
+        "/v1/images/generations",
+        json={"model": "yourself", "prompt": "x", "response_format": "b64_json"},
+    ).json()["data"][0]
+    assert entry["b64_json"] == b64
+    assert "url" not in entry
+
+
+def test_audio_speech_two_way_returns_worker_audio(client: TestClient) -> None:
+    import base64
+
+    wav = b"RIFF____WAVEreal-audio"
+    b64 = base64.b64encode(wav).decode()
+    emullm_api._connected_workers["yourself"] = FakeWorker(  # noqa: SLF001
+        reply={"content": "", "audio_b64": b64, "mime": "audio/wav"}
+    )
+    emullm_api._worker_capabilities["yourself"] = {"audio_speech": True}
+
+    r = client.post("/v1/audio/speech", json={"model": "yourself", "input": "hello"})
+    assert r.status_code == 200
+    assert r.content == wav  # the worker's real audio, not the synthetic stub
+    assert r.headers["x-emullm-synthetic"] == "false"
+    assert r.headers["x-emullm-file"].startswith("/emullm/cloud/files/")
+
+
+def test_audio_transcription_two_way_references_real_clip(client: TestClient) -> None:
+    worker = FakeWorker(reply="the transcript")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"audio_transcription": True}
+
+    r = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "yourself/same"},
+        files={"file": ("clip.wav", b"RIFF real audio bytes", "audio/wav")},
+    ).json()
+    assert r["text"] == "the transcript"
+    assert r["audio_file"]
+    sent = worker.sent[0]
+    assert sent["kind"] == "audio_transcription"
+    assert sent["audio"].startswith("/emullm/cloud/files/")
+    got = client.get(sent["audio"])  # the worker was handed a real, fetchable clip
+    assert got.status_code == 200 and got.content == b"RIFF real audio bytes"
+
+
+def test_fine_tuning_worker_volunteer_trains_and_publishes_result(client: TestClient) -> None:
+    upload = client.post(
+        "/v1/files",
+        data={"purpose": "fine-tune"},
+        files={"file": ("t.jsonl", b'{"messages": []}\n', "application/json")},
+    ).json()
+    worker = FakeWorker(reply="I'll train it with 3 epochs")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["yourself"] = {"fine_tuning": True}
+
+    job = client.post(
+        "/v1/fine_tuning/jobs",
+        json={"model": "yourself", "training_file": upload["id"]},
+    ).json()
+    assert job["status"] == "succeeded"
+    assert job["fine_tuned_model"].startswith("ft:yourself:")
+    assert job["error"] is None
+    assert job["result_files"]
+    manifest = client.get(emullm_api._cloud_file_url(job["result_files"][0]))  # noqa: SLF001
+    assert manifest.status_code == 200
+    assert b"fine_tuned_model" in manifest.content
+    # the worker was routed a reference to the real training data
+    assert worker.sent[0]["kind"] == "fine_tuning"
+    assert worker.sent[0]["files"]["training_file"] == upload["id"]
+
+
+def test_model_routes_from_config_serves(client: TestClient) -> None:
+    emullm_api.apply_agent_policies(
+        {"agents": [{"kind": "agent", "id": "srv", "serves": ["google/gemma-4-31b-it", "qwen/qwen3.8-27b"]}]}
+    )
+    assert emullm_api._model_routes["google/gemma-4-31b-it"] == "srv"  # noqa: SLF001
+    wid, _suffix, persona = emullm_api._require_model("qwen/qwen3.8-27b")  # noqa: SLF001
+    assert wid == "srv"
+    assert persona.get("served_model") == "qwen/qwen3.8-27b"
+
+
+def test_model_routes_admin_get_set_remove(client: TestClient) -> None:
+    assert client.post("/admin/emullm/model_routes", json={"routes": {"a/b": "w1"}}).json()["model_routes"]["a/b"] == "w1"
+    assert client.get("/admin/emullm/model_routes").json()["model_routes"]["a/b"] == "w1"
+    assert client.get("/admin/emullm/state").json()["model_routes"]["a/b"] == "w1"
+    client.post("/admin/emullm/model_routes", json={"routes": {"a/b": ""}})  # empty removes
+    assert "a/b" not in client.get("/admin/emullm/model_routes").json()["model_routes"]
+
+
+def test_model_route_relays_catalog_id_to_worker(client: TestClient) -> None:
+    # A routed catalog id (with a '/') is served by the mapped worker, and the
+    # worker is told which model to emulate.
+    emullm_api._connected_workers["srv"] = FakeWorker(reply="served as gemma")  # noqa: SLF001
+    client.post("/admin/emullm/model_routes", json={"routes": {"google/gemma-4-31b-it": "srv"}})
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "google/gemma-4-31b-it", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    assert r.json()["choices"][0]["message"]["content"] == "served as gemma"
+    sent = emullm_api._connected_workers["srv"].sent[0]  # noqa: SLF001
+    assert "google/gemma-4-31b-it" in sent.get("persona_instruction", "")
+
+
+@pytest.mark.parametrize("path", ["/v1/files", "/v1/assistants", "/v1/threads"])
+def test_durable_resource_list_then_create(client: TestClient, path: str) -> None:
+    empty = client.get(path).json()
+    assert empty["object"] == "list"
+    assert empty["data"] == []
+    created = client.post(path, json={"note": "test"}).json()
+    assert created["id"]
+    listed = client.get(path).json()["data"]
+    assert any(item["id"] == created["id"] for item in listed)
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "deleted_object"),
+    [
+        ("/v1/assistants", {"model": "yourself/same", "name": "helper"}, "assistant.deleted"),
+        ("/v1/threads", {"metadata": {"topic": "testing"}}, "thread.deleted"),
+    ],
+)
+def test_platform_resources_support_crud_and_protected_fields(
+    client: TestClient,
+    path: str,
+    body: dict[str, object],
+    deleted_object: str,
+) -> None:
+    created = client.post(path, json={**body, "id": "client-id", "object": "wrong"}).json()
+    resource_id = created["id"]
+    assert resource_id != "client-id"
+    assert client.get(f"{path}/{resource_id}").json() == created
+
+    modified = client.post(
+        f"{path}/{resource_id}",
+        json={"metadata": {"updated": True}, "id": "replacement", "created_at": 0},
+    ).json()
+    assert modified["id"] == resource_id
+    assert modified["created_at"] == created["created_at"]
+    assert modified["metadata"] == {"updated": True}
+
+    deleted = client.delete(f"{path}/{resource_id}")
+    assert deleted.json() == {"id": resource_id, "object": deleted_object, "deleted": True}
+    assert client.get(f"{path}/{resource_id}").status_code == 404
+
+
+def test_platform_resource_lists_are_cursor_paginated(client: TestClient) -> None:
+    created = [
+        client.post("/v1/threads", json={"metadata": {"index": index}}).json()
+        for index in range(3)
+    ]
+
+    first_page = client.get("/v1/threads", params={"order": "asc", "limit": 2}).json()
+    assert [item["id"] for item in first_page["data"]] == [created[0]["id"], created[1]["id"]]
+    assert first_page["has_more"] is True
+    second_page = client.get(
+        "/v1/threads",
+        params={"order": "asc", "limit": 2, "after": first_page["last_id"]},
+    ).json()
+    assert [item["id"] for item in second_page["data"]] == [created[2]["id"]]
+    assert second_page["has_more"] is False
+
+
+def test_fine_tuning_jobs_validate_files_and_expose_terminal_lifecycle(client: TestClient) -> None:
+    bad = client.post(
+        "/v1/fine_tuning/jobs",
+        json={"model": "yourself/same", "training_file": "file-missing"},
+    )
+    assert bad.status_code == 404
+
+    uploaded = client.post(
+        "/v1/files",
+        data={"purpose": "fine-tune"},
+        files={
+            "file": (
+                "training.jsonl",
+                b'{"messages":[{"role":"user","content":"hello"}]}\n',
+                "application/jsonl",
+            )
+        },
+    ).json()
+    created = client.post(
+        "/v1/fine_tuning/jobs",
+        json={"model": "yourself/same", "training_file": uploaded["id"]},
+    )
+
+    assert created.status_code == 200
+    job = created.json()
+    assert job["status"] == "failed"
+    assert job["error"]["code"] == "training_not_available"
+    assert client.get(f"/v1/fine_tuning/jobs/{job['id']}").json() == job
+    events = client.get(f"/v1/fine_tuning/jobs/{job['id']}/events").json()
+    assert events["data"][0]["level"] == "error"
+    assert client.get(f"/v1/fine_tuning/jobs/{job['id']}/checkpoints").json()["data"] == []
+    assert client.post(f"/v1/fine_tuning/jobs/{job['id']}/cancel").status_code == 409
+
+
+def test_crud_stub_persists_to_a_json_file_per_record(client: TestClient) -> None:
+    created = client.post("/v1/files", json={"note": "durable"}).json()
+    record_path = emullm_api._files_store._dir / f"{created['id']}.json"
+    assert record_path.exists()
+    on_disk = json.loads(record_path.read_text(encoding="utf-8"))
+    assert on_disk["note"] == "durable"
+
+
+def test_files_multipart_upload_retrieve_content_and_delete(client: TestClient) -> None:
+    content = b'{"messages": [{"role": "user", "content": "hello"}]}\n'
+    response = client.post(
+        "/v1/files",
+        data={"purpose": "fine-tune"},
+        files={"file": ("training.jsonl", content, "application/jsonl")},
+    )
+
+    assert response.status_code == 200
+    created = response.json()
+    assert created["object"] == "file"
+    assert created["filename"] == "training.jsonl"
+    assert created["purpose"] == "fine-tune"
+    assert created["bytes"] == len(content)
+    assert created["status"] == "processed"
+
+    file_id = created["id"]
+    assert client.get(f"/v1/files/{file_id}").json() == created
+    assert client.get(f"/v1/files/{file_id}/content").content == content
+    assert created in client.get("/v1/files").json()["data"]
+
+    deleted = client.delete(f"/v1/files/{file_id}")
+    assert deleted.json() == {"id": file_id, "object": "file", "deleted": True}
+    assert client.get(f"/v1/files/{file_id}").status_code == 404
+    assert client.get(f"/v1/files/{file_id}/content").status_code == 404
+
+
+def test_files_upload_validates_required_multipart_fields(client: TestClient) -> None:
+    missing_file = client.post(
+        "/v1/files",
+        data={"purpose": "fine-tune"},
+        files={"unused": ("unused.txt", b"x", "text/plain")},
+    )
+    assert missing_file.status_code == 400
+
+    missing_purpose = client.post(
+        "/v1/files",
+        files={"file": ("training.jsonl", b"{}\n", "application/jsonl")},
+    )
+    assert missing_purpose.status_code == 400
+
+
+def test_files_admin_reset_removes_metadata_and_content(client: TestClient) -> None:
+    created = client.post(
+        "/v1/files",
+        data={"purpose": "user_data"},
+        files={"file": ("notes.txt", b"remember me", "text/plain")},
+    ).json()
+    content_path = emullm_api._files_store.content_path(created["id"])  # noqa: SLF001
+    assert content_path.is_file()
+
+    response = client.post("/admin/emullm/reset")
+
+    assert response.status_code == 200
+    assert response.json()["removed"]["files"] == 1
+    assert not content_path.exists()
+
+
+def test_files_list_supports_filtering_order_and_cursor_pagination(client: TestClient) -> None:
+    first = client.post("/v1/files", json={"filename": "a.txt", "purpose": "assistants"}).json()
+    second = client.post("/v1/files", json={"filename": "b.txt", "purpose": "fine-tune"}).json()
+    third = client.post("/v1/files", json={"filename": "c.txt", "purpose": "fine-tune"}).json()
+
+    ascending = client.get("/v1/files", params={"order": "asc", "limit": 2}).json()
+    assert [record["id"] for record in ascending["data"]] == [first["id"], second["id"]]
+    assert ascending["first_id"] == first["id"]
+    assert ascending["last_id"] == second["id"]
+    assert ascending["has_more"] is True
+
+    next_page = client.get(
+        "/v1/files",
+        params={"order": "asc", "after": ascending["last_id"], "limit": 2},
+    ).json()
+    assert [record["id"] for record in next_page["data"]] == [third["id"]]
+    assert next_page["has_more"] is False
+
+    filtered = client.get("/v1/files", params={"purpose": "fine-tune", "order": "asc"}).json()
+    assert [record["id"] for record in filtered["data"]] == [second["id"], third["id"]]
+
+
+def test_files_enforce_upload_limit_and_clean_temporary_data(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(emullm_api, "_MAX_FILE_BYTES", 4)
+
+    response = client.post(
+        "/v1/files",
+        data={"purpose": "user_data"},
+        files={"file": ("too-large.txt", b"12345", "text/plain")},
+    )
+
+    assert response.status_code == 413
+    assert client.get("/v1/files").json()["data"] == []
+    assert not list(emullm_api._files_store._dir.glob("*.tmp"))  # noqa: SLF001
+
+
+def test_files_support_expiration_safe_names_and_range_downloads(client: TestClient) -> None:
+    response = client.post(
+        "/v1/files",
+        data={
+            "purpose": "user_data",
+            "expires_after[anchor]": "created_at",
+            "expires_after[seconds]": "60",
+        },
+        files={"file": ("../notes.txt", b"abcdef", "text/plain")},
+    )
+    created = response.json()
+
+    assert response.status_code == 200
+    assert created["filename"] == "notes.txt"
+    assert created["expires_at"] == created["created_at"] + 60
+
+    partial = client.get(
+        f"/v1/files/{created['id']}/content",
+        headers={"Range": "bytes=1-3"},
+    )
+    assert partial.status_code == 206
+    assert partial.content == b"bcd"
+
+
+def test_storage_round_trip_put_get_delete(client: TestClient) -> None:
+    assert client.get("/emullm/storage").json() == {"files": []}
+    assert client.get("/emullm/storage/notes/todo.txt").status_code == 404
+
+    put_response = client.put("/emullm/storage/notes/todo.txt", content=b"remember this")
+    assert put_response.status_code == 200
+    assert put_response.json() == {"path": "notes/todo.txt", "bytes": len(b"remember this")}
+
+    assert client.get("/emullm/storage").json() == {"files": ["notes/todo.txt"]}
+    get_response = client.get("/emullm/storage/notes/todo.txt")
+    assert get_response.status_code == 200
+    assert get_response.content == b"remember this"
+
+    delete_response = client.delete("/emullm/storage/notes/todo.txt")
+    assert delete_response.status_code == 200
+    assert client.get("/emullm/storage/notes/todo.txt").status_code == 404
+
+
+def test_storage_rejects_path_traversal(client: TestClient) -> None:
+    # The HTTP client normalizes ".." before it's even sent in some cases,
+    # so either FastAPI's routing 404s on the resulting path, or our own
+    # _safe_storage_path guard rejects it with 400 -- both are acceptable,
+    # the important thing is neither one ever escapes the storage root.
+    assert client.get("/emullm/storage/../../etc/passwd").status_code in (400, 404)
+    assert client.put("/emullm/storage/../escape.txt", content=b"x").status_code in (400, 404)
+
+
+def test_admin_state_reports_connected_workers_and_usage(client: TestClient) -> None:
+    emullm_api._connected_workers["alice"] = FakeWorker(reply="ok")  # noqa: SLF001
+    asyncio.run(emullm_api._relay("alice/same", "hi"))
+
+    state = client.get("/admin/emullm/state").json()
+
+    assert "alice" in state["connected_worker_ids"]
+    assert state["worker_usage"]["alice"]["total_requests"] == 1
+
+
+def test_admin_state_reports_mode_and_default_role(client: TestClient) -> None:
+    emullm_api._connected_workers["alice"] = FakeWorker()  # noqa: SLF001
+    state = client.get("/admin/emullm/state").json()
+    assert "mode" in state
+    assert state["uptime_seconds"] >= 0
+    # A connected worker with no declared role reports the default.
+    assert state["worker_roles"]["alice"] == "trusted"
+
+
+def test_admin_state_reports_declared_worker_role(client: TestClient) -> None:
+    emullm_api._connected_workers["bob"] = FakeWorker()  # noqa: SLF001
+    emullm_api._worker_roles["bob"] = "training"  # noqa: SLF001
+    state = client.get("/admin/emullm/state").json()
+    assert state["worker_roles"]["bob"] == "training"
+
+
+def test_status_pages_render_html(client: TestClient) -> None:
+    for url in ("/emullm/status", "/emullm/status/detail", "/admin/emullm/status"):
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert "text/html" in response.headers["content-type"]
+        assert "emullm status" in response.text
+    # The detail view injects DETAIL = true; the overview injects false.
+    assert "const DETAIL = true" in client.get("/emullm/status/detail").text
+    assert "const DETAIL = false" in client.get("/emullm/status").text
+
+
+def test_managed_workers_empty_without_supervisor(client: TestClient) -> None:
+    state = client.get("/admin/emullm/state").json()
+    assert state["managed_workers"] == []
+    listing = client.get("/admin/emullm/workers").json()
+    assert listing["supervisor_active"] is False
+    assert listing["workers"] == []
+
+
+def test_worker_control_endpoints_start_and_stop(client: TestClient) -> None:
+    from emullm import supervisor as sup
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.pid = 777
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+        def terminate(self):
+            self._alive = False
+
+        def wait(self, timeout=None):
+            self._alive = False
+            return 0
+
+    supervisor = sup.Supervisor(
+        [sup.WorkerSpec(worker_id="emullm_worker_1", argv=["x"], role="training")],
+        spawn=lambda spec: FakeProc(),
+    )
+    emullm_api._sup.set_supervisor(supervisor)  # noqa: SLF001
+    try:
+        listing = client.get("/admin/emullm/workers").json()
+        assert listing["supervisor_active"] is True
+        assert listing["workers"][0]["worker_id"] == "emullm_worker_1"
+        assert listing["workers"][0]["running"] is False
+
+        started = client.post("/admin/emullm/workers/emullm_worker_1/start").json()
+        assert started["started"] is True
+        assert started["workers"][0]["running"] is True
+
+        # It also shows up in the aggregate state.
+        state = client.get("/admin/emullm/state").json()
+        assert state["managed_workers"][0]["running"] is True
+
+        stopped = client.post("/admin/emullm/workers/emullm_worker_1/stop").json()
+        assert stopped["stopped"] is True
+        assert stopped["workers"][0]["running"] is False
+
+        # Unknown worker -> 404.
+        assert client.post("/admin/emullm/workers/nope/start").status_code == 404
+    finally:
+        emullm_api._sup.set_supervisor(None)  # noqa: SLF001
+
+
+def test_worker_control_409_without_supervisor(client: TestClient) -> None:
+    assert client.post("/admin/emullm/workers/x/start").status_code == 409
+    assert client.post("/admin/emullm/workers/x/stop").status_code == 409
+
+
+def test_config_get_default_is_empty(client: TestClient) -> None:
+    result = client.get("/admin/emullm/config").json()
+    assert result["config"] == {}
+    assert result["path"].endswith("config.json")
+
+
+def test_config_put_then_get_round_trip(client: TestClient) -> None:
+    payload = {"config": {"mode": "auto", "workers": [{"id": "w1", "role": "training"}]}}
+    saved = client.put("/admin/emullm/config", json=payload)
+    assert saved.status_code == 200
+    assert saved.json()["saved"] is True
+    assert client.get("/admin/emullm/config").json()["config"] == payload["config"]
+    # alias behaves identically
+    assert client.get("/emullm/admin/config").json()["config"] == payload["config"]
+
+
+def test_config_put_rejects_non_object(client: TestClient) -> None:
+    # `config` must be a JSON object; a list is rejected by validation.
+    assert client.put("/admin/emullm/config", json={"config": [1, 2, 3]}).status_code == 422
+
+
+def test_config_put_rejects_unknown_top_level_key(client: TestClient) -> None:
+    # Unknown top-level keys are rejected so a hand-edited file catches typos.
+    resp = client.put("/admin/emullm/config", json={"config": {"moed": "mock"}})
+    assert resp.status_code == 422
+
+
+def test_config_put_rejects_bad_launch_enum(client: TestClient) -> None:
+    payload = {"config": {"agents": [{"kind": "agent", "id": "a", "launch": "nope"}]}}
+    assert client.put("/admin/emullm/config", json=payload).status_code == 422
+
+
+def test_config_put_accepts_unified_agents(client: TestClient) -> None:
+    payload = {
+        "config": {
+            "description": "test cluster",
+            "mode": "recruit,mock",
+            "capability_fallback": "wait",
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "alice",
+                    "launch": "subagent",
+                    "command": "copilot",
+                    "description": "spawned copilot",
+                    "observe": ["chat"],
+                    "services": {
+                        "chat": "serve",
+                        "images": {"behavior": "error", "description": "not offered"},
+                    },
+                }
+            ],
+        }
+    }
+    saved = client.put("/admin/emullm/config", json=payload)
+    assert saved.status_code == 200, saved.text
+    assert client.get("/admin/emullm/config").json()["config"] == payload["config"]
+
+
+def test_config_schema_endpoint(client: TestClient) -> None:
+    schema = client.get("/admin/emullm/config/schema").json()
+    props = schema["properties"]
+    assert "agents" in props and "services" in props and "capability_fallback" in props
+    # alias serves the same schema
+    assert client.get("/emullm/admin/config/schema").json() == schema
+
+
+def test_backends_probe_reports_models(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        emullm_api,
+        "_http_get_json",
+        lambda url, headers, timeout=15.0: {"data": [{"id": "gpt-4o-mini"}, {"id": "gpt-4o"}]},
+    )
+    client.put(
+        "/admin/emullm/config",
+        json={"config": {"agents": [
+            {"kind": "agent", "id": "openai", "launch": "proxy",
+             "base_url": "http://backend.test/v1", "model": "gpt-4o-mini", "default": True}
+        ]}},
+    )
+    result = client.get("/admin/emullm/backends/probe").json()["backends"]
+    assert result[0]["ok"] is True
+    assert "gpt-4o-mini" in result[0]["models"]
+
+
+def test_backends_probe_survives_unreachable_backend(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(url, headers, timeout=15.0):
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(emullm_api, "_http_get_json", boom)
+    client.put("/admin/emullm/config", json={"config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]}})
+    result = client.get("/admin/emullm/backends/probe").json()["backends"]
+    assert result[0]["ok"] is False
+    assert "error" in result[0]
+
+
+def test_backends_probe_verify_flags_falsely_advertised(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeHTTPError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(f"HTTP {code}")
+            self.code = code
+
+    monkeypatch.setattr(
+        emullm_api,
+        "_http_get_json",
+        lambda url, headers, timeout=15.0: {"data": [{"id": "live-model"}, {"id": "dead-model"}]},
+    )
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        if payload.get("model") == "live-model" and "chat/completions" in url:
+            return {"choices": [{"message": {"content": "ok"}}]}
+        raise FakeHTTPError(404)  # dead-model: not loaded
+
+    def fake_raw(url, headers, payload, timeout=60.0):
+        raise FakeHTTPError(404)  # audio speech: not offered
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    monkeypatch.setattr(emullm_api, "_http_post_raw", fake_raw)
+    client.put("/admin/emullm/config", json={"config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]}})
+    b = client.get("/admin/emullm/backends/probe?verify=true").json()["backends"][0]
+    assert b["live"] == ["live-model"]
+    assert b["falsely_advertised"] == ["dead-model"]
+
+
+def test_backends_probe_verify_429_is_inconclusive_not_false(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeHTTPError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(f"HTTP {code}")
+            self.code = code
+
+    monkeypatch.setattr(
+        emullm_api, "_http_get_json", lambda url, headers, timeout=15.0: {"data": [{"id": "busy-model"}]}
+    )
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)  # skip real backoff waits
+
+    def always_429(url, headers, payload, timeout=60.0):
+        raise FakeHTTPError(429)
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", always_429)
+    monkeypatch.setattr(emullm_api, "_http_post_raw", always_429)
+    client.put("/admin/emullm/config", json={"config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]}})
+    b = client.get("/admin/emullm/backends/probe?verify=true&limit=1").json()["backends"][0]
+    # rate-limited is inconclusive, never counted as falsely advertised
+    assert b["falsely_advertised"] == []
+    assert "busy-model" in b["inconclusive"]
+
+
+def test_aggregate_validate_drops_dead_models(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeHTTPError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(f"HTTP {code}")
+            self.code = code
+
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(
+        emullm_api, "_http_get_json", lambda url, headers, timeout=15.0: {"data": [{"id": "good"}, {"id": "dead"}]}
+    )
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        # only "good" answers the text ("what model are you") IQ test
+        if payload.get("model") == "good" and "chat/completions" in url:
+            if isinstance(payload["messages"][0]["content"], str):
+                return {"choices": [{"message": {"content": "I am good"}}]}
+        raise FakeHTTPError(404)
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    monkeypatch.setattr(emullm_api, "_http_post_raw", lambda *a, **k: (_ for _ in ()).throw(FakeHTTPError(404)))
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "o",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "services": {"models": {"behavior": "aggregate", "update_interval": "1day", "validate": True}},
+                }
+            ]
+        }
+    )
+    cat = emullm_api.advertised_catalog()
+    assert cat["models"] == ["good"]  # "dead" (404 everywhere) filtered out by validation
+
+
+def test_validation_interval_never_and_default(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    def fake_get(url, headers, timeout=15.0):
+        calls["n"] += 1
+        return {"data": [{"id": "live"}]}
+
+    monkeypatch.setattr(emullm_api, "_http_get_json", fake_get)
+
+    # "never" -> no fetch, just the config models
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "n",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["cfg"],
+                    "services": {"models": {"behavior": "aggregate", "validation_interval": "never"}},
+                }
+            ]
+        }
+    )
+    assert emullm_api.advertised_catalog()["models"] == ["cfg"]
+    assert calls["n"] == 0
+
+    # "default" -> inherit the server-level validation_interval (so it fetches)
+    emullm_api.apply_agent_policies(
+        {
+            "validation_interval": "1day",
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "d",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["cfg"],
+                    "services": {"models": {"behavior": "aggregate", "validation_interval": "default"}},
+                }
+            ],
+        }
+    )
+    assert "live" in emullm_api.advertised_catalog()["models"]
+    assert calls["n"] >= 1
+
+
+def test_validation_interval_override_forces_all(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    def fake_get(url, headers, timeout=15.0):
+        calls["n"] += 1
+        return {"data": [{"id": "live"}]}
+
+    monkeypatch.setattr(emullm_api, "_http_get_json", fake_get)
+    # agent declares its OWN 1day, but the top-level override "never" wins.
+    emullm_api.apply_agent_policies(
+        {
+            "validation_interval_override": "never",
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "o",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["cfg"],
+                    "services": {"models": {"behavior": "aggregate", "validation_interval": "1day"}},
+                }
+            ],
+        }
+    )
+    assert emullm_api.advertised_catalog()["models"] == ["cfg"]  # override "never" -> no fetch
+    assert calls["n"] == 0
+
+
+def test_agent_level_validation_interval_is_implicit_for_its_models(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"n": 0}
+
+    def fake_get(url, headers, timeout=15.0):
+        calls["n"] += 1
+        return {"data": [{"id": "live"}]}
+
+    monkeypatch.setattr(emullm_api, "_http_get_json", fake_get)
+    # plain validation_interval at the agent level applies implicitly to its
+    # services.models (which doesn't declare its own).
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "a",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["cfg"],
+                    "validation_interval": "1day",
+                    "services": {"models": {"behavior": "aggregate"}},
+                }
+            ]
+        }
+    )
+    assert "live" in emullm_api.advertised_catalog()["models"]
+    assert calls["n"] >= 1
+
+
+def test_models_can_be_ids_or_nodes(client: TestClient) -> None:
+    # A models list may mix bare ids and node objects; the catalog extracts ids.
+    emullm_api.apply_agent_policies(
+        {
+            "services": {"models": ["base-id", {"id": "base-node", "chat": True}]},
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "a",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "models": ["m-str", {"id": "m-node", "validation_doneAt": "2020-01-01T00:00:00Z"}],
+                    "services": {"models": {"behavior": "aggregate", "validation_interval": None}},
+                }
+            ],
+        }
+    )
+    cat = emullm_api.advertised_catalog()
+    assert cat["models"] == ["base-id", "base-node", "m-str", "m-node"]
+
+
+def test_validate_agent_models_produces_nodes_with_timestamps(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        if "chat/completions" in url and isinstance(payload["messages"][0]["content"], str):
+            return {"choices": [{"message": {"content": "I am M1"}}]}
+        raise RuntimeError("wrong modality")
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    nodes = emullm_api.validate_agent_models({"id": "o", "base_url": "http://x/v1", "models": ["m1"]})
+    node = nodes[0]
+    assert node["id"] == "m1"
+    assert node["chat"] is True and node["status"] == "live"
+    assert node["identity"] == "I am M1"
+    assert node["validation_startedAt"] and node["validation_doneAt"]
+
+
+class _FakeHTTPError(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__(f"HTTP {code}")
+        self.code = code
+
+
+def test_probe_status_reachable_when_chat_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Endpoint answers a well-formed completion but with no usable content, and
+    # serves nothing else -> "reachable" (not dead, but won't chat), not "live".
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        if "chat/completions" in url:
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+        raise _FakeHTTPError(404)
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    monkeypatch.setattr(emullm_api, "_http_post_raw", lambda *a, **k: (_ for _ in ()).throw(_FakeHTTPError(404)))
+    r = emullm_api._probe_modalities_sync("http://x/v1", {}, "empty-model")
+    assert r["status"] == "reachable"
+    assert r["live"] is False
+    assert r["chat"] is True  # chat capability present; it just won't answer
+    assert "won't chat" in r["notes"]
+
+
+def test_probe_status_embeddings_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Doesn't chat, but serves embeddings -> usable (live: True) yet not "live"
+    # status; reported as "embeddings-only".
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        if "embeddings" in url:
+            return {"data": [{"embedding": [0.1, 0.2]}]}
+        raise _FakeHTTPError(404)
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    monkeypatch.setattr(emullm_api, "_http_post_raw", lambda *a, **k: (_ for _ in ()).throw(_FakeHTTPError(404)))
+    r = emullm_api._probe_modalities_sync("http://x/v1", {}, "emb-model")
+    assert r["status"] == "embeddings-only"
+    assert r["live"] is True
+    assert r["chat"] is False
+    assert "no chat" in r["notes"]
+
+
+def test_probe_not_loaded_note_confirms_4xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A definite 4xx on every surface -> not_loaded, with the code confirmed.
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        raise _FakeHTTPError(400)
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    monkeypatch.setattr(emullm_api, "_http_post_raw", fake_post)
+    r = emullm_api._probe_modalities_sync("http://x/v1", {}, "gone-model")
+    assert r["status"] == "not_loaded"
+    assert r["notes"] == "confirmed not loaded (HTTP 400)"
+
+
+def test_validate_skips_recently_validated_node(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        if "chat/completions" in url and isinstance(payload["messages"][0]["content"], str):
+            return {"choices": [{"message": {"content": "ok"}}]}
+        raise RuntimeError("wrong modality")
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    fresh = emullm_api._now_iso()
+    agent = {
+        "id": "o",
+        "base_url": "http://x/v1",
+        "services": {
+            "models": {
+                "behavior": "aggregate",
+                "validation_interval": "1day",
+                "catalog": [
+                    {"id": "recent", "validation_doneAt": fresh},  # fresh -> kept as-is
+                    "stale-id",  # bare id -> gets the IQ test
+                ],
+            }
+        },
+    }
+    nodes = emullm_api.validate_agent_models(agent)
+    by_id = {n["id"]: n for n in nodes}
+    assert by_id["recent"].get("validation_doneAt") == fresh  # not re-tested
+    assert "chat" not in by_id["recent"]  # untouched original node
+    assert by_id["stale-id"]["status"] == "live"  # freshly validated
+
+
+def test_validation_timeout_node(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(emullm_api.time, "sleep", lambda *a, **k: None)
+
+    def hang(base, headers, model_id, **kwargs):
+        import threading
+
+        threading.Event().wait(5)  # never returns within the tiny timeout
+        return {"id": model_id, "status": "live"}
+
+    monkeypatch.setattr(emullm_api, "_probe_modalities_sync", hang)
+    agent = {
+        "id": "o",
+        "base_url": "http://x/v1",
+        "services": {
+            "models": {
+                "behavior": "aggregate",
+                "validation_interval": "1day",
+                "validation_timeout": 1,  # 1 second budget
+                "catalog": ["slow-model"],
+            }
+        },
+    }
+    node = emullm_api.validate_agent_models(agent)[0]
+    assert node["status"] == "timeout"
+    assert "raise the timeout" in node["description"]
+
+
+def test_cross_agent_model_failover(client: TestClient) -> None:
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "primary",
+                    "launch": "proxy",
+                    "base_url": "http://p/v1",
+                    "services": {
+                        "models": {
+                            "behavior": "aggregate",
+                            "validation_interval": None,
+                            "catalog": [{"id": "shared", "status": "not_loaded", "live": False}, "solo-p"],
+                        }
+                    },
+                },
+                {
+                    "kind": "agent",
+                    "id": "backup",
+                    "launch": "proxy",
+                    "base_url": "http://b/v1",
+                    "services": {
+                        "models": {"behavior": "aggregate", "validation_interval": None, "catalog": ["shared", "solo-b"]}
+                    },
+                },
+            ]
+        }
+    )
+    # "shared" is dead on primary, live on backup -> failover routes to backup.
+    assert emullm_api.agents_for_model("shared") == ["backup"]
+    assert emullm_api.agents_for_model("solo-p") == ["primary"]
+    assert emullm_api.model_failover_map()["shared"] == ["backup"]
+
+
+def test_aggregate_router_strategies(client: TestClient) -> None:
+    # failover: skip validated-dead, take first live, rest are the failover order
+    chosen, order = emullm_api.select_from_catalog(
+        [{"id": "dead", "status": "not_loaded"}, "m1", "m2"], "failover"
+    )
+    assert chosen == "m1" and order == ["m1", "m2"]
+    # round-robin rotates across live entries (keyed)
+    picks = [emullm_api.select_from_catalog(["a", "b", "c"], "round-robin", key="k")[0] for _ in range(4)]
+    assert picks == ["a", "b", "c", "a"]
+    # random returns a live one
+    assert emullm_api.select_from_catalog(["x", "y"], "random")[0] in ("x", "y")
+    # all dead / empty -> nothing
+    assert emullm_api.select_from_catalog([{"id": "d", "live": False}], "failover") == (None, [])
+
+
+def test_resolve_service_route_aggregate(client: TestClient) -> None:
+    agent = {
+        "id": "o",
+        "services": {
+            "images": {
+                "behavior": "aggregate",
+                "strategy": "failover",
+                "catalog": [{"id": "d", "live": False}, "m1", "m2"],
+            }
+        },
+    }
+    assert emullm_api.resolve_service_route(agent, "images") == ("m1", ["m1", "m2"])
+    # a non-aggregate service has no route
+    assert emullm_api.resolve_service_route({"id": "o", "services": {"chat": "serve"}}, "chat") == (None, [])
+
+
+def test_model_list_lives_on_service_node(client: TestClient) -> None:
+    # the model list/cache may live on services.models.catalog (or agent.models)
+    emullm_api.apply_agent_policies(
+        {
+            "agents": [
+                {
+                    "kind": "agent",
+                    "id": "o",
+                    "launch": "proxy",
+                    "base_url": "http://x/v1",
+                    "services": {
+                        "models": {
+                            "behavior": "aggregate",
+                            "validation_interval": None,
+                            "catalog": ["svc-a", "svc-b"],
+                        }
+                    },
+                }
+            ]
+        }
+    )
+    assert emullm_api.advertised_catalog()["models"] == ["svc-a", "svc-b"]
+
+
+def test_admin_page_renders_html(client: TestClient) -> None:
+    for url in ("/emullm/admin", "/admin/emullm"):
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert "text/html" in response.headers["content-type"]
+        assert "emullm admin" in response.text
+    # The page resolves its REST calls relative to wherever it's served.
+    assert "location.pathname" in client.get("/emullm/admin").text
+
+
+def test_admin_rest_works_under_both_prefixes(client: TestClient) -> None:
+    # config PUT/GET reachable under both admin namespaces
+    assert client.put("/emullm/admin/config", json={"config": {"mode": "mock"}}).status_code == 200
+    assert client.get("/admin/emullm/config").json()["config"] == {"mode": "mock"}
+    assert client.put("/admin/emullm/config", json={"config": {"mode": "auto"}}).status_code == 200
+    assert client.get("/emullm/admin/config").json()["config"] == {"mode": "auto"}
+    # workers listing reachable under both
+    assert client.get("/emullm/admin/workers").status_code == 200
+    assert client.get("/admin/emullm/workers").status_code == 200
+
+
+def test_admin_runtime_dir_and_reset(client: TestClient, tmp_path) -> None:
+    new_dir = tmp_path / "moved"
+    client.post("/admin/emullm/runtime_dir", json={"path": str(new_dir)})
+    client.post("/v1/files", json={"note": "x"})
+    assert client.get("/v1/files").json()["data"]
+
+    client.post("/admin/emullm/reset")
+
+    assert client.get("/v1/files").json()["data"] == []
+
+
+def test_admin_delete_record(client: TestClient) -> None:
+    created = client.post("/v1/files", json={"note": "x"}).json()
+    assert client.delete(f"/admin/emullm/records/files/{created['id']}").status_code == 200
+    assert client.get("/v1/files").json()["data"] == []
+    assert client.delete(f"/admin/emullm/records/files/{created['id']}").status_code == 404
+    assert client.delete("/admin/emullm/records/no-such-kind/x").status_code == 404
+
+
+def test_admin_routes_have_an_emullm_admin_alias(client: TestClient) -> None:
+    """/emullm/admin/* must behave identically to /admin/emullm/*."""
+    a = client.get("/emullm/admin/state").json()
+    b = client.get("/admin/emullm/state").json()
+    # uptime_seconds is time-varying between the two calls; compare the rest.
+    a.pop("uptime_seconds", None)
+    b.pop("uptime_seconds", None)
+    assert a == b
+
+    created = client.post("/v1/files", json={"note": "via alias"}).json()
+    reset_via_alias = client.post("/emullm/admin/reset").json()
+    assert reset_via_alias["removed"]["files"] == 1
+    assert client.get("/v1/files").json()["data"] == []
+
+    created = client.post("/v1/files", json={"note": "delete via alias"}).json()
+    assert client.delete(f"/emullm/admin/records/files/{created['id']}").status_code == 200
+    assert client.get("/v1/files").json()["data"] == []
+
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="ok")  # noqa: SLF001
+    asyncio.run(emullm_api._relay("yourself/same", "hi"))
+    client.post("/emullm/admin/usage/reset")
+    assert client.get("/admin/emullm/state").json()["worker_usage"] == {}
+
+
+def test_clients_never_need_auth_tokens(client: TestClient) -> None:
+    """OpenAI-compatible clients must work keyless: no Authorization header
+    required, and a bogus Bearer token must not be treated as required/valid
+    auth (it is simply ignored)."""
+    bare = client.get("/v1/models")
+    assert bare.status_code == 200
+    assert "data" in bare.json()
+
+    with_bogus = client.get(
+        "/v1/models",
+        headers={"Authorization": "Bearer not-a-real-token"},
+    )
+    assert with_bogus.status_code == 200
+    assert with_bogus.json() == bare.json()
+
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="ok")  # noqa: SLF001
+    chat = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "yourself/same",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        # deliberately no Authorization header
+    )
+    assert chat.status_code == 200
+    assert chat.json()["choices"][0]["message"]["content"] == "ok"
+
+    chat_bogus = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "yourself/same",
+            "messages": [{"role": "user", "content": "hi again"}],
+        },
+        headers={"Authorization": "Bearer sk-no-key-required"},
+    )
+    assert chat_bogus.status_code == 200
+    assert chat_bogus.json()["choices"][0]["message"]["content"] == "ok"
+
+
+def test_tokens_new_page_is_html(client: TestClient) -> None:
+    response = client.get("/emullm/tokens/new")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "You do not need a token" in response.text
+    assert "Optional token" in response.text
+
+
+def test_create_token_requires_email(client: TestClient) -> None:
+    assert client.post("/emullm/tokens", json={}).status_code == 422  # missing required field
+    assert client.post("/emullm/tokens", json={"email": "  "}).status_code == 400
+
+
+def test_create_token_generates_one_by_default(client: TestClient) -> None:
+    result = client.post("/emullm/tokens", json={"email": "a@example.com"}).json()
+    assert result["id"]
+    assert result["email"] == "a@example.com"
+    assert emullm_api.is_valid_token(result["id"]) is True
+    assert emullm_api.is_valid_token("not-a-real-token") is False
+
+
+def test_create_token_accepts_a_bring_your_own_token(client: TestClient) -> None:
+    result = client.post("/emullm/tokens", json={"email": "a@example.com", "token": "my-own-token"}).json()
+    assert result["id"] == "my-own-token"
+    assert emullm_api.is_valid_token("my-own-token") is True
+
+
+def test_create_token_can_register_a_public_key(client: TestClient) -> None:
+    pubkey = "ssh-ed25519 AAAAtest a@example.com"
+    client.post("/emullm/tokens", json={"email": "a@example.com", "public_key": pubkey})
+    assert emullm_api.is_registered_public_key(pubkey) is True
+    assert emullm_api.is_registered_public_key("ssh-ed25519 AAAAnope") is False

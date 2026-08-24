@@ -1,0 +1,3 @@
+{"messages":[{"role":"system","content":"Classify support requests. Return exactly one lowercase label."},{"role":"user","content":"I was charged twice for the same order."},{"role":"assistant","content":"billing_duplicate_charge"}]}
+{"messages":[{"role":"system","content":"Classify support requests. Return exactly one lowercase label."},{"role":"user","content":"My package was supposed to arrive three days ago."},{"role":"assistant","content":"shipping_missing_package"}]}
+{"messages":[{"role":"system","content":"Classify support requests. Return exactly one lowercase label."},{"role":"user","content":"I cannot remember my password."},{"role":"assistant","content":"account_password_reset"}]}
