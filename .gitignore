@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+runtime/
+.pytest_cache/
+*.egg-info/
+.venv/
+emullm_worker_*/request.json
+emullm_worker_*/reply.json
+
+# IDE / editor
+.idea/
+
+# Stray virtualenv graveyard and node artifacts (this is a Python project)
+.dead-venvs/
+node_modules/
+package.json
+package-lock.json
+
+# Worker runtime logs/handoff (workers live under subagents/)
+*.log
+**/emullm_worker_*/request.json
+**/emullm_worker_*/reply.json
+.student/
+subagents/codex_ide_worker/
+subagents/copilot_worker_1/
