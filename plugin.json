@@ -1,0 +1,60 @@
+{
+  "id": "emullm",
+  "label": "EMULLM",
+  "description": "Coordination, audio, transcription, and administration infrastructure for Codex/Copilot workers over durable JSONL event streams with HTTP/HTTPS/WS/WSS parity.",
+  "summary": "Run the EMULLM server, review its transports, and open its administration console.",
+  "version": "1.0.0",
+  "entrypoint": "plugin.py",
+  "scan": "startup",
+  "routePrefix": "/emullm",
+  "configPage": "http://127.0.0.1:5173/emullm/admin",
+  "docs": "README.md",
+  "kind": "custom",
+  "requestTimeoutSeconds": 0,
+  "plugin-install": {
+    "requires": [],
+    "install": "python -m pip install -e .",
+    "files": [],
+    "steps": [
+      "Install the `emullm` package into the repository .venv.",
+      "Start the standalone server, or set EMULLM_PLUGIN_MODE=embedded to mount it in-process.",
+      "Open the administration console and confirm the transports answer."
+    ]
+  },
+  "plugin-init": [
+    {
+      "command": "web_proxy",
+      "description": "Redirects /emullm to the Workspace Emulation Router plugin.",
+      "redirect": "http://127.0.0.1:8801/emullm",
+      "path": "/emullm"
+    }
+  ],
+  "ui": {
+    "pages": [
+      {
+        "id": "configure",
+        "label": "Configure Workspace Emulation of LLMs",
+        "kind": "admin",
+        "descriptor": "http://127.0.0.1:5173/emullm/admin",
+        "glyph": "⚙",
+        "group": "PLUGINS"
+      },
+      {
+        "id": "audio",
+        "label": "Workspace Emulation Router",
+        "kind": "admin",
+        "descriptor": "http://127.0.0.1:5173/emullm/docs/",
+        "glyph": "♪",
+        "group": "PLUGINS"
+      },
+      {
+        "id": "monitor",
+        "label": "Workspace Emulation Monitor",
+        "kind": "user",
+        "descriptor": "http://127.0.0.1:5173/emullm/status",
+        "glyph": "◉",
+        "group": "PLUGINS"
+      }
+    ]
+  }
+}

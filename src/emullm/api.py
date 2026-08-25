@@ -3747,7 +3747,7 @@ def admin_stop_worker(worker_id: str) -> dict[str, Any]:
 # the schema below on write (unknown top-level keys are rejected so a
 # hand-edited file catches typos). Location: EMULLM_CONFIG_FILE, else
 # <repo root>/config.json.
-_CONFIG_PATH = Path(os.environ.get("EMULLM_CONFIG_FILE") or (Path(__file__).resolve().parent.parent / "config.json"))
+_CONFIG_PATH = Path(os.environ.get("EMULLM_CONFIG_FILE") or (Path(__file__).resolve().parent.parent.parent / "config.json"))
 
 
 class WorkerConfig(BaseModel):

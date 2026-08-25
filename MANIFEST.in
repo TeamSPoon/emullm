@@ -1,0 +1,8 @@
+include README.md
+include pyproject.toml
+include config.json
+include plugin.json
+include plugin.py
+recursive-include docs *.md
+recursive-include examples *.md *.py *.ps1 *.jsonl
+recursive-include src/emullm/static *
