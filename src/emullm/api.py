@@ -28,10 +28,19 @@ Implemented routes, and how each is emulated:
                                          server's disk for its own scratch
                                          space), plus GET /emullm/storage
                                          to list everything stored
+  - /ws_collab/v1/*                  -- mailbox_chat-compatible service API
+                                         (also /mailbox_chat/v1, /api,
+                                         /emullm, and bare aliases):
+                                         workers are durable mailboxes,
+                                         with config/mailboxes.json and
+                                         events_logs/<worker>.jsonl
+  - WS   /ws_collab/ws                -- mailbox_chat stream adapter
+                                         (also /mailbox_chat/ws,
+                                         /mailbox/ws, /emullm/mailbox/ws)
   - /emullm/specific_worker/{worker_id}/v1/*
                                      -- the SAME /v1/* surface (models,
-                                         chat/completions, completions,
-                                         responses, embeddings,
+                                         chat/completions, messages,
+                                         completions, responses, embeddings,
                                          moderations, images, audio),
                                          but with worker_id pinned from
                                          the URL instead of parsed out of
@@ -39,6 +48,13 @@ Implemented routes, and how each is emulated:
                                          only configure a fixed baseUrl
   - POST /v1/chat/completions        -- relayed to the connected worker (real)
                                          with normal JSON or SSE output
+  - POST /v1/messages                -- Anthropic Messages API-compatible
+                                         surface (Claude SDK / Claude Code
+                                         style). Relayed exactly like
+                                         chat/completions; the reply is
+                                         reshaped into Anthropic content
+                                         blocks, with Anthropic-style SSE
+                                         events when stream=true
   - POST /v1/completions             -- legacy text-completion; wraps the
                                          prompt as a single user message and
                                          relays it the same way
@@ -91,8 +107,8 @@ Implemented routes, and how each is emulated:
                                          remove one. Both URL forms hit
                                          the exact same handlers.
 
-Any request that is genuinely relayed (chat/completions, completions,
-responses) is queued and forwarded to whichever worker is currently
+Any request that is genuinely relayed (chat/completions, messages,
+completions, responses) is queued and forwarded to whichever worker is currently
 connected at WebSocket /emullm/{worker_id}/ws for that model's
 worker_id prefix (e.g. model "alice/same" routes to whoever is connected
 at /emullm/alice/ws). The worker reads the forwarded prompt, composes a
@@ -137,7 +153,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile
@@ -1482,6 +1498,50 @@ def _extract_images(content: Any) -> list[str]:
     return urls
 
 
+def _flatten_anthropic_content(content: Any) -> str:
+    """Like :func:`_flatten_content`, but also descends into Anthropic
+    ``tool_result`` blocks (whose ``content`` may itself be a string or a
+    nested block list) so tool output text isn't silently dropped from the
+    relayed prompt."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif item.get("type") == "tool_result":
+                    inner = _flatten_anthropic_content(item.get("content"))
+                    if inner:
+                        parts.append(inner)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def _extract_anthropic_images(content: Any) -> list[str]:
+    """Pull images out of Anthropic-style content blocks:
+    ``{"type": "image", "source": {"type": "base64", "media_type", "data"}}``
+    (converted to a data: URL the relay already understands) or
+    ``{"type": "image", "source": {"type": "url", "url": ...}}``."""
+    urls: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "image":
+                continue
+            source = item.get("source")
+            if not isinstance(source, dict):
+                continue
+            if source.get("type") == "base64" and source.get("data"):
+                media_type = source.get("media_type") or "image/png"
+                urls.append(f"data:{media_type};base64,{source['data']}")
+            elif isinstance(source.get("url"), str) and source["url"]:
+                urls.append(source["url"])
+    return urls
+
+
 def _reply_content(result: Any) -> str:
     """The text of a relay reply, whether the worker answered with a bare
     string (legacy/mock/proxy) or a structured dict (real two-way worker)."""
@@ -1550,6 +1610,24 @@ class ResponsesRequest(BaseModel):
     input: Any = ""
     temperature: float | None = Field(default=None, ge=0, le=2)
     stream: bool = False
+
+
+class MessagesRequest(BaseModel):
+    """Anthropic Messages API request shape (the surface Claude SDKs and
+    Claude Code speak). ``system`` is a top-level string or block list rather
+    than a message role; tool fields are accepted for wire compatibility but
+    tools are not executed by the relay -- the worker sees their text."""
+
+    model: str = _DEFAULT_MODEL_ID
+    messages: list[ChatMessage] = Field(default_factory=list)
+    max_tokens: int | None = Field(default=None, ge=1)
+    system: Any = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    stream: bool = False
+    stop_sequences: list[str] | None = None
+    metadata: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
 
 
 class EmbeddingsRequest(BaseModel):
@@ -1794,17 +1872,23 @@ async def _relay_to_worker(
                 continue
             try:
                 await peer.send_json(payload)
-                break
             except Exception:
                 if not wait:
                     return _PASS
                 # That worker may have just disconnected; keep waiting/retrying.
                 await asyncio.sleep(0.5)
                 continue
+            _record_relay_request(worker_id, request_id, payload)
+            break
 
         remaining = max(1.0, deadline - time.monotonic())
         try:
-            return await asyncio.wait_for(future, timeout=remaining)
+            result = await asyncio.wait_for(future, timeout=remaining)
+            # Real WebSocket replies are recorded by _handle_worker_message;
+            # this idempotent call also covers test/mock peers that resolve
+            # the Future directly without passing through that handler.
+            _record_relay_reply(worker_id, request_id, result)
+            return result
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="emullm worker did not reply in time")
     finally:
@@ -2101,6 +2185,85 @@ async def chat_completions(body: ChatRequest) -> Any:
         for chunk in chunks:
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@router.post("/v1/messages")
+async def anthropic_messages(body: MessagesRequest) -> Any:
+    """Anthropic Messages API-compatible endpoint. Relays exactly like
+    /v1/chat/completions (same worker routing, personas, model_routes, and
+    modes), then reshapes the reply into an Anthropic ``message`` object --
+    or, when ``stream`` is true, the Anthropic SSE event sequence
+    (message_start / content_block_* / message_delta / message_stop) -- so
+    Anthropic SDKs and Claude Code can point at this relay unchanged."""
+    if not body.messages:
+        raise HTTPException(status_code=400, detail="messages is required")
+    parts: list[str] = []
+    system_text = _flatten_anthropic_content(body.system) if body.system is not None else ""
+    if system_text:
+        parts.append(f"[system] {system_text}")
+    images: list[str] = []
+    for m in body.messages:
+        parts.append(f"[{m.role}] {_flatten_anthropic_content(m.content)}")
+        images.extend(_extract_anthropic_images(m.content))
+        images.extend(_extract_images(m.content))  # tolerate OpenAI-style blocks too
+    prompt_text = "\n\n".join(parts)
+    result = await _relay_full(body.model, prompt_text, images=images or None, kind="vision" if images else "chat")
+    reply_text = _reply_content(result)
+    message_id = _new_resource_id("msg")
+    usage = {
+        "input_tokens": _token_count(prompt_text),
+        "output_tokens": _token_count(reply_text),
+    }
+    message = {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": body.model,
+        "content": [{"type": "text", "text": reply_text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": usage,
+    }
+    if not body.stream:
+        return message
+
+    async def events() -> Any:
+        frames = [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        **message,
+                        "content": [],
+                        "stop_reason": None,
+                        "usage": {"input_tokens": usage["input_tokens"], "output_tokens": 0},
+                    },
+                },
+            ),
+            (
+                "content_block_start",
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            ),
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": reply_text}},
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": usage["output_tokens"]},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+        for event_name, data in frames:
+            yield f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -2511,6 +2674,12 @@ async def specific_worker_chat_completions(worker_id: str, body: ChatRequest) ->
     return await chat_completions(body)
 
 
+@router.post("/emullm/specific_worker/{worker_id}/v1/messages")
+async def specific_worker_messages(worker_id: str, body: MessagesRequest) -> Any:
+    body.model = _force_worker_id(body.model, worker_id)
+    return await anthropic_messages(body)
+
+
 @router.post("/emullm/specific_worker/{worker_id}/v1/completions")
 async def specific_worker_completions(worker_id: str, body: CompletionRequest) -> dict[str, Any]:
     body.model = _force_worker_id(body.model, worker_id)
@@ -2664,6 +2833,491 @@ class _JsonRecordStore:
             return removed
 
 
+# ---------------------------------------------------------------------------
+# Worker mailboxes are durable service channels, not transient WebSocket
+# bookkeeping. Their definitions/cursors live in config/mailboxes.json and
+# each ordered stream lives in events_logs/<mailbox>.jsonl. This mirrors the
+# on-disk layout used by the collaboration services while keeping the worker's
+# existing WebSocket request/reply protocol unchanged.
+# ---------------------------------------------------------------------------
+_MAILBOX_CONFIG_SCHEMA_VERSION = 2
+_MAILBOX_MAX_ID_LENGTH = 64
+_mailbox_lock = threading.RLock()
+
+
+def _mailbox_id(value: Any) -> str:
+    """Validate the portable mailbox identifier shared by REST, files, and WS."""
+    mailbox = str(value or "").strip()
+    if (
+        not mailbox
+        or len(mailbox) > _MAILBOX_MAX_ID_LENGTH
+        or not mailbox[0].isalnum()
+        or any(not (character.isascii() and (character.isalnum() or character in "._-")) for character in mailbox)
+    ):
+        raise ValueError(
+            "mailbox id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        )
+    return mailbox
+
+
+def _mailbox_agent_id(value: Any) -> str:
+    agent = str(value or "").strip()
+    if not agent or len(agent) > 255 or "\x00" in agent:
+        raise ValueError("agent id must be a non-empty string no longer than 255 characters")
+    return agent
+
+
+def _mailbox_config_path() -> Path:
+    return _RUNTIME_DIR / "config" / "mailboxes.json"
+
+
+def _mailbox_events_dir() -> Path:
+    return _RUNTIME_DIR / "events_logs"
+
+
+def _empty_mailbox_config() -> dict[str, Any]:
+    return {
+        "schema_version": _MAILBOX_CONFIG_SCHEMA_VERSION,
+        "mailboxes": {},
+        "agents": {},
+        "cursors": {},
+    }
+
+
+def _load_mailbox_config() -> dict[str, Any]:
+    """Read the durable mailbox configuration, failing loudly if it is corrupt."""
+    path = _mailbox_config_path()
+    if not path.is_file():
+        return _empty_mailbox_config()
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read mailbox configuration at {path}") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError(f"mailbox configuration at {path} must be a JSON object")
+    for key in ("mailboxes", "agents", "cursors"):
+        value = config.get(key)
+        if value is None:
+            config[key] = {}
+        elif not isinstance(value, dict):
+            raise RuntimeError(f"mailbox configuration field '{key}' must be an object")
+    try:
+        schema_version = int(config.get("schema_version") or 1)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"mailbox configuration at {path} has an invalid schema_version") from exc
+    if schema_version < 2:
+        for record in config["mailboxes"].values():
+            if not isinstance(record, dict):
+                continue
+            if record.get("source") == "events_logs":
+                record["source"] = "jsonl"
+            if record.get("transports") == ["events_logs", "websocket"]:
+                record["transports"] = ["jsonl", "ws"]
+        config["schema_version"] = _MAILBOX_CONFIG_SCHEMA_VERSION
+        _save_mailbox_config(config)
+    else:
+        config["schema_version"] = schema_version
+    return config
+
+
+def _save_mailbox_config(config: dict[str, Any]) -> None:
+    path = _mailbox_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".mailboxes.{uuid.uuid4().hex}.json.tmp"
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(config, handle, indent=2, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _mailbox_event_log_path(mailbox: str) -> Path:
+    return _mailbox_events_dir() / f"{_mailbox_id(mailbox)}.jsonl"
+
+
+def _mailbox_events(mailbox: str) -> list[dict[str, Any]]:
+    """Read one mailbox's append-only JSONL event log in sequence order."""
+    path = _mailbox_event_log_path(mailbox)
+    with _mailbox_lock:
+        if not path.is_file():
+            return []
+        events: list[dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8-sig") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise RuntimeError(
+                            f"mailbox event log {path} has a non-object event on line {line_number}"
+                        )
+                    events.append(event)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read mailbox event log at {path}") from exc
+    return events
+
+
+def _mailbox_json_value(value: Any) -> Any:
+    """Make an observed worker value safely representable in an event log."""
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except (TypeError, ValueError):
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            return str(value)
+
+
+def _ensure_mailbox(
+    mailbox: str,
+    *,
+    purpose: str | None = None,
+    hidden: bool | None = None,
+    writable: bool | None = None,
+    source: str | None = None,
+    transports: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create or update one durable mailbox descriptor."""
+    mailbox = _mailbox_id(mailbox)
+    with _mailbox_lock:
+        _mailbox_events_dir().mkdir(parents=True, exist_ok=True)
+        config = _load_mailbox_config()
+        existing = config["mailboxes"].get(mailbox)
+        record = dict(existing) if isinstance(existing, dict) else {}
+        created = not record
+        now = _now_iso()
+        if created:
+            record = {
+                "id": mailbox,
+                "name": mailbox,
+                "global_name": mailbox,
+                "purpose": purpose or f"LLM relay mailbox for worker '{mailbox}'",
+                "kind": "mailbox",
+                "source": source or "jsonl",
+                "transports": transports or ["jsonl", "ws"],
+                "hidden": bool(hidden) if hidden is not None else False,
+                "writable": bool(writable) if writable is not None else True,
+                "created_at": now,
+                "updated_at": now,
+            }
+        else:
+            changed = False
+            for key, value in (
+                ("purpose", purpose),
+                ("hidden", hidden),
+                ("writable", writable),
+                ("source", source),
+                ("transports", transports),
+            ):
+                if value is not None and record.get(key) != value:
+                    record[key] = value
+                    changed = True
+            for key, value in (
+                ("id", mailbox),
+                ("name", mailbox),
+                ("global_name", mailbox),
+                ("kind", "mailbox"),
+            ):
+                if record.get(key) != value:
+                    record[key] = value
+                    changed = True
+            if changed:
+                record["updated_at"] = now
+        config["mailboxes"][mailbox] = record
+        if created or record != existing:
+            _save_mailbox_config(config)
+        return dict(record)
+
+
+def _upsert_mailbox_agent(agent_id: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
+    agent_id = _mailbox_agent_id(agent_id)
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        existing = config["agents"].get(agent_id)
+        record = dict(existing) if isinstance(existing, dict) else {}
+        changed = record.get("id") != agent_id
+        record["id"] = agent_id
+        if properties:
+            safe_properties = _mailbox_json_value(properties)
+            for key, value in safe_properties.items():
+                if record.get(key) != value:
+                    record[key] = value
+                    changed = True
+        if changed:
+            record["updated_at"] = _now_iso()
+            config["agents"][agent_id] = record
+            _save_mailbox_config(config)
+        return dict(record)
+
+
+def _ensure_worker_mailbox(worker_id: str) -> dict[str, Any]:
+    """Expose a connected servant as its identically named mailbox and agent."""
+    mailbox = _ensure_mailbox(
+        worker_id,
+        writable=True,
+        source="jsonl",
+        transports=["jsonl", "ws"],
+    )
+    _upsert_mailbox_agent(
+        worker_id,
+        {
+            "kind": "worker",
+            "worker_id": worker_id,
+            "role": _worker_roles.get(worker_id, _DEFAULT_WORKER_ROLE),
+        },
+    )
+    return mailbox
+
+
+def _mailbox_is_known(mailbox: str) -> bool:
+    mailbox = _mailbox_id(mailbox)
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        return mailbox in config["mailboxes"] or mailbox in _connected_workers
+
+
+def _require_mailbox(mailbox: str) -> str:
+    try:
+        mailbox = _mailbox_id(mailbox)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if mailbox in _connected_workers:
+        _ensure_worker_mailbox(mailbox)
+    if not _mailbox_is_known(mailbox):
+        raise HTTPException(status_code=404, detail=f"no mailbox named '{mailbox}'")
+    return mailbox
+
+
+def _append_mailbox_event(
+    stream: str,
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    source_id: str,
+    source_kind: str,
+    correlation_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Append one event atomically enough for a local durable JSONL stream."""
+    try:
+        stream = _mailbox_id(stream)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    event_type = str(event_type or "").strip()
+    if not event_type:
+        raise HTTPException(status_code=400, detail="event type is required")
+    source_id = _mailbox_agent_id(source_id)
+    source_kind = str(source_kind or "service").strip() or "service"
+    idempotency_key = str(idempotency_key).strip() if idempotency_key else None
+
+    with _mailbox_lock:
+        _ensure_mailbox(stream)
+        events = _mailbox_events(stream)
+        if idempotency_key:
+            for event in reversed(events):
+                if event.get("idempotency_key") == idempotency_key:
+                    return event, True
+        sequence = max((int(event.get("seq") or 0) for event in events), default=0) + 1
+        event: dict[str, Any] = {
+            "id": _new_resource_id("evt"),
+            "stream": stream,
+            "seq": sequence,
+            "type": event_type,
+            "ts": _now_iso(),
+            "schema_version": 1,
+            "source_id": source_id,
+            "source_kind": source_kind,
+            "data": _mailbox_json_value(data),
+        }
+        if correlation_id:
+            event["correlation_id"] = str(correlation_id)
+        if idempotency_key:
+            event["idempotency_key"] = idempotency_key
+        path = _mailbox_event_log_path(stream)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise RuntimeError(f"cannot append mailbox event to {path}") from exc
+        return event, False
+
+
+def _mailbox_event_to_message(event: dict[str, Any]) -> dict[str, Any]:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    text = data.get("text", data.get("prompt", ""))
+    if isinstance(text, (dict, list)):
+        text = json.dumps(text, ensure_ascii=False)
+    return {
+        "id": str(event.get("id") or ""),
+        "timestamp": event.get("ts"),
+        "from": data.get("from") or event.get("source_id"),
+        "to": data.get("to"),
+        "send_to": data.get("send_to"),
+        "text": str(text or ""),
+        "type": event.get("type"),
+        "mailboxId": event.get("stream"),
+        "mailboxName": event.get("stream"),
+        "author": data.get("author") or event.get("source_id"),
+        "authorName": data.get("authorName") or data.get("author") or event.get("source_id"),
+        "raw": event,
+    }
+
+
+def _mailbox_endpoint_paths(mailbox: str) -> dict[str, str]:
+    mailbox = _mailbox_id(mailbox)
+    base = "/ws_collab/v1"
+    return {
+        "read": f"{base}/mailbox/messages?mailbox={mailbox}",
+        "send": f"{base}/mailbox/send",
+        "tail": f"{base}/streams/{mailbox}/tail",
+        "events": f"{base}/events?stream={mailbox}",
+        "ws": "/ws_collab/ws",
+        "worker_ws": f"/emullm/{mailbox}/ws",
+    }
+
+
+def _mailbox_cursor_payload(mailbox: str, agent: str) -> dict[str, Any]:
+    mailbox = _require_mailbox(mailbox)
+    try:
+        agent = _mailbox_agent_id(agent)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        events = _mailbox_events(mailbox)
+        record = config["cursors"].get(f"{agent}\x1f{mailbox}")
+        initialized = isinstance(record, dict) and bool(record.get("initialized"))
+        offset = int(record.get("offset") or 0) if initialized else 0
+        offset = max(0, min(offset, len(events)))
+    return {
+        "mailbox": mailbox,
+        "agent": agent,
+        "initialized": initialized,
+        "offset": offset,
+        "size": len(events),
+        "behind": len(events) - offset,
+        "entries_consumed": offset,
+        "entry_next": offset,
+        "entries_total": len(events),
+        "last_read_id": events[offset - 1].get("id") if offset else None,
+        "next_unread_id": events[offset].get("id") if offset < len(events) else None,
+    }
+
+
+def _set_mailbox_cursor(mailbox: str, agent: str, start: str) -> dict[str, Any]:
+    mailbox = _require_mailbox(mailbox)
+    try:
+        agent = _mailbox_agent_id(agent)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if start not in {"now", "beginning"}:
+        raise HTTPException(status_code=400, detail="cursor start must be 'now' or 'beginning'")
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        offset = len(_mailbox_events(mailbox)) if start == "now" else 0
+        config["cursors"][f"{agent}\x1f{mailbox}"] = {
+            "agent": agent,
+            "mailbox": mailbox,
+            "initialized": True,
+            "offset": offset,
+            "updated_at": _now_iso(),
+        }
+        _save_mailbox_config(config)
+    return _mailbox_cursor_payload(mailbox, agent)
+
+
+def _clear_mailbox_cursor(mailbox: str, agent: str) -> dict[str, Any]:
+    mailbox = _require_mailbox(mailbox)
+    try:
+        agent = _mailbox_agent_id(agent)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        config["cursors"].pop(f"{agent}\x1f{mailbox}", None)
+        _save_mailbox_config(config)
+    return _mailbox_cursor_payload(mailbox, agent)
+
+
+def _mailbox_event_count() -> int:
+    count = 0
+    directory = _mailbox_events_dir()
+    with _mailbox_lock:
+        if not directory.is_dir():
+            return 0
+        for path in directory.glob("*.jsonl"):
+            try:
+                count += len(_mailbox_events(path.stem))
+            except ValueError:
+                continue
+    return count
+
+
+def _clear_mailbox_storage() -> dict[str, int]:
+    """Remove mailbox configuration and every stream log for admin/test reset."""
+    with _mailbox_lock:
+        removed = {"mailbox_config": 0, "mailbox_events": 0}
+        config = _mailbox_config_path()
+        if config.is_file():
+            config.unlink()
+            removed["mailbox_config"] = 1
+        directory = _mailbox_events_dir()
+        if directory.is_dir():
+            for path in directory.glob("*.jsonl"):
+                path.unlink()
+                removed["mailbox_events"] += 1
+        return removed
+
+
+def _record_relay_request(worker_id: str, request_id: str, payload: dict[str, Any]) -> None:
+    _append_mailbox_event(
+        worker_id,
+        "LLM_REQUEST",
+        {
+            "text": payload.get("prompt", ""),
+            "prompt": payload.get("prompt", ""),
+            "model": payload.get("model"),
+            "from": "llm-api",
+            "to": worker_id,
+            "send_to": worker_id,
+            "request": _mailbox_json_value(payload),
+        },
+        source_id="llm-api",
+        source_kind="service",
+        correlation_id=request_id,
+        idempotency_key=f"request:{request_id}",
+    )
+
+
+def _record_relay_reply(worker_id: str, request_id: str, reply: Any) -> None:
+    text = reply.get("content", "") if isinstance(reply, dict) else reply
+    _append_mailbox_event(
+        worker_id,
+        "LLM_REPLY",
+        {
+            "text": str(text or ""),
+            "from": worker_id,
+            "to": "llm-api",
+            "send_to": None,
+            "reply": _mailbox_json_value(reply),
+        },
+        source_id=worker_id,
+        source_kind="worker",
+        correlation_id=request_id or None,
+        idempotency_key=f"reply:{request_id}" if request_id else None,
+    )
+
+
 class _FileRecordStore(_JsonRecordStore):
     """File metadata plus a sibling binary blob for each `/v1/files` ID."""
 
@@ -2725,6 +3379,507 @@ _threads_store = _JsonRecordStore("threads")
 _fine_tuning_jobs_store = _JsonRecordStore("fine_tuning_jobs")
 _fine_tuning_events_store = _JsonRecordStore("fine_tuning_events")
 _tokens_store = _JsonRecordStore("tokens")
+
+
+def _mailbox_descriptor(record: dict[str, Any], agent: str | None = None) -> dict[str, Any]:
+    mailbox = _mailbox_id(record.get("id"))
+    events = _mailbox_events(mailbox)
+    descriptor: dict[str, Any] = {
+        "id": mailbox,
+        "name": str(record.get("name") or mailbox),
+        "global_name": str(record.get("global_name") or mailbox),
+        "purpose": str(record.get("purpose") or f"LLM relay mailbox for worker '{mailbox}'"),
+        "kind": str(record.get("kind") or "mailbox"),
+        "source": str(record.get("source") or "jsonl"),
+        "transports": list(record.get("transports") or ["jsonl", "ws"]),
+        "storage": "events_logs",
+        "hidden": bool(record.get("hidden")),
+        "writable": bool(record.get("writable", True)),
+        "messages": len(events),
+        "connected": mailbox in _connected_workers,
+        "last_activity": events[-1].get("ts") if events else None,
+        "filename": str(_mailbox_event_log_path(mailbox)),
+        "endpoints": _mailbox_endpoint_paths(mailbox),
+    }
+    if agent:
+        cursor = _mailbox_cursor_payload(mailbox, agent)
+        descriptor.update(
+            {
+                "unread": cursor["behind"],
+                "cursorOffset": cursor["offset"],
+                "cursorInitialized": cursor["initialized"],
+                "lastReadMessageId": cursor["last_read_id"],
+                "nextUnreadMessageId": cursor["next_unread_id"],
+            }
+        )
+    return descriptor
+
+
+def _mailbox_directory(agent: str | None = None, include_activity: bool = False) -> list[dict[str, Any]]:
+    for worker_id in tuple(_connected_workers):
+        _ensure_worker_mailbox(worker_id)
+    if agent:
+        try:
+            agent = _mailbox_agent_id(agent)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        records = [
+            dict(record)
+            for record in config["mailboxes"].values()
+            if isinstance(record, dict) and (include_activity or not bool(record.get("hidden")))
+        ]
+    return sorted((_mailbox_descriptor(record, agent) for record in records), key=lambda item: item["id"])
+
+
+def _mailbox_event_page(
+    stream: str,
+    *,
+    after: str | None,
+    limit: int,
+    event_type: str | None = None,
+    source_id: str | None = None,
+    correlation_id: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    stream = _require_mailbox(stream)
+    if not 1 <= limit <= 1000:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
+    events = _mailbox_events(stream)
+    start = 0
+    if after:
+        matching_index = next((index for index, event in enumerate(events) if event.get("id") == after), None)
+        if matching_index is None:
+            raise HTTPException(status_code=409, detail="cursor_invalid")
+        start = matching_index + 1
+    candidates = events[start:]
+    if event_type:
+        candidates = [event for event in candidates if event.get("type") == event_type]
+    if source_id:
+        candidates = [event for event in candidates if event.get("source_id") == source_id]
+    if correlation_id:
+        candidates = [event for event in candidates if event.get("correlation_id") == correlation_id]
+    selected = candidates[:limit]
+    return selected, (selected[-1].get("id") if selected else after), len(candidates) > len(selected)
+
+
+class MailboxCreateRequest(BaseModel):
+    id: str | None = None
+    name: str | None = None
+    purpose: str | None = None
+    hidden: bool | None = None
+    writable: bool | None = None
+    source: str | None = None
+
+
+class MailboxSendRequest(BaseModel):
+    to: str | None = None
+    text: str
+    sender: str = "operator"
+    send_to: str | None = None
+    correlation_id: str | None = None
+    idempotency_key: str | None = None
+
+
+class MailboxAgentRequest(BaseModel):
+    id: str
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class MailboxCursorRequest(BaseModel):
+    mailbox: str
+    agent: str
+    start: Literal["now", "beginning"] = "now"
+
+
+class MailboxEventRequest(BaseModel):
+    stream: str
+    type: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    correlation_id: str | None = None
+    idempotency_key: str | None = None
+    source_id: str = "external"
+    source_kind: str = "service"
+
+
+@router.get("/capabilities")
+@router.get("/emullm/capabilities")
+@router.get("/ws_collab/v1/capabilities")
+@router.get("/mailbox_chat/v1/capabilities")
+def mailbox_capabilities() -> dict[str, Any]:
+    mailboxes = _mailbox_directory(include_activity=True)
+    return {
+        "service": "emullm",
+        "mailboxes": mailboxes,
+        "streams": [mailbox["id"] for mailbox in mailboxes],
+        "rest_base": "/ws_collab/v1",
+        "transports": ["jsonl", "ws"],
+        "server_time": _now_iso(),
+    }
+
+
+@router.get("/mailbox/mailboxes")
+@router.get("/api/mailbox/mailboxes")
+@router.get("/emullm/mailbox/mailboxes")
+@router.get("/ws_collab/v1/mailbox/mailboxes")
+@router.get("/mailbox_chat/v1/mailbox/mailboxes")
+def mailbox_mailboxes(agent: str | None = None, include_activity: bool = False) -> dict[str, Any]:
+    return {
+        "place": "emullm",
+        "global_name": "emullm",
+        "mailboxes": _mailbox_directory(agent=agent, include_activity=include_activity),
+        "server_time": _now_iso(),
+    }
+
+
+@router.post("/mailbox/create")
+@router.post("/api/mailbox/create")
+@router.post("/emullm/mailbox/create")
+@router.post("/ws_collab/v1/mailbox/create")
+@router.post("/mailbox_chat/v1/mailbox/create")
+@router.post("/mailbox/mailboxes")
+@router.post("/api/mailbox/mailboxes")
+@router.post("/emullm/mailbox/mailboxes")
+@router.post("/ws_collab/v1/mailbox/mailboxes")
+@router.post("/mailbox_chat/v1/mailbox/mailboxes")
+def mailbox_create(body: MailboxCreateRequest) -> dict[str, Any]:
+    proposed = body.id or body.name
+    if body.id and body.name and body.id != body.name:
+        raise HTTPException(status_code=400, detail="id and name must match when both are provided")
+    try:
+        mailbox = _mailbox_id(proposed)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    created = not _mailbox_is_known(mailbox)
+    record = _ensure_mailbox(
+        mailbox,
+        purpose=body.purpose.strip() if body.purpose else None,
+        hidden=body.hidden,
+        writable=body.writable,
+        source=body.source.strip() if body.source else None,
+    )
+    return {"created": created, "mailbox": _mailbox_descriptor(record)}
+
+
+@router.get("/mailbox/agents")
+@router.get("/api/mailbox/agents")
+@router.get("/emullm/mailbox/agents")
+@router.get("/ws_collab/v1/mailbox/agents")
+@router.get("/mailbox_chat/v1/mailbox/agents")
+def mailbox_agents() -> dict[str, Any]:
+    for worker_id in tuple(_connected_workers):
+        _ensure_worker_mailbox(worker_id)
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        agents = [dict(agent) for agent in config["agents"].values() if isinstance(agent, dict)]
+    return {"agents": sorted(agents, key=lambda agent: str(agent.get("id") or ""))}
+
+
+@router.post("/mailbox/agents")
+@router.post("/api/mailbox/agents")
+@router.post("/emullm/mailbox/agents")
+@router.post("/ws_collab/v1/mailbox/agents")
+@router.post("/mailbox_chat/v1/mailbox/agents")
+def mailbox_register_agent(body: MailboxAgentRequest) -> dict[str, Any]:
+    try:
+        return _upsert_mailbox_agent(body.id, body.properties)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/mailbox/messages")
+@router.get("/api/mailbox/messages")
+@router.get("/emullm/mailbox/messages")
+@router.get("/ws_collab/v1/mailbox/messages")
+@router.get("/mailbox_chat/v1/mailbox/messages")
+def mailbox_messages(
+    mailbox: str,
+    from_: str | None = Query(default=None, alias="from"),
+    to: str | None = None,
+    send_to: str | None = None,
+    text: str | None = None,
+    filter: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    mailbox = _require_mailbox(mailbox)
+    if not 1 <= limit <= 1000:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
+    messages = [_mailbox_event_to_message(event) for event in _mailbox_events(mailbox)]
+    if from_:
+        messages = [message for message in messages if message["from"] == from_]
+    if to:
+        messages = [message for message in messages if message["to"] == to]
+    if send_to:
+        messages = [message for message in messages if message["send_to"] == send_to]
+    match_text = text or filter
+    if match_text:
+        needle = match_text.casefold()
+        messages = [message for message in messages if needle in message["text"].casefold()]
+    messages = messages[-limit:]
+    return {"messages": messages, "user": from_, "peer": to}
+
+
+@router.post("/mailbox/send")
+@router.post("/api/mailbox/send")
+@router.post("/emullm/mailbox/send")
+@router.post("/ws_collab/v1/mailbox/send")
+@router.post("/mailbox_chat/v1/mailbox/send")
+def mailbox_send(
+    body: MailboxSendRequest,
+    idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    target = body.send_to or body.to
+    if not target:
+        raise HTTPException(status_code=400, detail="send_to or to must name a mailbox")
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+    mailbox = _require_mailbox(target)
+    try:
+        sender = _mailbox_agent_id(body.sender)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _upsert_mailbox_agent(sender, {"kind": "external"})
+    event, _ = _append_mailbox_event(
+        mailbox,
+        "CONVERSATION_MESSAGE",
+        {
+            "text": body.text,
+            "from": sender,
+            "to": body.to,
+            "send_to": body.send_to or mailbox,
+            "author": sender,
+            "authorName": sender,
+        },
+        source_id=sender,
+        source_kind="agent",
+        correlation_id=body.correlation_id,
+        idempotency_key=idempotency_header or body.idempotency_key,
+    )
+    return {"message": _mailbox_event_to_message(event)}
+
+
+@router.get("/mailbox/cursor")
+@router.get("/api/mailbox/cursor")
+@router.get("/emullm/mailbox/cursor")
+@router.get("/ws_collab/v1/mailbox/cursor")
+@router.get("/mailbox_chat/v1/mailbox/cursor")
+def mailbox_cursor(mailbox: str, agent: str) -> dict[str, Any]:
+    return _mailbox_cursor_payload(mailbox, agent)
+
+
+@router.post("/mailbox/cursor")
+@router.post("/api/mailbox/cursor")
+@router.post("/emullm/mailbox/cursor")
+@router.post("/ws_collab/v1/mailbox/cursor")
+@router.post("/mailbox_chat/v1/mailbox/cursor")
+def mailbox_set_cursor(body: MailboxCursorRequest) -> dict[str, Any]:
+    return _set_mailbox_cursor(body.mailbox, body.agent, body.start)
+
+
+@router.delete("/mailbox/cursor")
+@router.delete("/api/mailbox/cursor")
+@router.delete("/emullm/mailbox/cursor")
+@router.delete("/ws_collab/v1/mailbox/cursor")
+@router.delete("/mailbox_chat/v1/mailbox/cursor")
+def mailbox_delete_cursor(mailbox: str, agent: str) -> dict[str, Any]:
+    return _clear_mailbox_cursor(mailbox, agent)
+
+
+@router.get("/events")
+@router.get("/api/events")
+@router.get("/emullm/events")
+@router.get("/ws_collab/v1/events")
+@router.get("/mailbox_chat/v1/events")
+async def mailbox_events(
+    stream: str,
+    after: str | None = None,
+    limit: int = 100,
+    wait_ms: int = 0,
+    type: str | None = None,
+    source_id: str | None = None,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    if not 0 <= wait_ms <= 30000:
+        raise HTTPException(status_code=400, detail="wait_ms must be between 0 and 30000")
+    deadline = time.monotonic() + (wait_ms / 1000)
+    while True:
+        events, next_cursor, has_more = _mailbox_event_page(
+            stream,
+            after=after,
+            limit=limit,
+            event_type=type,
+            source_id=source_id,
+            correlation_id=correlation_id,
+        )
+        if events or wait_ms == 0 or time.monotonic() >= deadline:
+            return {
+                "stream": _require_mailbox(stream),
+                "events": events,
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "server_time": _now_iso(),
+            }
+        await asyncio.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
+
+
+@router.post("/events")
+@router.post("/api/events")
+@router.post("/emullm/events")
+@router.post("/ws_collab/v1/events")
+@router.post("/mailbox_chat/v1/events")
+def mailbox_post_event(
+    body: MailboxEventRequest,
+    idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    try:
+        _upsert_mailbox_agent(body.source_id, {"kind": body.source_kind})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    event, duplicate = _append_mailbox_event(
+        body.stream,
+        body.type,
+        body.data,
+        source_id=body.source_id,
+        source_kind=body.source_kind,
+        correlation_id=body.correlation_id,
+        idempotency_key=idempotency_header or body.idempotency_key,
+    )
+    return {
+        "id": event["id"],
+        "seq": event["seq"],
+        "cursor": event["id"],
+        "duplicate": duplicate,
+        "server_time": _now_iso(),
+    }
+
+
+@router.get("/streams/{mailbox}/tail")
+@router.get("/api/streams/{mailbox}/tail")
+@router.get("/emullm/streams/{mailbox}/tail")
+@router.get("/ws_collab/v1/streams/{mailbox}/tail")
+@router.get("/mailbox_chat/v1/streams/{mailbox}/tail")
+def mailbox_stream_tail(mailbox: str, count: int = 100) -> dict[str, Any]:
+    mailbox = _require_mailbox(mailbox)
+    if not 1 <= count <= 2000:
+        raise HTTPException(status_code=400, detail="count must be between 1 and 2000")
+    return {"stream": mailbox, "events": _mailbox_events(mailbox)[-count:]}
+
+
+def _mailbox_ws_cursor(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("cursor") or value.get("after")
+    return str(value) if value else None
+
+
+async def _mailbox_ws_flush(websocket: WebSocket, subscriptions: dict[str, str | None]) -> None:
+    """Push available events for each subscribed mailbox, preserving cursors."""
+    for stream, after in tuple(subscriptions.items()):
+        try:
+            events, next_cursor, _ = _mailbox_event_page(stream, after=after, limit=1000)
+        except HTTPException as exc:
+            subscriptions.pop(stream, None)
+            await websocket.send_json({"type": "error", "stream": stream, "detail": exc.detail})
+            continue
+        for event in events:
+            await websocket.send_json({"type": "event", "event": event})
+        if events:
+            subscriptions[stream] = next_cursor
+
+
+@router.websocket("/ws_collab/ws")
+@router.websocket("/mailbox_chat/ws")
+@router.websocket("/mailbox/ws")
+@router.websocket("/emullm/mailbox/ws")
+async def mailbox_service_socket(websocket: WebSocket) -> None:
+    """ws_collab/mailbox_chat stream transport for adapter clients.
+
+    Clients send ``{"type":"subscribe","streams":[...],"cursors":{...}}``
+    and receive ``{"type":"event","event":{...}}`` frames. ``publish`` (or
+    ``event``) accepts a typed event using the same fields as POST /events.
+    Polling the durable JSONL streams avoids a second, lossy in-memory
+    fan-out path and works across the worker relay's reconnect cycles.
+    """
+    await websocket.accept()
+    subscriptions: dict[str, str | None] = {}
+    try:
+        while True:
+            try:
+                frame = await asyncio.wait_for(websocket.receive_json(), timeout=0.1)
+            except asyncio.TimeoutError:
+                await _mailbox_ws_flush(websocket, subscriptions)
+                continue
+            if not isinstance(frame, dict):
+                await websocket.send_json({"type": "error", "detail": "WebSocket frame must be an object"})
+                continue
+            frame_type = str(frame.get("type") or "")
+            if frame_type == "subscribe":
+                streams = frame.get("streams")
+                if not isinstance(streams, list) or not streams:
+                    await websocket.send_json({"type": "error", "detail": "subscribe requires a non-empty streams list"})
+                    continue
+                cursors = frame.get("cursors")
+                cursors = cursors if isinstance(cursors, dict) else {}
+                try:
+                    for raw_stream in streams:
+                        stream = _require_mailbox(str(raw_stream))
+                        subscriptions[stream] = _mailbox_ws_cursor(cursors.get(stream))
+                except HTTPException as exc:
+                    await websocket.send_json({"type": "error", "detail": exc.detail})
+                    continue
+                await websocket.send_json({"type": "subscribed", "streams": sorted(subscriptions)})
+            elif frame_type == "unsubscribe":
+                streams = frame.get("streams")
+                if not isinstance(streams, list):
+                    await websocket.send_json({"type": "error", "detail": "unsubscribe requires a streams list"})
+                    continue
+                for raw_stream in streams:
+                    subscriptions.pop(str(raw_stream), None)
+                await websocket.send_json({"type": "unsubscribed", "streams": sorted(subscriptions)})
+            elif frame_type in {"publish", "event"}:
+                raw_event = frame.get("event") if isinstance(frame.get("event"), dict) else frame
+                stream = raw_event.get("stream")
+                event_type = raw_event.get("event_type") or raw_event.get("type")
+                data = raw_event.get("data")
+                if not isinstance(data, dict):
+                    await websocket.send_json({"type": "error", "detail": "published event data must be an object"})
+                    continue
+                try:
+                    source_id = str(raw_event.get("source_id") or "external")
+                    source_kind = str(raw_event.get("source_kind") or "service")
+                    _upsert_mailbox_agent(source_id, {"kind": source_kind})
+                    event, duplicate = _append_mailbox_event(
+                        str(stream or ""),
+                        str(event_type or ""),
+                        data,
+                        source_id=source_id,
+                        source_kind=source_kind,
+                        correlation_id=raw_event.get("correlation_id"),
+                        idempotency_key=raw_event.get("idempotency_key"),
+                    )
+                except (HTTPException, ValueError) as exc:
+                    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                    await websocket.send_json({"type": "error", "detail": detail})
+                    continue
+                await websocket.send_json(
+                    {
+                        "type": "published",
+                        "id": event["id"],
+                        "seq": event["seq"],
+                        "cursor": event["id"],
+                        "duplicate": duplicate,
+                    }
+                )
+            elif frame_type == "ping":
+                await websocket.send_json({"type": "pong", "server_time": _now_iso()})
+            else:
+                await websocket.send_json({"type": "error", "detail": f"unsupported frame type '{frame_type}'"})
+                continue
+            await _mailbox_ws_flush(websocket, subscriptions)
+    except WebSocketDisconnect:
+        pass
+    except RuntimeError as exc:
+        if "disconnect message" not in str(exc):
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -3085,12 +4240,6 @@ def _serve_cloud_file(file_id: str) -> FileResponse:
 
 @router.get("/emullm/cloud/files/{file_id}")
 def cloud_file(file_id: str) -> FileResponse:
-    return _serve_cloud_file(file_id)
-
-
-@router.get("/emullm/cloud/files/{file_id}")
-def cloud_file_alias(file_id: str) -> FileResponse:
-    # tolerate the alternate spelling the operator might use
     return _serve_cloud_file(file_id)
 
 
@@ -3496,6 +4645,12 @@ def admin_state() -> dict[str, Any]:
         },
         "pending_request_ids": sorted(_pending.keys()),
         "record_counts": {kind: len(store.list()) for kind, store in _KIND_STORES.items()},
+        "mailboxes": {
+            "config_path": str(_mailbox_config_path()),
+            "events_dir": str(_mailbox_events_dir()),
+            "count": len(_mailbox_directory(include_activity=True)),
+            "event_count": _mailbox_event_count(),
+        },
         "managed_workers": _sup.get_supervisor().status() if _sup.get_supervisor() else [],
         "backend": (
             {"name": _b.get("name"), "base_url": _b.get("base_url"), "model": _b.get("model")}
@@ -4130,9 +5285,11 @@ def admin_set_model_routes(body: ModelRoutesRequest) -> dict[str, Any]:
 @router.post("/emullm/admin/reset")
 def admin_reset() -> dict[str, Any]:
     """Deletes every persisted record (files/assistants/threads/fine-tuning
-    jobs/events) under the current runtime dir. Does not touch a
+    jobs/events and mailbox configuration/event logs) under the current runtime
+    dir. Does not touch a
     connected worker or in-flight relayed requests."""
     removed = {kind: store.clear() for kind, store in _KIND_STORES.items()}
+    removed.update(_clear_mailbox_storage())
     return {"removed": removed, **admin_state()}
 
 
@@ -4200,7 +5357,13 @@ async def emullm_socket(websocket: WebSocket, worker_id: str) -> None:
     gen) or "audio_b64"/"audio_url"/"mime" (speech). Those are persisted to
     the shared cloud files store and passed back through the matching
     /v1/... endpoint."""
+    try:
+        _mailbox_id(worker_id)
+    except ValueError:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
+    _ensure_worker_mailbox(worker_id)
     first: dict[str, Any] | None = None
     try:
         await websocket.send_json({"type": "hello", "worker_id": worker_id})
@@ -4226,6 +5389,7 @@ async def emullm_socket(websocket: WebSocket, worker_id: str) -> None:
         # as normal traffic under this instance_id.
         await _handle_worker_message(worker_id, first)
 
+    _ensure_worker_mailbox(worker_id)
     async with _worker_lock:
         _connected_workers[worker_id] = websocket
     try:
@@ -4234,6 +5398,12 @@ async def emullm_socket(websocket: WebSocket, worker_id: str) -> None:
             await _handle_worker_message(worker_id, data)
     except WebSocketDisconnect:
         pass
+    except RuntimeError as exc:
+        # Starlette's in-process WebSocket test transport can surface a
+        # completed disconnect as this RuntimeError instead of
+        # WebSocketDisconnect. Preserve real protocol errors.
+        if "disconnect message" not in str(exc):
+            raise
     finally:
         async with _worker_lock:
             if _connected_workers.get(worker_id) is websocket:
@@ -4243,13 +5413,14 @@ async def emullm_socket(websocket: WebSocket, worker_id: str) -> None:
 async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
     if data.get("type") == "reply":
         request_id = str(data.get("id") or "")
+        # A two-way worker may return real media alongside (or instead of)
+        # text: image_b64 / image_url / mime. Keep the reply structured so
+        # image-gen and vision can hand back actual bytes.
+        reply: dict[str, Any] = {"content": str(data.get("content") or "")}
+        for key in ("image_b64", "image_url", "audio_b64", "audio_url", "mime", "images", "file_id", "file_url"):
+            if data.get(key) is not None:
+                reply[key] = data[key]
+        _record_relay_reply(worker_id, request_id, reply)
         future = _pending.pop(request_id, None)
         if future and not future.done():
-            # A two-way worker may return real media alongside (or instead of)
-            # text: image_b64 / image_url / mime. Keep the reply structured so
-            # image-gen and vision can hand back actual bytes.
-            reply: dict[str, Any] = {"content": str(data.get("content") or "")}
-            for key in ("image_b64", "image_url", "audio_b64", "audio_url", "mime", "images", "file_id", "file_url"):
-                if data.get(key) is not None:
-                    reply[key] = data[key]
             future.set_result(reply)

@@ -35,13 +35,13 @@ connect-check-disconnect cycles instead.
 
 ## The loop, step by step
 
-You'll typically drive this through `emullm/worker.py`, a
+You'll typically drive this through `python -m emullm.worker`, a
 helper that does the actual WebSocket plumbing for you and hands you
 plain files to read/write instead. The pattern:
 
 1. **Connect.** Run (or have already running):
    ```
-   python emullm/worker.py --worker-id <your-name>
+   python -m emullm.worker --worker-id <your-name>
    ```
    Pick `<your-name>` as your own identity (e.g. `yourself`, or something
    more specific if several of you are sharing one server). It connects
@@ -105,7 +105,7 @@ in them (e.g. describing what image you'd have generated, or giving a
 moderation verdict), declare that at connect time, e.g.:
 
 ```
-python emullm/worker.py --worker-id yourself --capabilities images,moderations
+python -m emullm.worker --worker-id yourself --capabilities images,moderations
 ```
 
 Only declare a capability **true** if you're actually willing to be asked
@@ -170,7 +170,7 @@ Do not tell clients they need to register or present a token.
 ## A worked example, end to end
 
 ```
-$ python emullm/worker.py --worker-id yourself
+$ python -m emullm.worker --worker-id yourself
 CONNECTED... (implicit; script just starts waiting)
 REQUEST 9f3a...: [user] What's the capital of France?
 ---

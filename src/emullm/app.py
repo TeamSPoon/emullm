@@ -78,5 +78,5 @@ async def _lifespan(app: FastAPI):
         _api._CAPABILITY_FALLBACK = prev_capability_fallback
 
 
-app = FastAPI(title="emullm (emullm relay)", lifespan=_lifespan)
+app = FastAPI(title="EMULLM relay", lifespan=_lifespan)
 app.include_router(emullm_router)

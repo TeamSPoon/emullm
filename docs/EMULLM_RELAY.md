@@ -3,7 +3,7 @@
 [Back to repository README](../README.md)
 
 Status: implemented (server + worker + tests), not yet committed. See
-`../emullm/api.py`, `../emullm/worker.py`, and
+`../src/emullm/api.py`, `../src/emullm/worker.py`, and
 `../tests/test_api.py`.
 
 This is the technical design reference. If you're an LLM/agent looking
@@ -33,10 +33,10 @@ python run.py               # 127.0.0.1:8801
 python run.py --port 9001
 ```
 
-`../run.py` serves `../emullm/app.py` (a `FastAPI` app that includes the
-router from `../emullm/api.py`) with no `/api` prefix, so its routes sit at
+`../run.py` serves `../src/emullm/app.py` (a `FastAPI` app that includes the
+router from `../src/emullm/api.py`) with no `/api` prefix, so its routes sit at
 the bare `/v1/...` paths a real backend would use. All the code lives
-under the `../emullm` package (`api.py` for the router/relay logic,
+under the `../src/emullm` package (`api.py` for the router/relay logic,
 `app.py` for the app object, `worker.py` for the worker client), with the
 test suite in `../tests/test_api.py` (`pytest -q` runs it via the
 `testpaths` in `../pyproject.toml`).
@@ -75,6 +75,68 @@ real client <--HTTP-- (blocks on a Future) <--WS reply-- worker (writes {"type":
   fail fast -- it polls, waiting for one to (re)connect, acting like a
   slow API server rather than a broken one. Only after
   `_REQUEST_TIMEOUT_SECONDS` (900s) does it give up with 504.
+
+## Worker mailboxes and event logs
+
+Every worker WebSocket is also a durable mailbox whose id is exactly its
+`worker_id`. Worker ids must match
+`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; for example, `codex-ide-1` is a valid
+mailbox. The server creates/updates that mailbox as soon as the worker
+connects.
+
+Mailbox state uses the same durable service layout as the collaboration
+systems:
+
+```text
+<runtime>/
+  config/mailboxes.json                # mailbox descriptors, agents, cursors
+  events_logs/<worker_id>.jsonl        # ordered append-only event stream
+```
+
+Descriptors advertise this with `source: "jsonl"` and
+`transports: ["jsonl", "ws"]`; their additional `storage: "events_logs"`
+field identifies the local directory. `endpoints.ws` points to the generic
+adapter socket, while `endpoints.worker_ws` identifies the servant's native
+relay socket.
+
+Each normal LLM call records an `LLM_REQUEST` event immediately after its
+WebSocket frame is sent and an `LLM_REPLY` when the matching worker reply
+arrives. Both events use the original relay request id as `correlation_id`.
+This makes the request/reply pair inspectable even after the HTTP caller has
+finished. Event records include `id`, `stream`, monotonic per-stream `seq`,
+`type`, `ts`, `source_id`, `source_kind`, `data`, and (where applicable)
+`correlation_id`.
+
+The mailbox REST API is available under the primary compatibility mount
+`/ws_collab/v1`, plus `/mailbox_chat/v1`, `/emullm`, `/api`, and the bare
+paths. `mailbox_chat` uses this shared shape as an adapter boundary: a chat
+service can publish/read mailbox entries while the relay and its servant agent
+continue using their native request/reply transport. These mounts serve the
+same payloads:
+
+| Operation | Paths after the selected mount |
+| --- | --- |
+| Discover mailboxes | `GET /capabilities`, `GET /mailbox/mailboxes` |
+| Create mailbox / register agent | `POST /mailbox/create` (or `POST /mailbox/mailboxes`), `GET`/`POST /mailbox/agents` |
+| Read/chat mailbox entries | `GET /mailbox/messages`, `POST /mailbox/send` |
+| Persist a reader position | `GET`/`POST`/`DELETE /mailbox/cursor` |
+| Read/write typed events | `GET`/`POST /events` |
+| Read raw stream tail | `GET /streams/{mailbox}/tail` |
+| Live adapter stream | `WS /ws` |
+
+`POST /mailbox/send` publishes a durable `CONVERSATION_MESSAGE` event. Model
+invocation remains the normal `/v1/*` surface, which creates the correlated
+`LLM_REQUEST`/`LLM_REPLY` pair and speaks the existing worker WebSocket
+protocol. This keeps mailbox chat compatible without turning an audit/chat
+entry into an unacknowledged model job.
+
+The live adapter socket is `WS /ws_collab/ws` (aliases:
+`/mailbox_chat/ws`, `/mailbox/ws`, `/emullm/mailbox/ws`). Send
+`{"type":"subscribe","streams":["worker-id"],"cursors":{}}` to receive
+`{"type":"event","event":{...}}` frames. A client can also publish a typed
+event with `{"type":"publish","event":{"stream":"worker-id","event_type":"...",
+"data":{...}}}`. The socket catches up from the durable stream first, then
+polls it for live changes, so adapter reconnects do not lose relay traffic.
 
 ## Multi-worker routing: "a small pool of emulators"
 
@@ -151,8 +213,7 @@ keeps "no opinion" (quiet fallback) distinct from "explicitly declined"
 
 Beyond text stubs, a worker can exchange **real media** in both directions,
 persisted to a shared cloud files store (one durable blob store the relay and
-all workers use, served at `GET /emullm/cloud/files/<id>` -- the swapped
-spelling `/emullm/cloud/files/<id>` is accepted too):
+all workers use, served at `GET /emullm/cloud/files/<id>`):
 
 - **Inbound to the worker.** A vision `chat/completions` forwards `images`
   (urls/data-urls) on the request. `audio/transcriptions` persists the uploaded
@@ -208,7 +269,7 @@ Backed by `<runtime_dir>/storage/`, guarded against `..` path traversal.
 Some OpenAI-compatible clients only let you configure a fixed `baseUrl`,
 not a per-request `model` string. For those,
 `/emullm/specific_worker/{worker_id}/v1/*` mirrors the entire `/v1/*`
-surface (models, chat/completions, completions, responses, embeddings,
+surface (models, chat/completions, Anthropic messages, completions, responses, embeddings,
 moderations, images, audio) but forces the worker_id from the URL,
 keeping only the persona suffix from whatever `model` the client sends
 (or defaulting to `same`). Point a client's `baseUrl` at
@@ -237,7 +298,7 @@ paths, so it can't become a read-anything vector from the network), and
 path traversal out of an aliased directory is refused just like the
 normal docs root.
 
-Static HTML/CSS/JS assets under `../emullm/static` are
+Static HTML/CSS/JS assets under `../src/emullm/static` are
 served at `GET /emullm/static/{rel_path}` and, for single-segment HTML
 files, at the bare root `GET /{name}.html` (e.g. `static/index.html` is
 reachable as `/index.html`). The bare route only matches one path
@@ -255,7 +316,8 @@ touching Python internals:
   durable-resource record counts
 - `POST /admin/emullm/runtime_dir` -- repoint every durable record store
   (and `/emullm/storage`) at a different root directory
-- `POST /admin/emullm/reset` -- wipe all persisted resource records
+- `POST /admin/emullm/reset` -- wipe all persisted resource records,
+  mailbox configuration, and mailbox event logs
 - `POST /admin/emullm/usage/reset` -- clear rate-limit counters (one
   worker_id, or all)
 - `DELETE /admin/emullm/records/{kind}/{record_id}` -- delete one durable
@@ -263,9 +325,11 @@ touching Python internals:
 
 ## Full route map
 
-**OpenAI-compatible client-facing surface** (`/v1/...`):
+**Client-facing surface** (`/v1/...`; OpenAI-compatible except where noted):
 - `GET /v1/models`, `GET /v1/models/{model_id}`
 - `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/responses`
+- `POST /v1/messages` -- Anthropic Messages API-compatible request, response,
+  and streaming SSE event shapes
 - `POST /v1/embeddings`, `POST /v1/moderations`
 - `POST /v1/images/generations`
 - `POST /v1/audio/transcriptions`, `POST /v1/audio/speech`
@@ -283,6 +347,18 @@ same shape as above, worker_id forced from the URL.
 - `GET /emullm/docs/{rel_path}` -- serves docs/** live
 - `GET`/`PUT`/`DELETE /emullm/storage/{path}`, `GET /emullm/storage`
 
+**Worker mailbox / mailbox_chat-compatible API** (primary mount
+`/ws_collab/v1`; aliases at `/mailbox_chat/v1`, `/emullm`, `/api`, and the
+bare path):
+- `GET /capabilities`
+- `GET`/`POST /mailbox/mailboxes`, `POST /mailbox/create`
+- `GET`/`POST /mailbox/agents`
+- `GET /mailbox/messages`, `POST /mailbox/send`
+- `GET`/`POST`/`DELETE /mailbox/cursor`
+- `GET`/`POST /events`
+- `GET /streams/{mailbox}/tail`
+- `WS /ws` -- subscribe/publish durable event streams
+
 **Admin/test-controller** (`/admin/emullm/...`):
 - `GET /admin/emullm/state`
 - `POST /admin/emullm/runtime_dir`
@@ -293,7 +369,7 @@ same shape as above, worker_id forced from the URL.
 **WebSocket** (where workers connect, not a REST call):
 - `WS /emullm/{worker_id}/ws`
 
-## The worker side (`../emullm/worker.py`)
+## The worker side (`../src/emullm/worker.py`)
 
 Since the agent can't hold a live process open across its own turns, the
 worker script uses **file-based handoff**:
@@ -343,6 +419,10 @@ registered directly into `_connected_workers` (no real WebSocket needed):
   including the explicit-decline 501 short-circuit (worker never asked)
 - durable Files/Assistants/Threads/Fine-tuning lifecycles on real files,
   including byte downloads, JSONL validation, pagination, and deletion
+- automatic worker mailbox descriptors, durable `events_logs/*.jsonl`
+  request/reply pairs, mailbox-chat compatibility aliases, messages, event
+  tails, idempotent sends, persisted cursors, and WebSocket
+  subscribe/publish adapters
 - `/emullm/storage` round-trip (`PUT`/`GET`/`DELETE`/list) and path-
   traversal rejection
 - `/emullm/specific_worker/{worker_id}/v1/*` pinning

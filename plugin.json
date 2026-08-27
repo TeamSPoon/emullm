@@ -8,6 +8,15 @@
   "scan": "startup",
   "routePrefix": "/emullm",
   "configPage": "http://127.0.0.1:5173/emullm/admin",
+  "mailboxEndpoint": {
+    "path": "/mailbox/mailboxes",
+    "protocol": "ws_collab",
+    "description": "ws_collab-compatible mailbox directory served by the embedded EMULLM router (also answers at /emullm/mailbox/mailboxes); sibling routes /messages, /send share the base."
+  },
+  "servicesEndpoint": {
+    "path": "/api/plugins/emullm/endpoints",
+    "description": "Workbench enumerator of the embedded EMULLM router's registered routes."
+  },
   "docs": "README.md",
   "kind": "custom",
   "requestTimeoutSeconds": 0,
@@ -21,6 +30,13 @@
       "Open the administration console and confirm the transports answer."
     ]
   },
+  "plugin-uninstall": {
+    "uninstall": null,
+    "steps": [
+      "Stop the standalone EMULLM server (or unset EMULLM_PLUGIN_MODE=embedded and stop the embedded mount).",
+      "This is a vendored nested project (its own .git) -- remove its directory entirely to uninstall it, or leave it and just disable scanning it (set scan: disabled in plugins.json)."
+    ]
+  },
   "plugin-init": [
     {
       "command": "web_proxy",
@@ -29,6 +45,31 @@
       "path": "/emullm"
     }
   ],
+  "plugin-lifecycle": {
+    "standalone": true,
+    "hooks": {
+      "install": null,
+      "installAfter": null,
+      "uninstall": null,
+      "uninstallAfter": null,
+      "workbenchStartup": null,
+      "workbenchStartupAfter": null,
+      "workbenchShutdown": null,
+      "workbenchShutdownAfter": null,
+      "workspaceStartup": null,
+      "workspaceStartupAfter": null,
+      "workspaceShutdown": null,
+      "workspaceShutdownAfter": null
+    },
+    "note": "Runs as its own standalone server by default (set EMULLM_PLUGIN_MODE=embedded to mount it in-process instead). A standalone plugin owns its own process start/stop, so a workbench restart does not restart it -- workbenchShutdown, if implemented, is only a heads-up notification, never a signal to stop or restart this plugin's own server."
+  },
+  "plugin-api": {
+    "status": { "method": "GET", "path": "/emullm/admin/state", "description": "JSON worker/route/config state (see also /emullm/status for the HTML view)." },
+    "config": { "method": "GET", "path": "/emullm/admin/config", "description": "Current configuration." },
+    "restart": null,
+    "shutdown": null,
+    "note": "No HTTP route restarts or shuts down the process itself. /emullm/admin/reset clears persisted records (files/assistants/threads/events/mailbox storage) -- a data reset, not a process restart -- so it is deliberately not listed as 'restart' here."
+  },
   "ui": {
     "pages": [
       {
@@ -37,7 +78,7 @@
         "kind": "admin",
         "descriptor": "http://127.0.0.1:5173/emullm/admin",
         "glyph": "⚙",
-        "group": "PLUGINS"
+        "group": "CAPABILITIES"
       },
       {
         "id": "audio",
@@ -45,7 +86,7 @@
         "kind": "admin",
         "descriptor": "http://127.0.0.1:5173/emullm/docs/",
         "glyph": "♪",
-        "group": "PLUGINS"
+        "group": "SYSTEM"
       },
       {
         "id": "monitor",
@@ -53,7 +94,7 @@
         "kind": "user",
         "descriptor": "http://127.0.0.1:5173/emullm/status",
         "glyph": "◉",
-        "group": "PLUGINS"
+        "group": "RUNTIME"
       }
     ]
   }

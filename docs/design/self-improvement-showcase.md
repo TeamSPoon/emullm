@@ -20,7 +20,7 @@ Verified live against SingularityNET's 15-model catalog.
 
 Workers can now exchange **real media**, not just "describe it" text stubs,
 persisted to one shared store both relay and workers use
-(`/emullm/cloud/files/<id>`, with an `/emullm/...` alias):
+(`/emullm/cloud/files/<id>`):
 
 - **image generation** → worker returns a real PNG, stored + served by URL
 - **audio speech** → worker returns a real WAV

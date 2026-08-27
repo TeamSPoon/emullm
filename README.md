@@ -1,9 +1,9 @@
 # emullm
 
-A **simulated LLM backend relay**: it answers OpenAI-compatible API
-requests by relaying them, in real time, over a WebSocket to a connected
-worker (a human or an agent) acting as the model -- instead of calling a
-real model API.
+A **simulated LLM backend relay**: it answers OpenAI-compatible API requests
+and the Anthropic Messages API-compatible `/v1/messages` endpoint by relaying
+them, in real time, over a WebSocket to a connected worker (a human or an
+agent) acting as the model -- instead of calling a real model API.
 
 This is the standalone extraction of the `emullm` feature (originally
 built inside a larger workbench). It runs as its own FastAPI service on
@@ -19,7 +19,8 @@ flowchart LR
     relay -->|"response"| client
 ```
 
-- A client calls the keyless OpenAI-compatible surface at `/v1/*`.
+- A client calls the keyless `/v1/*` surface, including OpenAI-compatible
+  endpoints and Anthropic Messages API-compatible `/v1/messages`.
 - The relay forwards each request over a WebSocket to a connected worker.
 - The worker (a person or an agent) answers as if it were the model, and
   the reply is streamed back to the client.
@@ -96,6 +97,41 @@ complete design and route map.
 To have an agent (rather than a human) act as the worker, install the
 GitHub Copilot CLI or OpenAI Codex CLI -- see
 [Agent worker CLIs](#optional-agent-worker-clis).
+
+## Worker mailboxes
+
+Each connected worker WebSocket is exported as a durable mailbox with the
+same id as its `worker_id`. Mailbox configuration and reader cursors persist
+at `runtime\config\mailboxes.json`; each worker's ordered event stream
+persists at `runtime\events_logs\<worker_id>.jsonl`.
+
+The compatibility API is mounted at `/ws_collab/v1` and `/mailbox_chat/v1`
+(with `/emullm`, `/api`, and bare-path aliases). `mailbox_chat` can use
+that shared contract as an adapter for another chat service while emullm keeps
+the worker relay protocol intact. It provides mailbox discovery, agents,
+messages, sends, cursors, typed events, and stream tails:
+
+```text
+GET  /ws_collab/v1/mailbox/mailboxes
+GET  /ws_collab/v1/events?stream=<worker_id>
+GET  /ws_collab/v1/mailbox/messages?mailbox=<worker_id>
+POST /ws_collab/v1/mailbox/send
+```
+
+For an adapter that needs live delivery, connect to
+`ws://127.0.0.1:8801/ws_collab/ws` (aliases: `/mailbox_chat/ws`,
+`/mailbox/ws`, `/emullm/mailbox/ws`) and send:
+
+```json
+{"type":"subscribe","streams":["<worker_id>"],"cursors":{}}
+```
+
+The socket catches up from the durable event log and then emits
+`{"type":"event","event":{...}}` frames as relay traffic arrives.
+
+Regular `/v1/*` model calls emit correlated `LLM_REQUEST` and `LLM_REPLY`
+events into that worker mailbox. Use `POST /mailbox/send` for durable
+mailbox-chat entries; use `/v1/*` to invoke the worker as a model.
 
 ## Using the API
 
@@ -318,7 +354,7 @@ model discovery, non-text "pretend" endpoints, and stateful platform stubs --
 and each type covers a different slice. All non-text output is always
 *simulated* (deterministic pseudo-vectors / stubs), never real:
 
-| Type | chat · completions · responses | `/v1/models` | embeddings · moderations · images · audio | files · assistants · threads · fine_tuning |
+| Type | chat · completions · responses · Anthropic messages | `/v1/models` | embeddings · moderations · images · audio | files · assistants · threads · fine_tuning |
 | --- | --- | --- | --- | --- |
 | Interactive recruit | ✅ real relay | ✅ self-listed | ✅ if it opted in* | ✅ local stub |
 | Auto-configured subagent | ✅ real relay | ✅ self-listed | ✅ if it opted in* | ✅ local stub |

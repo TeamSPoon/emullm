@@ -4,7 +4,7 @@ These deliberately stay small: for endpoints that don't need a connected
 worker (models listing, embeddings, moderations, images, audio stubs, and
 the files/assistants/threads/fine_tuning CRUD stubs) we just check a 200
 and the expected shape. For the worker-relayed endpoints (chat
-completions, completions, responses), no worker is connected in this test
+completions, completions, responses, and messages), no worker is connected in this test
 process; the relay is designed to wait (not fail fast) for one, so these
 tests monkeypatch a short timeout and just assert the eventual 504 --
 the actual relay round-trip (including the /emullm/{worker_id}/ws
@@ -138,6 +138,262 @@ def test_responses_without_worker_waits_then_504(client: TestClient, short_timeo
     assert response.status_code == 504
 
 
+def test_messages_without_worker_waits_then_504(client: TestClient, short_timeout: None) -> None:
+    response = client.post(
+        "/v1/messages",
+        json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8},
+    )
+    assert response.status_code == 504
+
+
+def test_messages_relay_anthropic_content_and_return_message_shape(client: TestClient) -> None:
+    worker = FakeWorker(reply="relay reply")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "yourself/same",
+            "system": [{"type": "text", "text": "Be concise."}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": "YWJj"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "content": [{"type": "text", "text": "tool output"}]}],
+                },
+            ],
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    message = response.json()
+    assert message["id"].startswith("msg-")
+    assert message["type"] == "message"
+    assert message["role"] == "assistant"
+    assert message["content"] == [{"type": "text", "text": "relay reply"}]
+    assert message["stop_reason"] == "end_turn"
+    assert message["usage"]["input_tokens"] > 0
+    assert message["usage"]["output_tokens"] == 2
+    assert worker.sent[0]["prompt"] == (
+        "[system] Be concise.\n\n[user] Describe this image.\n\n[user] tool output"
+    )
+    assert worker.sent[0]["images"] == ["data:image/png;base64,YWJj"]
+    assert worker.sent[0]["kind"] == "vision"
+
+
+def test_connected_worker_exports_durable_correlated_mailbox_events(client: TestClient, tmp_path) -> None:
+    worker = FakeWorker(reply="mailbox reply")
+    emullm_api._connected_workers["codex-ide-1"] = worker  # noqa: SLF001
+
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "codex-ide-1/same",
+            "messages": [{"role": "user", "content": "record this request"}],
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    directory = client.get("/ws_collab/v1/mailbox/mailboxes", params={"include_activity": "true"})
+    assert directory.status_code == 200
+    mailbox = next(entry for entry in directory.json()["mailboxes"] if entry["id"] == "codex-ide-1")
+    assert mailbox["source"] == "jsonl"
+    assert mailbox["storage"] == "events_logs"
+    assert mailbox["transports"] == ["jsonl", "ws"]
+    assert mailbox["connected"] is True
+    assert mailbox["endpoints"]["ws"] == "/ws_collab/ws"
+    assert mailbox["endpoints"]["worker_ws"] == "/emullm/codex-ide-1/ws"
+
+    events_response = client.get("/ws_collab/v1/events", params={"stream": "codex-ide-1"})
+    assert events_response.status_code == 200
+    events = events_response.json()["events"]
+    assert [event["type"] for event in events] == ["LLM_REQUEST", "LLM_REPLY"]
+    assert [event["seq"] for event in events] == [1, 2]
+    assert events[0]["correlation_id"] == events[1]["correlation_id"]
+    assert events[0]["data"]["prompt"] == "[user] record this request"
+    assert events[1]["data"]["text"] == "mailbox reply"
+
+    messages = client.get("/api/mailbox/messages", params={"mailbox": "codex-ide-1"}).json()["messages"]
+    assert [message["text"] for message in messages] == ["[user] record this request", "mailbox reply"]
+    assert (tmp_path / "runtime" / "config" / "mailboxes.json").is_file()
+    assert (tmp_path / "runtime" / "events_logs" / "codex-ide-1.jsonl").is_file()
+
+    capabilities = client.get("/mailbox_chat/v1/capabilities").json()
+    assert capabilities["rest_base"] == "/ws_collab/v1"
+    assert "codex-ide-1" in capabilities["streams"]
+    assert capabilities["transports"] == ["jsonl", "ws"]
+
+
+def test_worker_websocket_creates_its_named_mailbox(client: TestClient, tmp_path) -> None:
+    with client.websocket_connect("/emullm/socket-servant/ws") as websocket:
+        assert websocket.receive_json() == {"type": "hello", "worker_id": "socket-servant"}
+        directory = client.get("/ws_collab/v1/mailbox/mailboxes", params={"include_activity": "true"}).json()
+        mailbox = next(entry for entry in directory["mailboxes"] if entry["id"] == "socket-servant")
+        assert mailbox["writable"] is True
+        assert mailbox["source"] == "jsonl"
+        agents = client.get("/ws_collab/v1/mailbox/agents").json()["agents"]
+        assert any(agent["id"] == "socket-servant" and agent["kind"] == "worker" for agent in agents)
+        assert (tmp_path / "runtime" / "events_logs").is_dir()
+
+
+def test_mailbox_chat_websocket_subscribes_and_publishes_events(client: TestClient) -> None:
+    assert client.post("/mailbox/create", json={"id": "ws-servant"}).status_code == 200
+    initial = client.post(
+        "/events",
+        json={
+            "stream": "ws-servant",
+            "type": "LLM_REQUEST",
+            "data": {"text": "catch up"},
+            "source_id": "llm-api",
+        },
+    )
+    assert initial.status_code == 200
+
+    with client.websocket_connect("/ws_collab/ws") as websocket:
+        websocket.send_json({"type": "subscribe", "streams": ["ws-servant"], "cursors": {}})
+        assert websocket.receive_json() == {"type": "subscribed", "streams": ["ws-servant"]}
+        caught_up = websocket.receive_json()
+        assert caught_up["type"] == "event"
+        assert caught_up["event"]["type"] == "LLM_REQUEST"
+
+        websocket.send_json(
+            {
+                "type": "publish",
+                "event": {
+                    "stream": "ws-servant",
+                    "event_type": "LLM_REPLY",
+                    "data": {"text": "live reply"},
+                    "source_id": "ws-servant",
+                    "source_kind": "worker",
+                    "correlation_id": "ws-1",
+                },
+            }
+        )
+        published = websocket.receive_json()
+        assert published["type"] == "published"
+        live = websocket.receive_json()
+        assert live["type"] == "event"
+        assert live["event"]["type"] == "LLM_REPLY"
+        assert live["event"]["correlation_id"] == "ws-1"
+
+
+def test_mailbox_config_migrates_legacy_transport_metadata(client: TestClient, tmp_path) -> None:
+    config_path = tmp_path / "runtime" / "config" / "mailboxes.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mailboxes": {
+                    "legacy-servant": {
+                        "id": "legacy-servant",
+                        "name": "legacy-servant",
+                        "source": "events_logs",
+                        "transports": ["events_logs", "websocket"],
+                    }
+                },
+                "agents": {},
+                "cursors": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    directory = client.get("/mailbox/mailboxes", params={"include_activity": "true"}).json()
+    mailbox = directory["mailboxes"][0]
+    assert mailbox["source"] == "jsonl"
+    assert mailbox["transports"] == ["jsonl", "ws"]
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["schema_version"] == 2
+    assert persisted["mailboxes"]["legacy-servant"]["source"] == "jsonl"
+
+
+def test_mailbox_chat_contract_supports_messages_events_and_cursors(client: TestClient) -> None:
+    create = client.post(
+        "/mailbox_chat/v1/mailbox/create",
+        json={"id": "manual-servant", "purpose": "test worker mailbox"},
+    )
+    assert create.status_code == 200
+    assert create.json()["created"] is True
+
+    payload = {
+        "to": "manual-servant",
+        "text": "hello servant",
+        "sender": "operator",
+        "correlation_id": "chat-1",
+    }
+    first = client.post(
+        "/mailbox_chat/v1/mailbox/send",
+        json=payload,
+        headers={"Idempotency-Key": "send-chat-1"},
+    )
+    assert first.status_code == 200
+    assert first.json()["message"]["type"] == "CONVERSATION_MESSAGE"
+    duplicate = client.post(
+        "/mailbox_chat/v1/mailbox/send",
+        json=payload,
+        headers={"Idempotency-Key": "send-chat-1"},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["message"]["id"] == first.json()["message"]["id"]
+
+    posted = client.post(
+        "/api/events",
+        json={
+            "stream": "manual-servant",
+            "type": "LLM_REQUEST",
+            "data": {"text": "typed request", "from": "llm-api", "to": "manual-servant"},
+            "source_id": "llm-api",
+            "correlation_id": "request-1",
+        },
+    )
+    assert posted.status_code == 200
+    assert posted.json()["seq"] == 2
+
+    events = client.get("/ws_collab/v1/events", params={"stream": "manual-servant"}).json()
+    assert len(events["events"]) == 2
+    assert events["events"][0]["type"] == "CONVERSATION_MESSAGE"
+    assert events["events"][1]["correlation_id"] == "request-1"
+    assert client.get(
+        "/api/mailbox/messages",
+        params={"mailbox": "manual-servant", "from": "operator"},
+    ).json()["messages"][0]["text"] == "hello servant"
+    assert len(client.get("/mailbox_chat/v1/streams/manual-servant/tail", params={"count": 2}).json()["events"]) == 2
+
+    initial_cursor = client.get(
+        "/ws_collab/v1/mailbox/cursor",
+        params={"mailbox": "manual-servant", "agent": "operator"},
+    ).json()
+    assert initial_cursor["initialized"] is False
+    beginning = client.post(
+        "/ws_collab/v1/mailbox/cursor",
+        json={"mailbox": "manual-servant", "agent": "operator", "start": "beginning"},
+    ).json()
+    assert beginning["initialized"] is True
+    assert beginning["offset"] == 0
+    now = client.post(
+        "/ws_collab/v1/mailbox/cursor",
+        json={"mailbox": "manual-servant", "agent": "operator", "start": "now"},
+    ).json()
+    assert now["offset"] == 2
+    cleared = client.delete(
+        "/ws_collab/v1/mailbox/cursor",
+        params={"mailbox": "manual-servant", "agent": "operator"},
+    ).json()
+    assert cleared["initialized"] is False
+
+
 @pytest.mark.parametrize(
     ("path", "body", "expected_marker"),
     [
@@ -148,6 +404,11 @@ def test_responses_without_worker_waits_then_504(client: TestClient, short_timeo
         ),
         ("/v1/completions", {"prompt": "hello", "stream": True}, "text_completion"),
         ("/v1/responses", {"input": "hello", "stream": True}, "response.output_text.delta"),
+        (
+            "/v1/messages",
+            {"messages": [{"role": "user", "content": "hello"}], "max_tokens": 8, "stream": True},
+            "event: message_start",
+        ),
     ],
 )
 def test_text_endpoints_support_server_sent_event_streams(
@@ -170,6 +431,14 @@ def test_unknown_models_fail_before_waiting_for_a_worker(client: TestClient) -> 
     response = client.post(
         "/v1/chat/completions",
         json={"model": "yourself/not-real", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 404
+
+
+def test_messages_unknown_model_fails_before_waiting_for_a_worker(client: TestClient) -> None:
+    response = client.post(
+        "/v1/messages",
+        json={"model": "yourself/not-real", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8},
     )
     assert response.status_code == 404
 
@@ -652,6 +921,27 @@ def test_specific_worker_prefix_pins_worker_regardless_of_model_field(client: Te
     assert alice.sent[0]["model"] == "alice/percent25"  # worker_id forced, suffix kept
 
 
+def test_specific_worker_messages_prefix_pins_worker_regardless_of_model_field(client: TestClient) -> None:
+    alice = FakeWorker(reply="alice's message answer")
+    emullm_api._connected_workers["alice"] = alice  # noqa: SLF001
+    bob = FakeWorker(reply="bob would never see this")
+    emullm_api._connected_workers["bob"] = bob  # noqa: SLF001
+
+    response = client.post(
+        "/emullm/specific_worker/alice/v1/messages",
+        json={
+            "model": "bob/percent25",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content"][0]["text"] == "alice's message answer"
+    assert not bob.sent
+    assert alice.sent[0]["model"] == "alice/percent25"  # worker_id forced, suffix kept
+
+
 def test_specific_worker_models_listing_is_scoped_to_that_worker(client: TestClient) -> None:
     emullm_api._worker_models["alice"] = {"same": {"display_name": "(alice)", "instruction": "Be alice."}}
 
@@ -1019,14 +1309,12 @@ def test_audio_speech_pretend_mode_adds_description(client: TestClient) -> None:
 
 
 # --- two-way real media pass-through + shared cloud files --------------------
-def test_cloud_files_roundtrip_both_spellings(client: TestClient) -> None:
+def test_cloud_files_roundtrip_uses_emullm_prefix(client: TestClient) -> None:
     record = emullm_api._store_cloud_bytes(b"hello-cloud", "note.txt", purpose="output")  # noqa: SLF001
     url = emullm_api._cloud_file_url(record["id"])  # noqa: SLF001
     assert url.startswith("/emullm/cloud/files/")
     got = client.get(url)
     assert got.status_code == 200 and got.content == b"hello-cloud"
-    alias = client.get(url.replace("/emullm/", "/emullm/"))
-    assert alias.status_code == 200 and alias.content == b"hello-cloud"
 
 
 def test_images_two_way_returns_worker_image_via_cloud_file(client: TestClient) -> None:

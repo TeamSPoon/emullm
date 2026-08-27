@@ -14,6 +14,7 @@ from pathlib import Path
 import uvicorn
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+SOURCE_ROOT = PROJECT_ROOT / "src"
 DEFAULT_PORT = 8801
 
 
@@ -24,13 +25,13 @@ def main() -> None:
     parser.add_argument("--no-reload", action="store_true", help="disable autoreload")
     args = parser.parse_args()
 
-    sys.path.insert(0, str(PROJECT_ROOT))
+    sys.path.insert(0, str(SOURCE_ROOT))
     uvicorn.run(
         "emullm.app:app",
         host=args.host,
         port=args.port,
         reload=not args.no_reload,
-        reload_dirs=[str(PROJECT_ROOT / "emullm")] if not args.no_reload else None,
+        reload_dirs=[str(SOURCE_ROOT / "emullm")] if not args.no_reload else None,
         reload_includes=["*.py"] if not args.no_reload else None,
         reload_excludes=["runtime/*", "__pycache__/*"] if not args.no_reload else None,
     )

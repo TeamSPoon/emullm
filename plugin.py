@@ -1,8 +1,9 @@
 """EMULLM workbench plugin entrypoint.
 
 The workbench plugin loader imports this file directly (not as part of a package)
-and calls ``create_router(manifest)``. We add this directory to ``sys.path`` so
-the ``emullm`` package is importable, then delegate to one of two runners:
+and calls ``create_router(manifest)``. We add the project's ``src`` directory to
+``sys.path`` so the ``emullm`` package is importable, then delegate to one of two
+runners:
 
 * :mod:`emullm.standalone` — run EMULLM as its own process; the workbench
   reaches it through its ``web_proxy`` (see ``plugin.json``). This is the default.
@@ -20,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_SOURCE_ROOT = _HERE / "src"
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
 
 
 def _mode() -> str:
