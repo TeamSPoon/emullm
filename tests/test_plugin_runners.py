@@ -1,10 +1,46 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from emullm import api, embedded, standalone
 from emullm import app as app_module
+
+
+def test_manifest_uses_native_service_catalog() -> None:
+    manifest = json.loads((Path(__file__).parents[1] / "plugin.json").read_text(encoding="utf-8"))
+    services = manifest["servicesEndpoint"]
+    assert services["path"] == "/emullm/endpoints"
+    assert services["method"] == "GET"
+    assert services["transport"] == "http"
+    assert services["protocol"] == "emullm-service-catalog-v1"
+    assert services["format"] == "json"
+    assert services["websocket"] == "/emullm/ws"
+    endpoints = manifest["plugin-endpoints"]
+    assert "plugin-api" not in manifest
+    assert endpoints["services"]["path"] == "/emullm/endpoints"
+    assert endpoints["workerWebSocket"]["path"] == "/emullm/ws"
+    assert endpoints["mailboxWebSocket"]["path"] == "/emullm/mailbox/ws"
+    assert manifest["serverEventLog"] == {
+        "endpoint": "/emullm/websock_to_llm_user/events",
+        "method": "GET",
+        "protocol": "http",
+        "format": "json",
+    }
+    modes = manifest["runtimeModes"]
+    assert modes["default"] == modes["current"] == "standalone"
+    assert {mode["id"] for mode in modes["available"]} == {"standalone", "embedded"}
+    standalone = next(mode for mode in modes["available"] if mode["id"] == "standalone")
+    embedded_mode = next(mode for mode in modes["available"] if mode["id"] == "embedded")
+    assert standalone["server"]["baseUrl"] == "http://127.0.0.1:8801"
+    assert standalone["environment"] == {"EMULLM_PLUGIN_MODE": "standalone"}
+    assert standalone["config"]["plugin-lifecycle.standalone"] is True
+    assert embedded_mode["server"]["servicePath"] == "/emullm"
+    assert embedded_mode["environment"] == {"EMULLM_PLUGIN_MODE": "embedded"}
+    assert embedded_mode["config"]["plugin-lifecycle.standalone"] is False
 
 
 def test_embedded_router_includes_relay_routes_and_lifespan(monkeypatch) -> None:

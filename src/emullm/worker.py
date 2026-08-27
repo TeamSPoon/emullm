@@ -1,10 +1,12 @@
 """emullm worker: the client side of workbench/server/emullm_api.py.
 
-Connects to ws://<host>/emullm/<worker-id>/ws (worker-id is a plain
-identity in the URL, e.g. "yourself", "alice", "bob" -- a small pool of
-these can be connected at once, each independently routed to) and waits
-up to --idle-timeout seconds for one relayed request. If one arrives, it
-is written to --request-file as JSON and this script then waits
+Connects to ws://<host>/emullm/ws?worker_id=<worker-id> (worker-id is a
+plain identity in the query, e.g. "yourself", "alice", "bob" -- a small
+pool of these can be connected at once, each independently routed to).
+An optional ``modelmasks`` query parameter limits offers to matching glob
+patterns; omit it to offer answers for every model. The worker waits up to
+--idle-timeout seconds for one relayed request. If one arrives, it is
+written to --request-file as JSON and this script then waits
 (polling) for --reply-file to appear with a matching id, sends that
 reply back over the socket, deletes both files, and immediately loops to
 wait for the next request (no rest in between while there's active
@@ -58,6 +60,8 @@ Usage:
 While a request is pending (request file written, reply file not yet
 present), answer it by writing --reply-file as JSON:
     {"id": "<same id as the request>", "content": "<your reply text>"}
+To reject an offered model/request instead, write:
+    {"id": "<same id as the request>", "reject": true, "reason": "why"}
 To return real media two-way, add e.g. "image_b64"/"mime" (image gen)
 or "audio_b64" (speech) alongside "content".
 """
@@ -70,13 +74,25 @@ import random
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 import websockets
 
 DEFAULT_HOST_WS_URL = "ws://127.0.0.1:8801"
-DEFAULT_WORKER_ID = "yourself"
+DEFAULT_WORKER_ID: str | None = None
 DEFAULT_REQUEST_FILE = Path(__file__).resolve().parents[1] / "runtime" / "emullm_request.json"
 DEFAULT_REPLY_FILE = Path(__file__).resolve().parents[1] / "runtime" / "emullm_reply.json"
+
+
+def worker_socket_url(host_ws_url: str, worker_id: str | None, modelmasks: str = "") -> str:
+    """Build the canonical native servant URL without encoding identity in its path."""
+    params: dict[str, str] = {}
+    if worker_id:
+        params["worker_id"] = worker_id
+    if modelmasks:
+        params["modelmasks"] = modelmasks
+    suffix = f"?{urlencode(params)}" if params else ""
+    return f"{host_ws_url.rstrip('/')}/emullm/ws{suffix}"
 
 
 async def _wait_for_reply(request_id: str, reply_file: Path, timeout: float) -> dict:
@@ -107,7 +123,7 @@ async def _wait_for_reply(request_id: str, reply_file: Path, timeout: float) -> 
 _REPLY_MEDIA_KEYS = ("image_b64", "image_url", "audio_b64", "audio_url", "mime", "file_id", "file_url", "images")
 
 
-async def _maybe_register(websocket, capabilities: dict[str, bool], role: str = "") -> None:
+async def _maybe_register(websocket, capabilities: dict[str, bool], role: str = "") -> str | None:
     """If the server greets us with a "hello" handshake within a couple
     seconds, declare our capabilities (and optional role) in reply. An
     older/simpler server that doesn't send a hello is tolerated -- we just
@@ -116,12 +132,15 @@ async def _maybe_register(websocket, capabilities: dict[str, bool], role: str = 
         hello = await asyncio.wait_for(websocket.recv(), timeout=3.0)
         data = json.loads(hello)
     except (asyncio.TimeoutError, json.JSONDecodeError):
-        return
+        return None
     if isinstance(data, dict) and data.get("type") == "hello":
         message: dict[str, object] = {"type": "register", "capabilities": capabilities}
         if role:
             message["role"] = role
         await websocket.send(json.dumps(message))
+        worker_id = data.get("worker_id")
+        return str(worker_id) if worker_id else None
+    return None
 
 
 async def _run_once(
@@ -132,23 +151,23 @@ async def _run_once(
     reply_timeout: float,
     capabilities: dict[str, bool],
     role: str = "",
-) -> bool:
-    """One connect. Returns True if a request was handled (caller should
-    reconnect immediately), False if idle (caller should rest first)."""
+) -> tuple[bool, str | None]:
+    """One connect. Returns ``(handled, assigned_worker_id)``."""
     async with websockets.connect(ws_url) as websocket:
-        await _maybe_register(websocket, capabilities, role)
+        assigned_worker_id = await _maybe_register(websocket, capabilities, role)
 
         try:
             raw = await asyncio.wait_for(websocket.recv(), timeout=idle_timeout)
         except asyncio.TimeoutError:
             print(f"IDLE: no request within {idle_timeout}s, disconnecting", flush=True)
-            return False
+            return False, assigned_worker_id
 
         data = json.loads(raw)
         if data.get("type") != "request":
-            return True
+            return True, assigned_worker_id
 
         request_id = str(data["id"])
+        await websocket.send(json.dumps({"type": "accept", "id": request_id}))
         request_file.parent.mkdir(parents=True, exist_ok=True)
         request_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         persona_note = ""
@@ -164,21 +183,39 @@ async def _run_once(
         )
 
         reply = await _wait_for_reply(request_id, reply_file, reply_timeout)
-        message: dict[str, object] = {"type": "reply", "id": request_id, "content": str(reply.get("content") or "")}
+        if reply.get("reject"):
+            message: dict[str, object] = {
+                "type": "reject",
+                "id": request_id,
+                "reason": str(reply.get("reason") or "worker declined the request"),
+            }
+            await websocket.send(json.dumps(message))
+            print(f"REJECTED {request_id}: {message['reason']}", flush=True)
+            return True, assigned_worker_id
+        message = {"type": "reply", "id": request_id, "content": str(reply.get("content") or "")}
         for key in _REPLY_MEDIA_KEYS:
             if reply.get(key) is not None:
                 message[key] = reply[key]
         await websocket.send(json.dumps(message))
         returned = [k for k in _REPLY_MEDIA_KEYS if k in message]
         print(f"REPLIED to {request_id}" + (f" (+media: {returned})" if returned else ""), flush=True)
-        return True
+        return True, assigned_worker_id
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--worker-id", default=DEFAULT_WORKER_ID, help="identity this worker connects/registers as (used in the URL path)")
-    parser.add_argument("--host-ws-url", default=DEFAULT_HOST_WS_URL, help="server base, e.g. ws://127.0.0.1:8801 -- worker-id is appended as /emullm/<worker-id>/ws")
+    parser.add_argument(
+        "--worker-id",
+        default=DEFAULT_WORKER_ID,
+        help="identity sent as the worker_id query parameter; omit it to receive a server-assigned identity",
+    )
+    parser.add_argument("--host-ws-url", default=DEFAULT_HOST_WS_URL, help="server base, e.g. ws://127.0.0.1:8801")
     parser.add_argument("--ws-url", default=None, help="full websocket URL override; if given, --worker-id/--host-ws-url are ignored")
+    parser.add_argument(
+        "--modelmasks",
+        default="",
+        help="comma-separated model glob patterns to accept, e.g. 'openai/*,gpt-*'; omit to accept all models",
+    )
     parser.add_argument(
         "--capabilities",
         default="",
@@ -195,14 +232,18 @@ async def main() -> None:
     parser.add_argument("--role", default="", help="self-declared role/phase shown on the status page, e.g. 'trusted' or 'training'")
     args = parser.parse_args()
 
-    ws_url = args.ws_url or f"{args.host_ws_url.rstrip('/')}/emullm/{args.worker_id}/ws"
     capabilities = {name.strip(): True for name in args.capabilities.split(",") if name.strip()}
+    worker_id = args.worker_id
 
     while True:
+        ws_url = args.ws_url or worker_socket_url(args.host_ws_url, worker_id, args.modelmasks)
         try:
-            handled = await _run_once(
+            handled, assigned_worker_id = await _run_once(
                 ws_url, args.request_file, args.reply_file, args.idle_timeout, args.reply_timeout, capabilities, args.role
             )
+            if not worker_id and assigned_worker_id:
+                worker_id = assigned_worker_id
+                print(f"ASSIGNED WORKER ID: {worker_id}", flush=True)
         except (ConnectionRefusedError, OSError) as error:
             print(f"connect failed: {error}", flush=True)
             handled = False

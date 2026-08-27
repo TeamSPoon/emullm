@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from urllib.parse import parse_qs, urlparse
 
 from emullm import supervisor as sup
 from emullm import worker as worker_mod
@@ -26,6 +27,16 @@ def test_worker_wait_for_reply_forwards_full_media_dict(tmp_path):
     assert got["image_b64"] == "QUJD"
     assert got["mime"] == "image/png"
     assert not reply_file.exists()  # consumed after use
+
+
+def test_worker_socket_url_uses_the_single_endpoint_and_optional_masks():
+    anonymous = urlparse(worker_mod.worker_socket_url("ws://127.0.0.1:8801", None))
+    assert anonymous.path == "/emullm/ws"
+    assert not anonymous.query
+
+    named = urlparse(worker_mod.worker_socket_url("ws://127.0.0.1:8801/", "agent-one", "vendor/*,gpt-*"))
+    assert named.path == "/emullm/ws"
+    assert parse_qs(named.query) == {"worker_id": ["agent-one"], "modelmasks": ["vendor/*,gpt-*"]}
 
 
 class FakeProc:
@@ -148,6 +159,13 @@ def test_config_worker_model_flows_to_copilot_launch(tmp_path):
     spec = sup.specs_from_config(config, tmp_path)[0]
     assert spec.argv[0] == "copilot"
     assert "--model" in spec.argv and "gpt-5.4" in spec.argv
+
+
+def test_config_worker_modelmasks_flow_to_plain_worker(tmp_path):
+    config = {"workers": [{"id": "w1", "launch": "worker", "modelmasks": ["openai/*", "gpt-*"]}]}
+    spec = sup.specs_from_config(config, tmp_path)[0]
+    assert spec.modelmasks == "openai/*,gpt-*"
+    assert spec.argv[spec.argv.index("--modelmasks") + 1] == "openai/*,gpt-*"
 
 
 def test_subagent_model_default_flows_to_discovered_workers(tmp_path):

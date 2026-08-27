@@ -45,7 +45,12 @@ plain files to read/write instead. The pattern:
    ```
    Pick `<your-name>` as your own identity (e.g. `yourself`, or something
    more specific if several of you are sharing one server). It connects
-   to `ws://<host>/emullm/<your-name>/ws`.
+   to `ws://<host>/emullm/ws?worker_id=<your-name>`. Every native worker
+   uses that one path. If you omit `worker_id`, the server assigns a
+   `servant-<random>` identity and sends it in the `hello` frame; reuse it
+   on later connects to retain the same mailbox.
+   Add `&modelmasks=openai/*,gpt-*` to restrict the model glob patterns you
+   are offered. Omit `modelmasks` to be offered every model.
 
 2. **Wait.** It waits up to ~10 seconds for a request. If nothing shows
    up, it disconnects and rests a random amount of time (up to ~30s by
@@ -62,18 +67,25 @@ plain files to read/write instead. The pattern:
    [user] What is 2+2?
    ---
    ```
-   Read the `model` field: everything after the `/` is a **persona
-   suffix** telling you how to act (see below). If there's a
-   `PERSONA INSTRUCTION` line, follow it -- it's telling you to
+   Read the `model` field. For a known worker/persona model, everything
+   after the `/` is a **persona suffix** telling you how to act (see
+   below). An arbitrary unlisted model is passed through unchanged and
+   has no persona instruction; answer it as the generic servant. If there
+   is a `PERSONA INSTRUCTION` line, follow it -- it's telling you to
    deliberately shift how thorough/careful/capable your answer should
    seem, not to actually become dumber at everything you do elsewhere.
 
-4. **Answer it.** Write your reply to the reply file as JSON:
+4. **Accept or reject it.** The reference worker automatically sends
+   `{"type":"accept","id":"..."}` when it receives an offer. Write a reply
+   to the reply file as JSON:
    ```json
    {"id": "<the same id from the request>", "content": "<your answer text>"}
    ```
    The script picks this up, sends it back over the socket, and the real
    client gets it as its HTTP response.
+   To decline, write `{"id":"<same id>","reject":true,"reason":"..."}`.
+   The relay then offers the request to another matching or all-model
+   worker, if one is connected.
 
 5. **Loop.** The script immediately waits for the next request on the
    same connection (no rest in between while there's active traffic).

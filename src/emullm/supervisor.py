@@ -30,15 +30,18 @@ class WorkerSpec:
     cwd: Optional[Path] = None
     role: str = "trusted"
     autostart: bool = True
+    modelmasks: str = ""
     # non-init runtime handle for the running process (set by the supervisor)
     process: Any = field(default=None, init=False, repr=False)
 
 
-def default_worker_argv(worker_id: str, host_ws_url: str, role: str = "trusted") -> list[str]:
+def default_worker_argv(
+    worker_id: str, host_ws_url: str, role: str = "trusted", modelmasks: str = ""
+) -> list[str]:
     """The plain worker-loop launch command: this package's own worker loop,
     writing its handoff files into the (per-worker) current directory. Used
     for explicit config workers that don't specify a ``launch``."""
-    return [
+    argv = [
         sys.executable,
         "-m",
         "emullm.worker",
@@ -53,6 +56,9 @@ def default_worker_argv(worker_id: str, host_ws_url: str, role: str = "trusted")
         "--role",
         role,
     ]
+    if modelmasks:
+        argv += ["--modelmasks", modelmasks]
+    return argv
 
 
 # Kickoff prompt for a Copilot-agent worker launched in a subagent folder.
@@ -111,7 +117,7 @@ _WORKER_KINDS = {"worker", "loop", "python"}
 
 
 def _launch_for(
-    launch: Any, worker_id: str, host_ws_url: str, role: str, model: str | None = None
+    launch: Any, worker_id: str, host_ws_url: str, role: str, model: str | None = None, modelmasks: str = ""
 ) -> tuple[Optional[list[str]], bool]:
     """Resolve a launch override into ``(argv, spawn)``.
 
@@ -132,7 +138,7 @@ def _launch_for(
         if low in _COPILOT_KINDS:
             return copilot_launch_argv(model=model), True
         if low in _WORKER_KINDS:
-            return default_worker_argv(worker_id, host_ws_url, role), True
+            return default_worker_argv(worker_id, host_ws_url, role, modelmasks), True
         return token.split(), True
     return copilot_launch_argv(model=model), True
 
@@ -226,13 +232,29 @@ def specs_from_config(
         cwd = (base_dir / cwd_val) if cwd_val else None
         launch = entry.get("launch")
         model = entry.get("model")
-        if launch is None:
-            argv, spawn = default_worker_argv(worker_id, host_ws_url, role), True
+        raw_modelmasks = entry.get("modelmasks")
+        if isinstance(raw_modelmasks, (list, tuple)):
+            modelmasks = ",".join(str(mask).strip() for mask in raw_modelmasks if str(mask).strip())
+        elif isinstance(raw_modelmasks, str):
+            modelmasks = raw_modelmasks.strip()
         else:
-            argv, spawn = _launch_for(launch, worker_id, host_ws_url, role, model=model)
+            modelmasks = ""
+        if launch is None:
+            argv, spawn = default_worker_argv(worker_id, host_ws_url, role, modelmasks), True
+        else:
+            argv, spawn = _launch_for(launch, worker_id, host_ws_url, role, model=model, modelmasks=modelmasks)
         if not spawn or not argv:
             continue  # recruit: connects itself, nothing to spawn
-        specs.append(WorkerSpec(worker_id=worker_id, argv=argv, cwd=cwd, role=role, autostart=autostart))
+        specs.append(
+            WorkerSpec(
+                worker_id=worker_id,
+                argv=argv,
+                cwd=cwd,
+                role=role,
+                modelmasks=modelmasks,
+                autostart=autostart,
+            )
+        )
     return specs
 
 
@@ -268,6 +290,7 @@ def expand_agents(config: dict[str, Any]) -> dict[str, Any]:
                     "cwd": agent.get("cwd") or (f"subagents/{worker_id}" if worker_id else None),
                     "launch": agent.get("command") or "copilot",
                     "model": agent.get("model"),
+                    "modelmasks": agent.get("modelmasks"),
                 }
             )
         elif launch == "mock":
@@ -279,6 +302,7 @@ def expand_agents(config: dict[str, Any]) -> dict[str, Any]:
                     "capabilities": agent.get("capabilities"),
                     "role": agent.get("role"),
                     "models": agent.get("models"),
+                    "modelmasks": agent.get("modelmasks"),
                 }
             )
         elif launch == "proxy":

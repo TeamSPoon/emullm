@@ -7,7 +7,7 @@ and the expected shape. For the worker-relayed endpoints (chat
 completions, completions, responses, and messages), no worker is connected in this test
 process; the relay is designed to wait (not fail fast) for one, so these
 tests monkeypatch a short timeout and just assert the eventual 504 --
-the actual relay round-trip (including the /emullm/{worker_id}/ws
+the actual relay round-trip (including the /emullm/ws?worker_id=...
 handshake) is exercised manually via scripts/emullm_worker.py against a
 live server.
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 from fastapi import FastAPI
@@ -72,11 +73,14 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     # or a FakeWorker registered by one test still being "connected" for
     # the next one).
     monkeypatch.setattr(emullm_api, "_connected_workers", {})
+    monkeypatch.setattr(emullm_api, "_native_worker_ids", set())
     monkeypatch.setattr(emullm_api, "_worker_models", {})
     monkeypatch.setattr(emullm_api, "_worker_capabilities", {})
     monkeypatch.setattr(emullm_api, "_worker_roles", {})
+    monkeypatch.setattr(emullm_api, "_worker_model_masks", {})
     monkeypatch.setattr(emullm_api, "_worker_usage", {})
     monkeypatch.setattr(emullm_api, "_pending", {})
+    monkeypatch.setattr(emullm_api, "_pending_models", {})
     monkeypatch.setattr(emullm_api, "_DOC_ALIASES", {})
     # No managed-worker supervisor by default (auto mode sets one).
     emullm_api._sup.set_supervisor(None)  # noqa: SLF001
@@ -101,6 +105,34 @@ def test_list_models_includes_personas(client: TestClient) -> None:
         "yourself/percent25",
         "yourself/percent10",
     }
+
+
+def test_service_catalog_advertises_one_shared_worker_socket(client: TestClient) -> None:
+    response = client.get("/emullm/endpoints")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == "emullm"
+    worker_sockets = [
+        endpoint
+        for endpoint in body["endpoints"]
+        if endpoint["path"].startswith("/emullm/") and "WS" in endpoint["methods"]
+    ]
+    assert any(endpoint["path"] == "/emullm/ws" for endpoint in worker_sockets)
+    assert all("{worker_id}" not in endpoint["path"] for endpoint in worker_sockets)
+    assert all(endpoint["comment"] and "parameters" in endpoint for endpoint in body["endpoints"])
+
+    worker_socket = next(endpoint for endpoint in worker_sockets if endpoint["path"] == "/emullm/ws")
+    assert {parameter["name"] for parameter in worker_socket["parameters"]} == {"worker_id", "modelmasks"}
+    chat = next(endpoint for endpoint in body["endpoints"] if endpoint["path"] == "/v1/chat/completions")
+    assert chat["requestBody"]["content"]["application/json"]["schema"]["$ref"].endswith("/ChatRequest")
+    interaction_log = next(
+        endpoint for endpoint in body["endpoints"] if endpoint["path"] == "/emullm/websock_to_llm_user/events"
+    )
+    assert {"worker_id", "model", "modelmask", "type", "after", "limit"} == {
+        parameter["name"] for parameter in interaction_log["parameters"]
+    }
+    assert "ChatRequest" in body["schemas"]
+    assert client.get("/endpoints").json()["endpoints"] == body["endpoints"]
 
 
 def test_get_single_model(client: TestClient) -> None:
@@ -213,7 +245,7 @@ def test_connected_worker_exports_durable_correlated_mailbox_events(client: Test
     assert mailbox["transports"] == ["jsonl", "ws"]
     assert mailbox["connected"] is True
     assert mailbox["endpoints"]["ws"] == "/ws_collab/ws"
-    assert mailbox["endpoints"]["worker_ws"] == "/emullm/codex-ide-1/ws"
+    assert mailbox["endpoints"]["worker_ws"] == "/emullm/ws?worker_id=codex-ide-1"
 
     events_response = client.get("/ws_collab/v1/events", params={"stream": "codex-ide-1"})
     assert events_response.status_code == 200
@@ -236,7 +268,7 @@ def test_connected_worker_exports_durable_correlated_mailbox_events(client: Test
 
 
 def test_worker_websocket_creates_its_named_mailbox(client: TestClient, tmp_path) -> None:
-    with client.websocket_connect("/emullm/socket-servant/ws") as websocket:
+    with client.websocket_connect("/emullm/ws?worker_id=socket-servant") as websocket:
         assert websocket.receive_json() == {"type": "hello", "worker_id": "socket-servant"}
         directory = client.get("/ws_collab/v1/mailbox/mailboxes", params={"include_activity": "true"}).json()
         mailbox = next(entry for entry in directory["mailboxes"] if entry["id"] == "socket-servant")
@@ -245,6 +277,23 @@ def test_worker_websocket_creates_its_named_mailbox(client: TestClient, tmp_path
         agents = client.get("/ws_collab/v1/mailbox/agents").json()["agents"]
         assert any(agent["id"] == "socket-servant" and agent["kind"] == "worker" for agent in agents)
         assert (tmp_path / "runtime" / "events_logs").is_dir()
+        events = client.get("/ws_collab/v1/events", params={"stream": "socket-servant"}).json()["events"]
+        assert events[0]["type"] == "WORKER_CONNECTED"
+
+
+def test_worker_websocket_generates_an_identity_and_applies_model_masks(client: TestClient) -> None:
+    with client.websocket_connect("/emullm/ws?modelmasks=vendor/*,gpt-*") as websocket:
+        hello = websocket.receive_json()
+        worker_id = hello["worker_id"]
+        assert re.fullmatch(r"servant-[0-9a-f]{16}", worker_id)
+        assert hello["modelmasks"] == ["vendor/*", "gpt-*"]
+        assert emullm_api._worker_model_masks[worker_id] == ("vendor/*", "gpt-*")  # noqa: SLF001
+
+
+def test_worker_websocket_without_model_masks_accepts_all_models(client: TestClient) -> None:
+    with client.websocket_connect("/emullm/ws?worker_id=all-model-servant") as websocket:
+        assert websocket.receive_json() == {"type": "hello", "worker_id": "all-model-servant"}
+        assert "all-model-servant" not in emullm_api._worker_model_masks  # noqa: SLF001
 
 
 def test_mailbox_chat_websocket_subscribes_and_publishes_events(client: TestClient) -> None:
@@ -427,20 +476,39 @@ def test_text_endpoints_support_server_sent_event_streams(
     assert "streamed answer" in response.text
 
 
-def test_unknown_models_fail_before_waiting_for_a_worker(client: TestClient) -> None:
+@pytest.mark.parametrize("model", ["unlisted-model", "vendor/unlisted-model", "yourself/unlisted-model"])
+def test_unknown_models_are_forwarded_unchanged_to_generic_servant(client: TestClient, model: str) -> None:
+    worker = FakeWorker(reply="generic servant reply")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+
     response = client.post(
         "/v1/chat/completions",
-        json={"model": "yourself/not-real", "messages": [{"role": "user", "content": "hello"}]},
+        json={"model": model, "messages": [{"role": "user", "content": "hello"}]},
     )
-    assert response.status_code == 404
+
+    assert response.status_code == 200
+    assert response.json()["model"] == model
+    assert response.json()["choices"][0]["message"]["content"] == "generic servant reply"
+    assert worker.sent[0]["model"] == model
+    assert worker.sent[0]["worker_id"] == "yourself"
+    assert "persona_instruction" not in worker.sent[0]
 
 
-def test_messages_unknown_model_fails_before_waiting_for_a_worker(client: TestClient) -> None:
+def test_messages_unknown_model_is_forwarded_unchanged_to_generic_servant(client: TestClient) -> None:
+    worker = FakeWorker(reply="generic message reply")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+
     response = client.post(
         "/v1/messages",
-        json={"model": "yourself/not-real", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8},
+        json={"model": "vendor/unlisted-model", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8},
     )
-    assert response.status_code == 404
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "vendor/unlisted-model"
+    assert response.json()["content"][0]["text"] == "generic message reply"
+    assert worker.sent[0]["model"] == "vendor/unlisted-model"
+    assert worker.sent[0]["worker_id"] == "yourself"
+    assert "persona_instruction" not in worker.sent[0]
 
 
 def test_mock_mode_answers_without_a_worker(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -784,6 +852,61 @@ def test_relay_routes_to_the_worker_matching_the_model_prefix() -> None:
     assert not bob.sent
 
 
+def test_model_masks_prioritize_matches_then_retry_an_all_model_worker() -> None:
+    class RejectingWorker:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+            await emullm_api._handle_worker_message(  # noqa: SLF001
+                "masked-servant",
+                {"type": "reject", "id": payload["id"], "reason": "outside my live capacity"},
+            )
+
+    masked = RejectingWorker()
+    fallback = FakeWorker(reply="all-model answer")
+    emullm_api._connected_workers["masked-servant"] = masked  # noqa: SLF001
+    emullm_api._worker_model_masks["masked-servant"] = ("vendor/*",)  # noqa: SLF001
+    emullm_api._connected_workers["all-model-servant"] = fallback  # noqa: SLF001
+    emullm_api._native_worker_ids.update({"masked-servant", "all-model-servant"})  # noqa: SLF001
+
+    result = asyncio.run(emullm_api._relay("vendor/any-model", "hello"))
+
+    assert result == "all-model answer"
+    assert masked.sent[0]["acceptance_requested"] is True
+    assert fallback.sent[0]["model"] == "vendor/any-model"
+    assert fallback.sent[0]["worker_id"] == "all-model-servant"
+
+
+def test_llm_user_interaction_log_is_filterable_over_http_and_websocket(client: TestClient) -> None:
+    emullm_api._connected_workers["logged-servant"] = FakeWorker(reply="logged answer")  # noqa: SLF001
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "logged-servant/same", "messages": [{"role": "user", "content": "log this"}]},
+    )
+    assert response.status_code == 200
+
+    log = client.get(
+        "/emullm/websock_to_llm_user/events",
+        params={"worker_id": "logged-servant", "model": "logged-servant/same"},
+    ).json()
+    assert log["stream"] == "websock_to_llm_user"
+    assert [event["type"] for event in log["events"]] == ["LLM_REQUEST", "LLM_REPLY"]
+    assert log["events"][0]["data"]["from"] == "LLM_USER"
+    assert log["events"][0]["data"]["to"] == "logged-servant"
+    assert log["events"][1]["data"]["from"] == "logged-servant"
+    assert log["events"][1]["data"]["to"] == "LLM_USER"
+
+    with client.websocket_connect("/emullm/websock_to_llm_user/ws?worker_id=logged-servant&type=LLM_REPLY") as websocket:
+        subscribed = websocket.receive_json()
+        assert subscribed["stream"] == "websock_to_llm_user"
+        event = websocket.receive_json()
+        assert event["type"] == "event"
+        assert event["event"]["type"] == "LLM_REPLY"
+        assert event["event"]["data"]["worker_id"] == "logged-servant"
+
+
 def test_list_models_aggregates_every_connected_worker(client: TestClient) -> None:
     emullm_api._connected_workers["alice"] = FakeWorker()  # noqa: SLF001
     emullm_api._worker_models["alice"] = {"same": {"display_name": "(alice)", "instruction": "Be alice."}}
@@ -799,6 +922,7 @@ def test_worker_caps_lookup(client: TestClient) -> None:
         "connected": False,
         "models": sorted(emullm_api._PERSONA_SUFFIXES.keys()),
         "capabilities": {},
+        "modelmasks": None,
     }
 
     emullm_api._connected_workers["alice"] = FakeWorker()  # noqa: SLF001

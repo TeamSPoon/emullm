@@ -63,14 +63,17 @@ real client <--HTTP-- (blocks on a Future) <--WS reply-- worker (writes {"type":
 - Each relayed request gets a `request_id` (uuid4 hex) and an
   `asyncio.Future` stored in a module-level `_pending` dict.
 - The request is sent as `{"type": "request", "id", "model", "worker_id",
-  "prompt", "persona_instruction"?}` -- and, for two-way media jobs, also
-  `"images"` / `"audio"` / `"files"` / `"kind"` (see "Two-way media" below)
-  -- over whichever worker's WebSocket matches the model's worker_id.
-- The worker's `{"type": "reply", "id", "content"}` message resolves the
-  matching future, which becomes the HTTP response. A worker may also
-  include real media on the reply (`"image_b64"`/`"image_url"`/`"mime"`,
-  `"audio_b64"`/`"audio_url"`); the relay persists it to the shared cloud
-  files store and hands the caller a stable URL.
+  "prompt", "acceptance_requested": true, "persona_instruction"?}` -- and,
+  for two-way media jobs, also `"images"` / `"audio"` / `"files"` / `"kind"`
+  (see "Two-way media" below) -- over an eligible worker's WebSocket.
+- A worker may send `{"type":"accept","id":...}` and later
+  `{"type":"reply","id","content"}`, or decline a particular offer with
+  `{"type":"reject","id","reason":"..."}`. A direct `reply` remains an
+  implicit acceptance for older clients. Rejection makes the relay offer the
+  request to the next eligible worker instead of fabricating an answer.
+- Any `model` string is accepted and forwarded unchanged. An exact configured
+  `model_routes` entry takes precedence. Otherwise, matching `modelmasks`
+  workers are tried first, then workers with no masks (which accept all).
 - If no worker for that worker_id is connected, `_relay()` does **not**
   fail fast -- it polls, waiting for one to (re)connect, acting like a
   slow API server rather than a broken one. Only after
@@ -98,6 +101,15 @@ Descriptors advertise this with `source: "jsonl"` and
 field identifies the local directory. `endpoints.ws` points to the generic
 adapter socket, while `endpoints.worker_ws` identifies the servant's native
 relay socket.
+
+Every request interaction is mirrored into the aggregate JSONL mailbox
+`events_logs/websock_to_llm_user.jsonl`. Its events use explicit
+`LLM_USER -> worker_id` and `worker_id -> LLM_USER` directions and include
+the original model, prompt, correlation id, and reply/rejection metadata.
+`GET /emullm/websock_to_llm_user/events` supports `worker_id`, exact
+`model`, glob `modelmask`, event `type`, and `after` cursor filters; the
+equivalent live feed is `WS /emullm/websock_to_llm_user/ws` with the same
+query parameters.
 
 Each normal LLM call records an `LLM_REQUEST` event immediately after its
 WebSocket frame is sent and an `LLM_REPLY` when the matching worker reply
@@ -140,25 +152,32 @@ polls it for live changes, so adapter reconnects do not lose relay traffic.
 
 ## Multi-worker routing: "a small pool of emulators"
 
-More than one worker can be connected at once, each under its own
-`worker_id` (e.g. `"yourself"`, `"alice"`, `"bob"`). A model id is
-`"<worker_id>/<persona-suffix>"` (see personas below), and a request for
-that model is routed to whichever worker is currently registered under
-that worker_id -- not just "whoever happens to be connected."
+More than one worker can be connected at once, each under its own optional
+`worker_id` (e.g. `"alice"`, `"bob"`). A named worker can still be addressed
+with `"<worker_id>/<persona-suffix>"` (see personas below). For every other
+model, the relay chooses matching `modelmasks` first and then unmasked
+all-model workers.
 
 Workers connect at:
 
 ```
-WS /emullm/{worker_id}/ws
+WS /emullm/ws
 ```
 
-worker_id comes straight from the URL path. On connect, the server
-sends a `{"type": "hello", "worker_id": ...}` handshake and waits
-(briefly, ~10s) for an optional
-`{"type": "register", "models": {...}, "capabilities": {...}}` reply (see
-below). A worker that skips this (or an older/simpler client that never
-registers) still works fine, just with the default persona menu and no
-"pretend" capabilities.
+Use query parameters rather than path segments:
+
+```
+WS /emullm/ws?worker_id=alice&modelmasks=openai/*,gpt-*
+```
+
+`worker_id` is optional. The server assigns a mailbox-safe
+`servant-<random>` identity when it is omitted and returns it in the
+`{"type":"hello","worker_id":...}` handshake. `modelmasks` is also optional:
+comma-delimited glob patterns limit the model offers sent to that worker;
+when omitted, it receives offers for all models. Workers can additionally
+send `{"type":"register", "models": {...}, "capabilities": {...},
+"modelmasks":[...]}` at any time. A worker that skips registration still
+works with the default persona menu and no "pretend" capabilities.
 
 ## Personas ("yourself/same", "yourself/percent25", ...)
 
@@ -367,14 +386,15 @@ bare path):
 - `DELETE /admin/emullm/records/{kind}/{record_id}`
 
 **WebSocket** (where workers connect, not a REST call):
-- `WS /emullm/{worker_id}/ws`
+- `WS /emullm/ws?worker_id=<optional-id>&modelmasks=<optional-globs>`
+- `WS /emullm/websock_to_llm_user/ws` -- filtered aggregate interaction log
 
 ## The worker side (`../src/emullm/worker.py`)
 
 Since the agent can't hold a live process open across its own turns, the
 worker script uses **file-based handoff**:
 
-1. Connects to `ws://{{EMULLM_WS_HOST}}/emullm/<worker-id>/ws`.
+1. Connects to `ws://{{EMULLM_WS_HOST}}/emullm/ws?worker_id=<worker-id>`.
 2. If greeted with a `hello`, replies with a `register` message declaring
    `--capabilities` (comma-separated: `images,embeddings,moderations,
    audio_transcription,audio_speech`).

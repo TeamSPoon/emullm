@@ -22,7 +22,8 @@ two-way "socketing" back to the relay.
    real deploy. Prefer `wss://` on 443.
 2. Allowlist that host in the cloud env (Codex environment internet settings;
    Copilot org/repo firewall allowlist).
-3. The worker connects **out** to `wss://<relay-host>/emullm/<id>/ws`. The
+3. The worker connects **out** to
+   `wss://<relay-host>/emullm/ws?worker_id=<id>`. The
    socket is full-duplex, so both directions work: jobs down, worker messages up
    (relay inbox/back-channel). Media travels by cloud-file URL on the same
    allowlisted host.

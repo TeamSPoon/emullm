@@ -11,11 +11,55 @@
   "mailboxEndpoint": {
     "path": "/mailbox/mailboxes",
     "protocol": "ws_collab",
+    "websocket": "/emullm/mailbox/ws",
     "description": "ws_collab-compatible mailbox directory served by the embedded EMULLM router (also answers at /emullm/mailbox/mailboxes); sibling routes /messages, /send share the base."
   },
   "servicesEndpoint": {
-    "path": "/api/plugins/emullm/endpoints",
-    "description": "Workbench enumerator of the embedded EMULLM router's registered routes."
+    "path": "/emullm/endpoints",
+    "method": "GET",
+    "transport": "http",
+    "protocol": "emullm-service-catalog-v1",
+    "format": "json",
+    "websocket": "/emullm/ws",
+    "description": "Native EMULLM catalog of every HTTP and WebSocket service, including comments, parameters, request bodies, responses, reusable schemas, and the shared worker socket at /emullm/ws."
+  },
+  "serverEventLog": {
+    "endpoint": "/emullm/websock_to_llm_user/events",
+    "method": "GET",
+    "protocol": "http",
+    "format": "json"
+  },
+  "runtimeModes": {
+    "available": [
+      {
+        "id": "standalone",
+        "label": "Standalone",
+        "server": {
+          "baseUrl": "http://127.0.0.1:8801"
+        },
+        "environment": {
+          "EMULLM_PLUGIN_MODE": "standalone"
+        },
+        "config": {
+          "plugin-lifecycle.standalone": true
+        }
+      },
+      {
+        "id": "embedded",
+        "label": "Embedded",
+        "server": {
+          "servicePath": "/emullm"
+        },
+        "environment": {
+          "EMULLM_PLUGIN_MODE": "embedded"
+        },
+        "config": {
+          "plugin-lifecycle.standalone": false
+        }
+      }
+    ],
+    "default": "standalone",
+    "current": "standalone"
   },
   "docs": "README.md",
   "kind": "custom",
@@ -61,11 +105,14 @@
       "workspaceShutdown": null,
       "workspaceShutdownAfter": null
     },
-    "note": "Runs as its own standalone server by default (set EMULLM_PLUGIN_MODE=embedded to mount it in-process instead). A standalone plugin owns its own process start/stop, so a workbench restart does not restart it -- workbenchShutdown, if implemented, is only a heads-up notification, never a signal to stop or restart this plugin's own server."
+    "note": "Runs in the runtimeModes.current selection. Standalone owns its server process; embedded mounts the router into Workbench. Changing modes takes effect on the next Workbench/API restart."
   },
-  "plugin-api": {
+  "plugin-endpoints": {
     "status": { "method": "GET", "path": "/emullm/admin/state", "description": "JSON worker/route/config state (see also /emullm/status for the HTML view)." },
     "config": { "method": "GET", "path": "/emullm/admin/config", "description": "Current configuration." },
+    "services": { "method": "GET", "path": "/emullm/endpoints", "description": "Native service catalog with comments, parameter metadata, request schemas, responses, and reusable component schemas." },
+    "workerWebSocket": { "method": "WS", "path": "/emullm/ws", "description": "Single worker socket; optional worker_id and modelmasks query parameters identify and filter each connection without creating new paths." },
+    "mailboxWebSocket": { "method": "WS", "path": "/emullm/mailbox/ws", "description": "ws_collab-compatible durable mailbox/event socket." },
     "restart": null,
     "shutdown": null,
     "note": "No HTTP route restarts or shuts down the process itself. /emullm/admin/reset clears persisted records (files/assistants/threads/events/mailbox storage) -- a data reset, not a process restart -- so it is deliberately not listed as 'restart' here."

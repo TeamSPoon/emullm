@@ -52,7 +52,7 @@ Then, in a second terminal with the environment activated, connect a
 worker and open the chat client:
 
 ```console
-python -m emullm.worker --worker-id yourself --host-ws-url ws://127.0.0.1:8801
+python -m emullm.worker --host-ws-url ws://127.0.0.1:8801
 python -m emullm.chat
 ```
 
@@ -80,11 +80,35 @@ environment there as well. For example, in Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 ```
 
-Then connect as the model:
+Then connect a servant:
 
 ```console
-python -m emullm.worker --worker-id yourself --host-ws-url ws://127.0.0.1:8801
+python -m emullm.worker --host-ws-url ws://127.0.0.1:8801
 ```
+
+Every native servant uses the one endpoint:
+`ws://127.0.0.1:8801/emullm/ws`. Supply an optional identity as
+`?worker_id=codex-ide-1`; if omitted, the server assigns a
+`servant-<random>` identity and returns it in the first `hello` frame. Supply
+an optional comma-separated glob list as
+`?worker_id=codex-ide-1&modelmasks=openai/*,gpt-*`; omitting `modelmasks`
+makes the servant eligible for every model. Unlisted model IDs are always
+forwarded unchanged in the request frame. A servant may explicitly send
+`accept` then `reply`, or send `reject` for a particular request so the relay
+can try another eligible servant.
+
+EMULLM advertises its own current HTTP and WebSocket routes at
+`GET /emullm/endpoints`. The catalog always contains the single shared
+worker route `/emullm/ws`; worker connections do not create new paths. Every
+catalog entry includes its comment, query/path/header parameters, request-body
+schema, and response metadata. Reusable component schemas are returned in the
+top-level `schemas` map.
+
+The Workbench manifest declares the aggregate server event log at
+`GET /emullm/websock_to_llm_user/events` and two selectable runtime modes:
+`standalone` (the default server at `http://127.0.0.1:8801`) and `embedded`
+(the router mounted at `/emullm`). The selected `runtimeModes.current` value
+maps to `EMULLM_PLUGIN_MODE` and takes effect on the next Workbench/API restart.
 
 The worker connects, waits briefly for a relayed request, answers it, and
 rests -- see `docs/EMULLM_ONBOARD.md` for the complete worker doc (the
@@ -104,6 +128,13 @@ Each connected worker WebSocket is exported as a durable mailbox with the
 same id as its `worker_id`. Mailbox configuration and reader cursors persist
 at `runtime\config\mailboxes.json`; each worker's ordered event stream
 persists at `runtime\events_logs\<worker_id>.jsonl`.
+
+The server also writes every `LLM_USER ↔ worker_id` offer, accept, reject, and
+reply to the aggregate JSONL mailbox
+`runtime\events_logs\websock_to_llm_user.jsonl`. Read filtered history at
+`GET /emullm/websock_to_llm_user/events` or stream it from
+`WS /emullm/websock_to_llm_user/ws`; both support `worker_id`, `model`,
+`modelmask`, `type`, and `after` filters/cursors.
 
 The compatibility API is mounted at `/ws_collab/v1` and `/mailbox_chat/v1`
 (with `/emullm`, `/api`, and bare-path aliases). `mailbox_chat` can use
@@ -274,10 +305,12 @@ Chat client (`emullm.chat`):
 
 - **Server** (`python run.py` / `emullm-serve`): `--host` (`127.0.0.1`),
   `--port` (`8801`), `--no-reload`.
-- **Worker** (`python -m emullm.worker`): `--worker-id` (`yourself`),
-  `--host-ws-url` (`ws://127.0.0.1:8801`), `--idle-timeout` (`10`s),
-  `--rest-seconds` (`30`s), `--rest-min-seconds` (`1`s), `--reply-timeout`
-  (`3600`s), `--request-file`, `--reply-file`, `--once`.
+- **Worker** (`python -m emullm.worker`): optional `--worker-id` (server
+  assigns one when omitted), `--modelmasks` (comma-separated glob patterns;
+  omitted means all models), `--host-ws-url` (`ws://127.0.0.1:8801`),
+  `--idle-timeout` (`10`s), `--rest-seconds` (`30`s), `--rest-min-seconds`
+  (`1`s), `--reply-timeout` (`3600`s), `--request-file`, `--reply-file`,
+  `--once`.
 - **Chat** (`python -m emullm.chat`): `--base-url`, `--model`, `--api-key`,
   `--system`, `--history-file`, `--one-shot`, `--timeout` (`900`s).
 
@@ -292,7 +325,8 @@ These live in `emullm/api.py`:
   send an explicit `expires_after`.
 - `_ALLOWED_FILE_PURPOSES` — the accepted `purpose` values for `/v1/files`.
 - `_DEFAULT_WORKER_ID` (`yourself`) / `_DEFAULT_MODEL_ID` (`yourself/same`) —
-  the persona used when a request doesn't name one.
+  the virtual default persona used when a request doesn't name one; it is not
+  a WebSocket URL path or required worker identity.
 
 ## Tests
 

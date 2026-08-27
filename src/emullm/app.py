@@ -3,7 +3,7 @@
 Exposes the emullm router as its own app so it can run on its own port
 (see run.py). Point OpenAI-compatible clients at http://<host>/v1 -- no
 API key/token required -- and connect workers at
-ws://<host>/emullm/<worker_id>/ws.
+ws://<host>/emullm/ws?worker_id=<worker_id>.
 
 In `auto` mode (EMULLM_MODE=auto) the app also starts its own worker
 subprocesses on startup and stops them on shutdown -- see

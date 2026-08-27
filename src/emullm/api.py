@@ -109,9 +109,9 @@ Implemented routes, and how each is emulated:
 
 Any request that is genuinely relayed (chat/completions, messages,
 completions, responses) is queued and forwarded to whichever worker is currently
-connected at WebSocket /emullm/{worker_id}/ws for that model's
-worker_id prefix (e.g. model "alice/same" routes to whoever is connected
-at /emullm/alice/ws). The worker reads the forwarded prompt, composes a
+connected at WebSocket /emullm/ws. A worker identifies with the ``worker_id``
+query parameter and can declare ``modelmasks`` query patterns; a worker without
+masks is eligible for every model. The worker reads the forwarded prompt, composes a
 reply, and sends it back tagged with the same request id; that reply
 becomes the HTTP response. If no
 worker happens to be connected right now (e.g. a request lands during
@@ -140,6 +140,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import mimetypes
@@ -154,6 +155,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile
@@ -163,6 +165,122 @@ from . import supervisor as _sup
 router = APIRouter()
 
 _REQUEST_TIMEOUT_SECONDS = 900  # generous -- a human/agent may take a while to reply
+
+
+def _websocket_catalog_parameters(path: str) -> list[dict[str, Any]]:
+    if path == "/emullm/ws":
+        return [
+            {
+                "name": "worker_id",
+                "in": "query",
+                "required": False,
+                "description": "Stable worker/mailbox identity; omitted values receive a generated servant ID.",
+                "schema": {"type": "string"},
+            },
+            {
+                "name": "modelmasks",
+                "in": "query",
+                "required": False,
+                "description": "Comma-separated or repeated model glob patterns; omit to accept all models.",
+                "schema": {"type": "array", "items": {"type": "string"}},
+            },
+        ]
+    if path in {"/emullm/websock_to_llm_user/ws", "/websock_to_llm_user/ws"}:
+        return [
+            {
+                "name": name,
+                "in": "query",
+                "required": False,
+                "description": description,
+                "schema": {"type": "string"},
+            }
+            for name, description in (
+                ("worker_id", "Return interactions for one worker identity."),
+                ("model", "Return interactions for one exact model ID."),
+                ("modelmask", "Return interactions whose model matches this glob."),
+                ("type", "Return one or more comma-separated event types."),
+                ("after", "Resume after this event cursor."),
+            )
+        ]
+    return []
+
+
+@router.get("/endpoints")
+@router.get("/emullm/endpoints")
+def service_catalog() -> dict[str, Any]:
+    """Advertise EMULLM services with comments, parameters, and schemas."""
+    openapi = get_openapi(title="EMULLM", version="1.0.0", routes=router.routes)
+    openapi_paths = openapi.get("paths", {})
+    endpoints: list[dict[str, Any]] = []
+    for route in router.routes:
+        path = getattr(route, "path", None)
+        if not isinstance(path, str):
+            continue
+        methods = sorted(method for method in (getattr(route, "methods", None) or []) if method != "HEAD")
+        endpoint = getattr(route, "endpoint", None)
+        doc = (getattr(endpoint, "__doc__", None) or "").strip()
+        name = str(getattr(route, "name", "") or "")
+        if not methods:
+            comment = doc or name.replace("_", " ").strip().capitalize() or "WebSocket endpoint"
+            endpoints.append(
+                {
+                    "path": path,
+                    "methods": ["WS"],
+                    "name": name,
+                    "summary": comment.splitlines()[0],
+                    "description": comment,
+                    "comment": comment,
+                    "transport": "websocket",
+                    "parameters": _websocket_catalog_parameters(path),
+                    "requestBody": None,
+                    "responses": {"101": {"description": "WebSocket protocol upgrade"}},
+                }
+            )
+            continue
+
+        operations: dict[str, dict[str, Any]] = {}
+        for method in methods:
+            operation = dict(openapi_paths.get(path, {}).get(method.lower(), {}))
+            operations[method] = {
+                key: operation[key]
+                for key in (
+                    "summary",
+                    "description",
+                    "parameters",
+                    "requestBody",
+                    "responses",
+                    "tags",
+                    "deprecated",
+                    "security",
+                )
+                if key in operation
+            }
+        primary = operations.get(methods[0], {})
+        comment = str(primary.get("description") or doc or primary.get("summary") or name.replace("_", " ")).strip()
+        endpoints.append(
+            {
+                "path": path,
+                "methods": methods,
+                "name": name,
+                "summary": str(primary.get("summary") or comment.splitlines()[0]),
+                "description": comment,
+                "comment": comment,
+                "transport": "http",
+                "parameters": primary.get("parameters", []),
+                "requestBody": primary.get("requestBody"),
+                "responses": primary.get("responses", {}),
+                "operations": operations,
+            }
+        )
+    endpoints.sort(key=lambda entry: (entry["path"], entry["methods"]))
+    return {
+        "id": "emullm",
+        "prefix": "/emullm",
+        "count": len(endpoints),
+        "endpoints": endpoints,
+        "schemas": openapi.get("components", {}).get("schemas", {}),
+    }
+
 
 # Human-facing server "mode", surfaced on the status page and in the admin
 # state JSON, and used by _relay to decide how to answer when a worker isn't
@@ -178,6 +296,15 @@ _SERVER_STARTED_AT = time.time()
 
 # Sentinel: a relay step couldn't handle the request -> try the next mode.
 _PASS: Any = object()
+
+
+class _WorkerRejected(Exception):
+    """A worker declined an offered request before producing a reply."""
+
+    def __init__(self, worker_id: str, reason: str) -> None:
+        self.worker_id = worker_id
+        self.reason = reason
+        super().__init__(f"worker '{worker_id}' rejected the request: {reason}")
 
 
 def _current_modes() -> list[str]:
@@ -256,7 +383,8 @@ def register_mock_workers(specs: list[dict[str, Any]]) -> list[str]:
     """Register a set of pretend copilots as connected in-process workers.
 
     Each spec: ``{ "id": "alice", "reply": "...", "template": "...",
-    "capabilities": ["images"], "role": "trusted", "models": {...} }``.
+    "capabilities": ["images"], "role": "trusted", "models": {...},
+    "modelmasks": ["vendor/*"] }``.
     Returns the ids registered. Used by the app lifespan (from config
     ``mock_workers``) and directly by tests.
     """
@@ -278,6 +406,10 @@ def register_mock_workers(specs: list[dict[str, Any]]) -> list[str]:
         models = spec.get("models")
         if isinstance(models, dict) and models:
             _worker_models[worker_id] = models
+        if "modelmasks" in spec:
+            _set_worker_model_masks(worker_id, _normalise_model_masks(spec["modelmasks"]))
+        else:
+            _worker_model_masks.pop(worker_id, None)
         registered.append(worker_id)
     return registered
 
@@ -291,6 +423,7 @@ def unregister_mock_workers(worker_ids: list[str]) -> None:
         _worker_capabilities.pop(worker_id, None)
         _worker_roles.pop(worker_id, None)
         _worker_models.pop(worker_id, None)
+        _worker_model_masks.pop(worker_id, None)
 
 
 # --- Proxy backends (proxy / proxy-observe modes) --------------------------
@@ -533,8 +666,10 @@ def _check_and_record_usage(worker_id: str) -> None:
 # registered under that worker_id -- not to "whoever happens to be
 # connected" like a single-worker design would.
 _connected_workers: dict[str, WebSocket] = {}
+_native_worker_ids: set[str] = set()
 _worker_lock = asyncio.Lock()
-_pending: dict[str, "asyncio.Future[str]"] = {}
+_pending: dict[str, "asyncio.Future[Any]"] = {}
+_pending_models: dict[str, str] = {}
 
 # Each worker declares its OWN model list on connect (see the websocket
 # handshake below): a dict of suffix -> {"display_name", "instruction"}.
@@ -561,6 +696,10 @@ _DEFAULT_WORKER_ROLE = "trusted"
 _worker_roles: dict[str, str] = {}
 
 _DEFAULT_WORKER_ID = "yourself"
+
+# A missing entry means the worker accepts all models. A present empty tuple
+# means it intentionally accepts none; non-empty entries are glob patterns.
+_worker_model_masks: dict[str, tuple[str, ...]] = {}
 
 # ---------------------------------------------------------------------------
 # Default/fallback persona suffixes, used for any worker_id that hasn't
@@ -615,6 +754,76 @@ def _models_for(worker_id: str) -> dict[str, dict[str, Any]]:
     connect (see the websocket handshake), or _PERSONA_SUFFIXES as a
     fallback for a worker_id that hasn't declared one (yet)."""
     return _worker_models.get(worker_id, _PERSONA_SUFFIXES)
+
+
+def _normalise_model_masks(value: Any) -> tuple[str, ...] | None:
+    """Normalize comma-delimited or JSON-list model glob patterns."""
+    if value is None:
+        return None
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    masks: list[str] = []
+    for raw_value in raw_values:
+        if not isinstance(raw_value, str):
+            continue
+        masks.extend(mask.strip() for mask in raw_value.split(",") if mask.strip())
+    return tuple(dict.fromkeys(masks))
+
+
+def _set_worker_model_masks(worker_id: str, masks: tuple[str, ...] | None) -> None:
+    if masks is None:
+        _worker_model_masks.pop(worker_id, None)
+    else:
+        _worker_model_masks[worker_id] = masks
+
+
+def _new_automatic_worker_id() -> str:
+    """Create a collision-resistant mailbox-safe identity for an anonymous socket."""
+    while True:
+        worker_id = f"servant-{uuid.uuid4().hex[:16]}"
+        if worker_id not in _connected_workers:
+            return worker_id
+
+
+def _worker_candidates_for_model(model: str, resolved_worker_id: str) -> list[str]:
+    """Return live workers eligible to accept a model offer, in try order."""
+    if _model_routes.get(model):
+        return [resolved_worker_id]  # Explicit operator route always wins.
+
+    requested_worker_id, _ = _split_model_id(model)
+    if requested_worker_id != _DEFAULT_WORKER_ID and requested_worker_id in _connected_workers:
+        return [requested_worker_id]  # Preserve explicit named-worker routing.
+
+    matching = sorted(
+        worker_id
+        for worker_id in _native_worker_ids
+        if worker_id in _connected_workers
+        if (masks := _worker_model_masks.get(worker_id)) and any(fnmatchcase(model, mask) for mask in masks)
+    )
+    unmasked = sorted(
+        worker_id
+        for worker_id in _native_worker_ids
+        if worker_id in _connected_workers and worker_id not in _worker_model_masks
+    )
+    ordered: list[str] = []
+    for candidates, key in ((matching, "websocket-modelmasks:matching"), (unmasked, "websocket-modelmasks:all")):
+        if candidates:
+            _, rotated = select_from_catalog(candidates, "round-robin", key=key)
+            ordered.extend(rotated)
+    return ordered or [resolved_worker_id]
+
+
+def _is_known_worker_id(worker_id: str) -> bool:
+    """Whether a model prefix explicitly addresses an available worker."""
+    return (
+        worker_id == _DEFAULT_WORKER_ID
+        or worker_id in _connected_workers
+        or worker_id in _worker_models
+        or worker_id in _worker_capabilities
+        or worker_id in _worker_roles
+        or worker_id in _agent_descriptions
+        or worker_id in _worker_service_behavior
+        or worker_id in _model_routes.values()
+    )
 
 
 def _worker_can_pretend(worker_id: str, capability: str) -> bool:
@@ -1677,13 +1886,20 @@ def _require_model(model: str) -> tuple[str, str, dict[str, Any]]:
         }
     worker_id, suffix = _split_model_id(model)
     persona = _models_for(worker_id).get(suffix)
-    if persona is None:
-        # In proxy mode, accept the backend's own model ids (e.g. a real
-        # multi-model upstream) instead of 404ing -- they're forwarded as-is.
-        if _proxy_available():
-            return model, "", {"instruction": None, "passthrough": True}
-        raise HTTPException(status_code=404, detail=f"unknown model '{model}'")
-    return worker_id, suffix, persona
+    if persona is not None and suffix != "same":
+        # Percent dials are virtual personas even when their prefix is not a
+        # registered worker (for example ``smart/percent10`` in proxy mode).
+        return worker_id, suffix, persona
+    if _is_known_worker_id(worker_id):
+        if persona is not None:
+            return worker_id, suffix, persona
+        # A named worker can receive a model it did not advertise. Keep the
+        # caller's model intact instead of treating its suffix as a persona.
+        return worker_id, "", {"instruction": None, "passthrough": True, "served_model": model}
+
+    # Arbitrary model IDs are valid relay input. They are opaque to the
+    # generic servant, which receives the original model value unchanged.
+    return _DEFAULT_WORKER_ID, "", {"instruction": None, "passthrough": True, "served_model": model}
 
 
 def _backend_model_for(model: str, backend: dict[str, Any]) -> str:
@@ -1730,8 +1946,8 @@ async def _relay_full(
     this fails FAST with 429 (and a Retry-After telling the caller when to
     come back -- possibly minutes away), rather than queuing yet more work
     onto an already-busy worker."""
-    worker_id, _, persona = _require_model(model)
-    _check_and_record_usage(worker_id)
+    resolved_worker_id, _, persona = _require_model(model)
+    worker_ids = _worker_candidates_for_model(model, resolved_worker_id)
     instruction = persona.get("instruction")
 
     extra: dict[str, Any] = {}
@@ -1745,15 +1961,30 @@ async def _relay_full(
         extra["kind"] = kind
 
     modes = _current_modes()
-    for mode in modes:
-        result = await _relay_step(mode, worker_id, model, prompt_text, instruction, extra or None)
-        if result is not _PASS:
-            await _mirror_to_observers(worker_id, model, prompt_text, _reply_content(result))
-            return result
+    rejections: list[_WorkerRejected] = []
+    for worker_id in worker_ids:
+        _check_and_record_usage(worker_id)
+        for mode in modes:
+            try:
+                result = await _relay_step(mode, worker_id, model, prompt_text, instruction, extra or None)
+            except _WorkerRejected as rejection:
+                rejections.append(rejection)
+                break
+            if result is not _PASS:
+                await _mirror_to_observers(worker_id, model, prompt_text, _reply_content(result))
+                return result
+        else:
+            continue
+        # A rejection is an explicit refusal, so offer the request to the next
+        # matching/all-model worker instead of manufacturing a reply.
+        continue
+    if rejections:
+        reasons = "; ".join(f"{item.worker_id}: {item.reason}" for item in rejections)
+        raise HTTPException(status_code=503, detail=f"all eligible workers rejected model '{model}' ({reasons})")
     # Every step passed (e.g. `recruit` with nobody connected and no fallback).
     raise HTTPException(
         status_code=504,
-        detail=f"no strategy produced a reply for '{worker_id}' (modes={','.join(modes)})",
+        detail=f"no strategy produced a reply for '{resolved_worker_id}' (modes={','.join(modes)})",
     )
 
 
@@ -1840,6 +2071,7 @@ async def _relay_to_worker(
     loop = asyncio.get_running_loop()
     future: "asyncio.Future[Any]" = loop.create_future()
     _pending[request_id] = future
+    _pending_models[request_id] = model
 
     payload = {
         "type": "request",
@@ -1847,6 +2079,7 @@ async def _relay_to_worker(
         "model": model,
         "worker_id": worker_id,
         "prompt": prompt_text,
+        "acceptance_requested": True,
     }
     if instruction:
         payload["persona_instruction"] = instruction
@@ -1887,12 +2120,13 @@ async def _relay_to_worker(
             # Real WebSocket replies are recorded by _handle_worker_message;
             # this idempotent call also covers test/mock peers that resolve
             # the Future directly without passing through that handler.
-            _record_relay_reply(worker_id, request_id, result)
+            _record_relay_reply(worker_id, request_id, result, model)
             return result
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="emullm worker did not reply in time")
     finally:
         _pending.pop(request_id, None)
+        _pending_models.pop(request_id, None)
 
 
 @router.get("/v1/models")
@@ -1930,6 +2164,7 @@ def worker_caps(worker_id: str) -> dict[str, Any]:
         "connected": worker_id in _connected_workers,
         "models": sorted(_models_for(worker_id).keys()),
         "capabilities": _worker_capabilities.get(worker_id, {}),
+        "modelmasks": list(_worker_model_masks[worker_id]) if worker_id in _worker_model_masks else None,
     }
 
 
@@ -2843,6 +3078,8 @@ class _JsonRecordStore:
 _MAILBOX_CONFIG_SCHEMA_VERSION = 2
 _MAILBOX_MAX_ID_LENGTH = 64
 _mailbox_lock = threading.RLock()
+_LLM_USER_ID = "LLM_USER"
+_LLM_USER_MAILBOX = "websock_to_llm_user"
 
 
 def _mailbox_id(value: Any) -> str:
@@ -3035,6 +3272,16 @@ def _ensure_mailbox(
         return dict(record)
 
 
+def _ensure_llm_user_mailbox() -> dict[str, Any]:
+    return _ensure_mailbox(
+        _LLM_USER_MAILBOX,
+        purpose="Aggregate LLM_USER to worker request, acceptance, rejection, and reply log",
+        writable=False,
+        source="jsonl",
+        transports=["jsonl", "ws"],
+    )
+
+
 def _upsert_mailbox_agent(agent_id: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
     agent_id = _mailbox_agent_id(agent_id)
     with _mailbox_lock:
@@ -3176,13 +3423,19 @@ def _mailbox_event_to_message(event: dict[str, Any]) -> dict[str, Any]:
 def _mailbox_endpoint_paths(mailbox: str) -> dict[str, str]:
     mailbox = _mailbox_id(mailbox)
     base = "/ws_collab/v1"
+    if mailbox == _LLM_USER_MAILBOX:
+        return {
+            "events": "/emullm/websock_to_llm_user/events",
+            "ws": "/emullm/websock_to_llm_user/ws",
+            "tail": f"{base}/streams/{mailbox}/tail",
+        }
     return {
         "read": f"{base}/mailbox/messages?mailbox={mailbox}",
         "send": f"{base}/mailbox/send",
         "tail": f"{base}/streams/{mailbox}/tail",
         "events": f"{base}/events?stream={mailbox}",
         "ws": "/ws_collab/ws",
-        "worker_ws": f"/emullm/{mailbox}/ws",
+        "worker_ws": f"/emullm/ws?worker_id={mailbox}",
     }
 
 
@@ -3280,41 +3533,149 @@ def _clear_mailbox_storage() -> dict[str, int]:
 
 
 def _record_relay_request(worker_id: str, request_id: str, payload: dict[str, Any]) -> None:
+    data = {
+        "text": payload.get("prompt", ""),
+        "prompt": payload.get("prompt", ""),
+        "model": payload.get("model"),
+        "worker_id": worker_id,
+        "from": _LLM_USER_ID,
+        "to": worker_id,
+        "send_to": worker_id,
+        "direction": "LLM_USER->worker",
+        "request": _mailbox_json_value(payload),
+    }
     _append_mailbox_event(
         worker_id,
         "LLM_REQUEST",
-        {
-            "text": payload.get("prompt", ""),
-            "prompt": payload.get("prompt", ""),
-            "model": payload.get("model"),
-            "from": "llm-api",
-            "to": worker_id,
-            "send_to": worker_id,
-            "request": _mailbox_json_value(payload),
-        },
-        source_id="llm-api",
-        source_kind="service",
+        data,
+        source_id=_LLM_USER_ID,
+        source_kind="user",
+        correlation_id=request_id,
+        idempotency_key=f"request:{request_id}",
+    )
+    _append_mailbox_event(
+        _LLM_USER_MAILBOX,
+        "LLM_REQUEST",
+        data,
+        source_id=_LLM_USER_ID,
+        source_kind="user",
         correlation_id=request_id,
         idempotency_key=f"request:{request_id}",
     )
 
 
-def _record_relay_reply(worker_id: str, request_id: str, reply: Any) -> None:
+def _record_relay_reply(worker_id: str, request_id: str, reply: Any, model: str | None = None) -> None:
     text = reply.get("content", "") if isinstance(reply, dict) else reply
+    data = {
+        "text": str(text or ""),
+        "model": model,
+        "worker_id": worker_id,
+        "from": worker_id,
+        "to": _LLM_USER_ID,
+        "send_to": None,
+        "direction": "worker->LLM_USER",
+        "reply": _mailbox_json_value(reply),
+    }
     _append_mailbox_event(
         worker_id,
         "LLM_REPLY",
-        {
-            "text": str(text or ""),
-            "from": worker_id,
-            "to": "llm-api",
-            "send_to": None,
-            "reply": _mailbox_json_value(reply),
-        },
+        data,
         source_id=worker_id,
         source_kind="worker",
         correlation_id=request_id or None,
         idempotency_key=f"reply:{request_id}" if request_id else None,
+    )
+    _append_mailbox_event(
+        _LLM_USER_MAILBOX,
+        "LLM_REPLY",
+        data,
+        source_id=worker_id,
+        source_kind="worker",
+        correlation_id=request_id or None,
+        idempotency_key=f"reply:{request_id}" if request_id else None,
+    )
+
+
+def _record_relay_accept(worker_id: str, request_id: str, model: str | None = None) -> None:
+    data = {
+        "model": model,
+        "worker_id": worker_id,
+        "from": worker_id,
+        "to": _LLM_USER_ID,
+        "send_to": None,
+        "direction": "worker->LLM_USER",
+    }
+    _append_mailbox_event(
+        worker_id,
+        "LLM_ACCEPT",
+        data,
+        source_id=worker_id,
+        source_kind="worker",
+        correlation_id=request_id,
+        idempotency_key=f"accept:{request_id}",
+    )
+    _append_mailbox_event(
+        _LLM_USER_MAILBOX,
+        "LLM_ACCEPT",
+        data,
+        source_id=worker_id,
+        source_kind="worker",
+        correlation_id=request_id,
+        idempotency_key=f"accept:{request_id}",
+    )
+
+
+def _record_relay_rejection(worker_id: str, request_id: str, reason: str, model: str | None = None) -> None:
+    data = {
+        "text": reason,
+        "reason": reason,
+        "model": model,
+        "worker_id": worker_id,
+        "from": worker_id,
+        "to": _LLM_USER_ID,
+        "send_to": None,
+        "direction": "worker->LLM_USER",
+    }
+    _append_mailbox_event(
+        worker_id,
+        "LLM_REJECT",
+        data,
+        source_id=worker_id,
+        source_kind="worker",
+        correlation_id=request_id,
+        idempotency_key=f"reject:{request_id}",
+    )
+    _append_mailbox_event(
+        _LLM_USER_MAILBOX,
+        "LLM_REJECT",
+        data,
+        source_id=worker_id,
+        source_kind="worker",
+        correlation_id=request_id,
+        idempotency_key=f"reject:{request_id}",
+    )
+
+
+def _record_worker_connection(worker_id: str, model_masks: tuple[str, ...] | None) -> None:
+    _append_mailbox_event(
+        worker_id,
+        "WORKER_CONNECTED",
+        {
+            "worker_id": worker_id,
+            "modelmasks": list(model_masks) if model_masks is not None else None,
+        },
+        source_id="emullm",
+        source_kind="service",
+    )
+
+
+def _record_worker_disconnection(worker_id: str) -> None:
+    _append_mailbox_event(
+        worker_id,
+        "WORKER_DISCONNECTED",
+        {"worker_id": worker_id},
+        source_id="emullm",
+        source_kind="service",
     )
 
 
@@ -3461,6 +3822,68 @@ def _mailbox_event_page(
         candidates = [event for event in candidates if event.get("correlation_id") == correlation_id]
     selected = candidates[:limit]
     return selected, (selected[-1].get("id") if selected else after), len(candidates) > len(selected)
+
+
+def _llm_user_event_matches(
+    event: dict[str, Any],
+    *,
+    worker_id: str | None = None,
+    model: str | None = None,
+    modelmask: str | None = None,
+    event_types: set[str] | None = None,
+) -> bool:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    if worker_id and data.get("worker_id") != worker_id:
+        return False
+    if model and data.get("model") != model:
+        return False
+    if modelmask and not fnmatchcase(str(data.get("model") or ""), modelmask):
+        return False
+    return not event_types or event.get("type") in event_types
+
+
+def _llm_user_event_page(
+    *,
+    after: str | None,
+    limit: int,
+    worker_id: str | None = None,
+    model: str | None = None,
+    modelmask: str | None = None,
+    event_types: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """Read a filtered page while advancing past filtered-out JSONL events."""
+    if not 1 <= limit <= 1000:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
+    _ensure_llm_user_mailbox()
+    events = _mailbox_events(_LLM_USER_MAILBOX)
+    start = 0
+    if after:
+        index = next((index for index, event in enumerate(events) if event.get("id") == after), None)
+        if index is None:
+            raise HTTPException(status_code=409, detail="cursor_invalid")
+        start = index + 1
+
+    selected: list[dict[str, Any]] = []
+    cursor = after
+    index = start
+    while index < len(events) and len(selected) < limit:
+        event = events[index]
+        cursor = str(event.get("id") or "") or cursor
+        if _llm_user_event_matches(
+            event,
+            worker_id=worker_id,
+            model=model,
+            modelmask=modelmask,
+            event_types=event_types,
+        ):
+            selected.append(event)
+        index += 1
+    return selected, cursor, index < len(events)
+
+
+def _parse_event_types(values: list[str]) -> set[str] | None:
+    types = {item.strip() for value in values for item in value.split(",") if item.strip()}
+    return types or None
 
 
 class MailboxCreateRequest(BaseModel):
@@ -3722,6 +4145,43 @@ async def mailbox_events(
         await asyncio.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
 
 
+@router.get("/emullm/websock_to_llm_user/events")
+@router.get("/websock_to_llm_user/events")
+def websock_to_llm_user_events(
+    worker_id: str | None = None,
+    model: str | None = None,
+    modelmask: str | None = None,
+    type: str | None = None,
+    after: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Read the aggregate LLM_USER-to-worker JSONL log with server-side filters."""
+    try:
+        normalized_worker_id = _mailbox_id(worker_id) if worker_id else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    events, next_cursor, has_more = _llm_user_event_page(
+        after=after,
+        limit=limit,
+        worker_id=normalized_worker_id,
+        model=model,
+        modelmask=modelmask,
+        event_types=_parse_event_types([type] if type else []),
+    )
+    return {
+        "stream": _LLM_USER_MAILBOX,
+        "events": events,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "filters": {
+            "worker_id": normalized_worker_id,
+            "model": model,
+            "modelmask": modelmask,
+            "type": type,
+        },
+    }
+
+
 @router.post("/events")
 @router.post("/api/events")
 @router.post("/emullm/events")
@@ -3875,6 +4335,62 @@ async def mailbox_service_socket(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "error", "detail": f"unsupported frame type '{frame_type}'"})
                 continue
             await _mailbox_ws_flush(websocket, subscriptions)
+    except WebSocketDisconnect:
+        pass
+    except RuntimeError as exc:
+        if "disconnect message" not in str(exc):
+            raise
+
+
+@router.websocket("/emullm/websock_to_llm_user/ws")
+@router.websocket("/websock_to_llm_user/ws")
+async def websock_to_llm_user_socket(websocket: WebSocket) -> None:
+    """Stream the aggregate LLM_USER interaction mailbox with query filters."""
+    await websocket.accept()
+    try:
+        worker_id_value = websocket.query_params.get("worker_id")
+        worker_id = _mailbox_id(worker_id_value) if worker_id_value else None
+        event_types = _parse_event_types(websocket.query_params.getlist("type") + websocket.query_params.getlist("types"))
+        model = websocket.query_params.get("model")
+        modelmask = websocket.query_params.get("modelmask")
+        after = websocket.query_params.get("after")
+        _ensure_llm_user_mailbox()
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "detail": str(exc)})
+        await websocket.close(code=1008)
+        return
+
+    filters = {
+        "worker_id": worker_id,
+        "model": model,
+        "modelmask": modelmask,
+        "types": sorted(event_types) if event_types else None,
+    }
+    await websocket.send_json({"type": "subscribed", "stream": _LLM_USER_MAILBOX, "filters": filters, "cursor": after})
+    try:
+        while True:
+            events, next_cursor, has_more = _llm_user_event_page(
+                after=after,
+                limit=1000,
+                worker_id=worker_id,
+                model=model,
+                modelmask=modelmask,
+                event_types=event_types,
+            )
+            for event in events:
+                await websocket.send_json({"type": "event", "event": event})
+            after = next_cursor
+            if has_more:
+                await asyncio.sleep(0)
+                continue
+            try:
+                frame = await asyncio.wait_for(websocket.receive_json(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            if isinstance(frame, dict) and frame.get("type") == "ping":
+                await websocket.send_json({"type": "pong", "server_time": _now_iso()})
+            else:
+                await websocket.send_json({"type": "error", "detail": "only ping is supported on this read-only stream"})
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -4629,6 +5145,10 @@ def admin_state() -> dict[str, Any]:
         "connected_worker_ids": sorted(_connected_workers.keys()),
         "worker_models": {worker_id: sorted(models.keys()) for worker_id, models in _worker_models.items()},
         "worker_capabilities": dict(_worker_capabilities),
+        "worker_model_masks": {
+            worker_id: list(_worker_model_masks[worker_id]) if worker_id in _worker_model_masks else None
+            for worker_id in sorted(_connected_workers)
+        },
         "worker_roles": {
             worker_id: _worker_roles.get(worker_id, _DEFAULT_WORKER_ROLE)
             for worker_id in sorted(set(_connected_workers) | set(_worker_roles))
@@ -4726,8 +5246,8 @@ _STATUS_PAGE_HTML = """<!doctype html>
 
 <h2>Connected workers</h2>
 <table>
-  <thead><tr><th>Worker</th><th>Role</th><th>Models</th><th>Capabilities</th><th>Usage (window / total)</th></tr></thead>
-  <tbody id="workers"><tr><td colspan="5" class="muted">loading...</td></tr></tbody>
+  <thead><tr><th>Worker</th><th>Role</th><th>Models</th><th>Model masks</th><th>Capabilities</th><th>Usage (window / total)</th></tr></thead>
+  <tbody id="workers"><tr><td colspan="6" class="muted">loading...</td></tr></tbody>
 </table>
 
 <div id="detail-sections"></div>
@@ -4783,10 +5303,11 @@ async function refresh() {
     const roles = s.worker_roles || {};
     const tbody = document.getElementById('workers');
     if (!workers.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="muted">no workers connected</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="muted">no workers connected</td></tr>';
     } else {
       tbody.innerHTML = workers.map(id => {
         const models = (s.worker_models || {})[id] || [];
+        const masks = (s.worker_model_masks || {})[id];
         const caps = (s.worker_capabilities || {})[id] || {};
         const u = (s.worker_usage || {})[id] || {};
         const usage = (u.requests_in_window ?? 0) + ' / ' + (u.max_per_window ?? '-') +
@@ -4794,6 +5315,7 @@ async function refresh() {
         return '<tr><td><span class="dot on"></span><b>' + esc(id) + '</b></td>' +
           '<td>' + roleBadge(roles[id]) + '</td>' +
           '<td>' + pills(models) + '</td>' +
+          '<td>' + (masks === null ? '<span class="muted">all models</span>' : pills(masks || [])) + '</td>' +
           '<td>' + pills(caps, true) + '</td>' +
           '<td>' + usage + '</td></tr>';
       }).join('');
@@ -4813,9 +5335,12 @@ async function refresh() {
             ' over ' + (u.window_seconds ?? '-') + 's &middot; total: ' + (u.total_requests ?? 0) +
             ' &middot; last used: ' + fmtTime(u.last_used_at);
           const models = (s.worker_models || {})[id] || [];
+          const masks = (s.worker_model_masks || {})[id];
           return '<div class="card" style="display:block;margin-bottom:0.5rem">' +
             '<b>' + esc(id) + '</b> &middot; ' + roleLine + '<br>' +
             '<span class="muted">models:</span> ' + pills(models) + '<br>' +
+            '<span class="muted">model masks:</span> ' +
+            (masks === null ? 'all models' : pills(masks || [])) + '<br>' +
             '<span class="muted">' + usageLine + '</span></div>';
         }).join('');
       }
@@ -4916,6 +5441,7 @@ class WorkerConfig(BaseModel):
     cwd: str | None = None
     launch: str | list[str] | None = None
     model: str | None = None  # AI model for a Copilot-agent launch (ignored for the plain worker loop)
+    modelmasks: str | list[str] | None = None
 
 
 class MockWorkerConfig(BaseModel):
@@ -4929,6 +5455,7 @@ class MockWorkerConfig(BaseModel):
     capabilities: dict[str, bool] | list[str] | None = None
     role: str | None = None
     models: Any | None = None
+    modelmasks: str | list[str] | None = None
 
 
 class BackendConfig(BaseModel):
@@ -5002,6 +5529,7 @@ class AgentConfig(BaseModel):
     template: str | None = None
     capabilities: dict[str, bool] | list[str] | None = None
     models: Any | None = None
+    modelmasks: str | list[str] | None = None
     # what exchanges this agent wants mirrored to it (as in proxy-observe):
     # true/"all" for everything, or a list of service names to scope it.
     observe: bool | str | list[str] | None = None
@@ -5151,7 +5679,8 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   <span id="updated" class="muted">-</span></p>
 <p class="warn">This page can edit config and start/stop worker processes. Keep it bound to localhost.</p>
 
-<h2>Managed workers <span id="sup-note" class="muted"></span></h2>
+<h2>Managed workers <button id="refresh-services" type="button">Refresh services</button>
+  <span id="sup-note" class="muted"></span></h2>
 <table>
   <thead><tr><th>Worker</th><th>Role</th><th>PID</th><th>State</th><th>Actions</th></tr></thead>
   <tbody id="workers"><tr><td colspan="5" class="muted">loading...</td></tr></tbody>
@@ -5169,7 +5698,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 // Resolve REST calls relative to wherever this page is served, so it works
 // under either admin prefix (/emullm/admin or /admin/emullm) -- and would
 // survive being mounted under a sub-path. Both alias trees exist server-side.
-const ADMIN = location.pathname.replace(/\/+$/, '') || '/emullm/admin';
+const ADMIN = location.pathname.replace(/\\/+$/, '') || '/emullm/admin';
 async function getJSON(u, opts) { const r = await fetch(u, opts); return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) }; }
 function esc(x) { return String(x).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
@@ -5197,6 +5726,7 @@ document.getElementById('workers').addEventListener('click', async (e) => {
   await fetch(ADMIN + '/workers/' + encodeURIComponent(btn.dataset.id) + '/' + btn.dataset.act, { method: 'POST' });
   refreshWorkers();
 });
+document.getElementById('refresh-services').addEventListener('click', tick);
 
 async function loadConfig() {
   const r = await getJSON(ADMIN + '/config', { cache: 'no-store' });
@@ -5327,36 +5857,24 @@ _KIND_STORES.update(
 )
 
 
-@router.websocket("/emullm/{worker_id}/ws")
-async def emullm_socket(websocket: WebSocket, worker_id: str) -> None:
-    """A small pool of workers can be connected at once, one per
-    worker_id (taken directly from the URL path -- e.g. connect to
-    /emullm/yourself/ws, /emullm/alice/ws, .../bob/ws). A new
-    connection under the SAME worker_id replaces the previous one for
-    that id, but a different worker_id is tracked independently and
-    routed to separately.
+def _apply_worker_registration(worker_id: str, registration: dict[str, Any]) -> None:
+    models = registration.get("models")
+    if isinstance(models, dict) and models:
+        _worker_models[worker_id] = models
+    capabilities = registration.get("capabilities")
+    if isinstance(capabilities, dict):
+        _worker_capabilities[worker_id] = {str(key): bool(value) for key, value in capabilities.items()}
+    role = registration.get("role")
+    if isinstance(role, str) and role.strip():
+        _worker_roles[worker_id] = role.strip()
+    if "modelmasks" in registration:
+        _set_worker_model_masks(worker_id, _normalise_model_masks(registration["modelmasks"]))
 
-    On connect, the server optionally asks the worker to declare its own
-    model list / capabilities: it sends {"type":"hello","worker_id":
-    worker_id} and waits (briefly) for an optional
-    {"type":"register", "models": {suffix: {display_name, instruction},
-    ...}, "capabilities": {embeddings: bool, moderations: bool, images:
-    bool, audio_transcription: bool, audio_speech: bool, fine_tuning:
-    bool}}. A worker that
-    skips this (or never sends anything at all -- e.g. an older/simpler
-    client) just falls back to _PERSONA_SUFFIXES and no extra
-    capabilities, under whatever worker_id the URL gave it.
 
-    Job protocol: the server sends {"type":"request","id",...,"prompt",
-    optional "persona_instruction", and -- for two-way media -- "images"
-    (urls/data-urls from a vision request), "audio" (a cloud file URL of a
-    clip to transcribe), "files" (e.g. a fine-tune training_file + cloud
-    url), and "kind" (chat/vision/image/audio_speech/audio_transcription/
-    fine_tuning). The worker replies {"type":"reply","id","content"} and MAY
-    additionally return real media: "image_b64"/"image_url"/"mime" (image
-    gen) or "audio_b64"/"audio_url"/"mime" (speech). Those are persisted to
-    the shared cloud files store and passed back through the matching
-    /v1/... endpoint."""
+async def _serve_worker_socket(
+    websocket: WebSocket, worker_id: str, model_masks: tuple[str, ...] | None
+) -> None:
+    """Serve one native worker connection after its query parameters are parsed."""
     try:
         _mailbox_id(worker_id)
     except ValueError:
@@ -5364,38 +5882,22 @@ async def emullm_socket(websocket: WebSocket, worker_id: str) -> None:
         return
     await websocket.accept()
     _ensure_worker_mailbox(worker_id)
-    first: dict[str, Any] | None = None
-    try:
-        await websocket.send_json({"type": "hello", "worker_id": worker_id})
-        first = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
-    except (asyncio.TimeoutError, WebSocketDisconnect):
-        first = None
-    except Exception:
-        first = None
-
-    if isinstance(first, dict) and first.get("type") == "register":
-        models = first.get("models")
-        if isinstance(models, dict) and models:
-            _worker_models[worker_id] = models
-        capabilities = first.get("capabilities")
-        if isinstance(capabilities, dict):
-            _worker_capabilities[worker_id] = {str(k): bool(v) for k, v in capabilities.items()}
-        role = first.get("role")
-        if isinstance(role, str) and role.strip():
-            _worker_roles[worker_id] = role.strip()
-    elif isinstance(first, dict):
-        # Not a register message -- an older/simpler worker that ignored
-        # the "hello" and just started talking. Don't drop it; handle it
-        # as normal traffic under this instance_id.
-        await _handle_worker_message(worker_id, first)
-
-    _ensure_worker_mailbox(worker_id)
     async with _worker_lock:
         _connected_workers[worker_id] = websocket
+        _native_worker_ids.add(worker_id)
+        _set_worker_model_masks(worker_id, model_masks)
+    _record_worker_connection(worker_id, model_masks)
     try:
+        hello: dict[str, Any] = {"type": "hello", "worker_id": worker_id}
+        if model_masks is not None:
+            hello["modelmasks"] = list(model_masks)
+        await websocket.send_json(hello)
         while True:
             data = await websocket.receive_json()
-            await _handle_worker_message(worker_id, data)
+            if isinstance(data, dict) and data.get("type") == "register":
+                _apply_worker_registration(worker_id, data)
+            elif isinstance(data, dict):
+                await _handle_worker_message(worker_id, data)
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -5405,12 +5907,45 @@ async def emullm_socket(websocket: WebSocket, worker_id: str) -> None:
         if "disconnect message" not in str(exc):
             raise
     finally:
+        disconnected = False
         async with _worker_lock:
             if _connected_workers.get(worker_id) is websocket:
                 del _connected_workers[worker_id]
+                _native_worker_ids.discard(worker_id)
+                _worker_model_masks.pop(worker_id, None)
+                disconnected = True
+        if disconnected:
+            _record_worker_disconnection(worker_id)
+
+
+@router.websocket("/emullm/ws")
+async def emullm_socket(websocket: WebSocket) -> None:
+    """The single native servant socket.
+
+    ``worker_id`` and optional comma-delimited ``modelmasks`` are query
+    parameters. Omit ``worker_id`` to receive a generated identity in the
+    hello frame, and omit ``modelmasks`` to accept offers for every model.
+    """
+    worker_id = (websocket.query_params.get("worker_id") or "").strip() or _new_automatic_worker_id()
+    raw_masks = websocket.query_params.getlist("modelmasks")
+    model_masks = _normalise_model_masks(raw_masks) if raw_masks else None
+    await _serve_worker_socket(websocket, worker_id, model_masks)
 
 
 async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
+    if data.get("type") == "accept":
+        request_id = str(data.get("id") or "")
+        if request_id and request_id in _pending:
+            _record_relay_accept(worker_id, request_id, _pending_models.get(request_id))
+        return
+    if data.get("type") == "reject":
+        request_id = str(data.get("id") or "")
+        reason = str(data.get("reason") or data.get("content") or "worker declined the request")
+        future = _pending.get(request_id)
+        if future and not future.done():
+            _record_relay_rejection(worker_id, request_id, reason, _pending_models.get(request_id))
+            future.set_exception(_WorkerRejected(worker_id, reason))
+        return
     if data.get("type") == "reply":
         request_id = str(data.get("id") or "")
         # A two-way worker may return real media alongside (or instead of)
@@ -5420,7 +5955,7 @@ async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
         for key in ("image_b64", "image_url", "audio_b64", "audio_url", "mime", "images", "file_id", "file_url"):
             if data.get(key) is not None:
                 reply[key] = data[key]
-        _record_relay_reply(worker_id, request_id, reply)
+        _record_relay_reply(worker_id, request_id, reply, _pending_models.get(request_id))
         future = _pending.pop(request_id, None)
         if future and not future.done():
             future.set_result(reply)
