@@ -167,7 +167,7 @@ all-model workers.
 The default deployment routes every configured model through:
 
 ```json
-["copilot-headless-*", "codex-headless-*", "https://llm.a.singularitycompute.com/v1"]
+["worker-copilot-*", "worker-codex-*", "https://llm.a.singularitycompute.com/v1"]
 ```
 
 The first connected matching worker group is tried in order (round-robin
@@ -177,7 +177,9 @@ final OpenAI-compatible fallback.
 Managed headless Copilot servants keep one SDK/CLI runtime resident. When
 startup warmup is enabled, each sends and awaits one configured warmup prompt
 before registering its worker WebSocket, moving the cold inference cost out of
-the client request path.
+the client request path. They also accept compact cloud-file metadata in relay
+requests, fetch the local EMULLM file URL, and send image, audio, and arbitrary
+file bytes to the resident SDK session as native blob attachments.
 
 Workers connect at:
 
@@ -192,13 +194,21 @@ WS /emullm/ws?worker_id=alice&modelmasks=openai/*,gpt-*
 ```
 
 `worker_id` is optional. The server assigns a mailbox-safe
-`servant-<random>` identity when it is omitted and returns it in the
+`worker-unknown-<random>` identity when it is omitted and returns it in the
 `{"type":"hello","worker_id":...}` handshake. `modelmasks` is also optional:
 comma-delimited glob patterns limit the model offers sent to that worker;
 when omitted, it receives offers for all models. Workers can additionally
 send `{"type":"register", "models": {...}, "capabilities": {...},
 "modelmasks":[...]}` at any time. A worker that skips registration still
 works with the default persona menu and no "pretend" capabilities.
+
+Request disposition frames are distinct:
+
+- `accept` followed by `reply` completes normally.
+- `reject` is a semantic/model/capability refusal and records `LLM_REJECT`.
+- `not_ready` with `reason` and `retry_after` is transient and records
+  `LLM_NOT_READY`. The relay immediately tries the next candidate, excludes the
+  deferred worker during its cooldown, then permits later offers again.
 
 ## Personas ("yourself/same", "yourself/percent25", ...)
 
@@ -220,10 +230,90 @@ overrides the default menu for that worker_id in the aggregated
 `_PERSONA_SUFFIXES`, so a bare-bones worker still gets a sensible default
 without declaring anything.
 
-`GET /v1/models` aggregates the persona menu across every currently
-connected worker, plus the default worker_id (`"yourself"`) even if it
-isn't connected right now, so the primary identity is always
-discoverable.
+`GET /v1/models` aggregates the persona menu across every currently connected
+worker, plus the default worker_id (`"yourself"`) even if it isn't connected
+right now. It also advertises every configured services/model-route ID as an
+EMULLM simulation. A managed servant with a known active backing model adds a
+direct stable alias such as `worker-copilot-1/gpt-5.6-sol`; its entry reports
+the worker kind, active backing model, description, and SDK capability metadata.
+The alias still routes to that exact worker rather than treating the backing
+model name as a new worker.
+
+Every authenticated Copilot SDK catalog entry is also exported as
+`copilot/<model-id>`. With no explicit route override, the first request lazily
+loads that exact backing model into one of four persistent `worker-copilot-5..8`
+slots. A matching running/stopped slot is reused, an empty slot is created, and
+a stopped slot loaded for another model can be reassigned with a fresh session.
+If four different slots are running, loading a fifth model fails rather than
+silently serving it with the wrong backing model. An explicit `model_routes`
+entry overrides this default and can target servant globs or real backend URLs.
+
+`emullm/default` is always present and resolves to the configured
+`services.model` default, while preserving `emullm/default` in the public
+response model field. A route configured directly on the alias takes
+precedence.
+
+The admin Models configurator reads the live `/v1/models` response and persists
+per-model JSON merge patches/hiding under `model_catalog_overrides`. Its
+dedicated `route_targets` editor writes `model_routes`; live fields such as
+connection state and active workers remain derived rather than being frozen in
+the patch.
+
+The admin test client accepts base64 uploads over its loopback REST endpoint,
+persists each upload in EMULLM's cloud-file store, and sends only compact
+metadata URLs across `WS /emullm/ws`. This keeps binary/base64 payloads out of
+worker and event-log frames while preserving downloadable test artifacts.
+Original filenames are also withheld: the browser submits neutral
+`attachment-N` names and the server independently regenerates them before
+cloud storage, worker relay, event logging, and response metadata. MIME type is
+stored separately, so media handling and downloads do not require extensions.
+
+The public `POST /v1/chat/completions` path uses the same transport for OpenAI
+`image_url` content blocks whose URL is a base64 image data URL. The HTTP layer
+decodes and persists the image, replaces the data URL with
+`/emullm/cloud/files/{file_id}`, and adds a compact attachment record to the
+worker request. Managed servants download the stored bytes and pass a native
+blob to the resident SDK. Limits are 12 inline images, 25 MiB per image, and
+50 MiB total; malformed, empty, or oversized data URLs are rejected before a
+worker request is sent.
+
+OpenAI `input_audio` blocks on that endpoint follow the same path. The client
+sends base64 plus a `format` of `wav`, `mp3`, `flac`, `m4a`, `ogg`, or `webm`;
+the worker WebSocket receives one cloud URL in `audio` and a compact attachment
+record, never the base64. Audio limits are 12 files, 25 MiB each, and 50 MiB
+total. Transport support does not imply that every selected backing model can
+interpret audio, so callers should inspect model metadata or handle an explicit
+unsupported-capability answer.
+
+All Copilot catalog entries distinguish blob **transport** from model
+**comprehension**. Arbitrary image/audio/file blobs can traverse the SDK
+attachment transport, while audio comprehension is labeled `sdk_advertised`,
+`operator_declared`, `family_implied`, or `not_advertised`. Missing Copilot
+schema metadata is therefore not reported as a definite lack of support.
+
+For any media-bearing request, the relay derives `required_capabilities`
+(`vision_input` and/or `audio_input`) and includes them in the worker offer.
+Round-robin ordering is capability-aware: explicitly capable workers are tried
+first, unknown workers remain fallbacks, and explicit `false` declarations are
+skipped. Rejection continues through the remaining candidates and configured
+route targets. Managed servants declare positive capability names through their
+`capabilities` list; `!name` or `-name` declares an opt-out and causes a direct
+incompatible offer to be rejected before `accept`.
+Resident Copilot errors such as a timeout, bridge exit, or missing assistant
+message produce `not_ready`, not `reject`.
+
+The route configurator exposes five literal shortcuts:
+`worker-in-name`, `worker-copilot-*`, `worker-codex-*`,
+`worker-unknown-*`, and `backend-*`. `worker-in-name` selects the worker prefix
+from the requested model ID. `backend-*` expands configured backend names;
+worker globs retain capability-aware round-robin and accept/reject/not-ready
+behavior.
+
+`POST /v1/chat/completions` also accepts an EMULLM extension,
+`required_capabilities`, for task tags such as `code` and `summarization`.
+These use the same capable-first/unknown-fallback ordering. Task tags are
+operator declarations rather than Copilot SDK claims; Codex is represented as
+the `worker-codex-*` worker/provider route, not as a capability.
 
 ## Capability-gated "pretend" modes
 

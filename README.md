@@ -88,14 +88,17 @@ python -m emullm.worker --host-ws-url ws://127.0.0.1:8801
 
 Every native servant uses the one endpoint:
 `ws://127.0.0.1:8801/emullm/ws`. Supply an optional identity as
-`?worker_id=copilot-headless-1`; if omitted, the server assigns a
-`servant-<random>` identity and returns it in the first `hello` frame. Supply
+`?worker_id=worker-copilot-1`; if omitted, the server assigns a
+`worker-unknown-<random>` identity and returns it in the first `hello` frame. Supply
 an optional comma-separated glob list as
-`?worker_id=copilot-headless-1&modelmasks=openai/*,gpt-*`; omitting `modelmasks`
+`?worker_id=worker-copilot-1&modelmasks=openai/*,gpt-*`; omitting `modelmasks`
 makes the servant eligible for every model. Unlisted model IDs are always
 forwarded unchanged in the request frame. A servant may explicitly send
-`accept` then `reply`, or send `reject` for a particular request so the relay
-can try another eligible servant.
+`accept` then `reply`, send `reject` for a semantic/capability refusal, or send
+`not_ready` with `retry_after` for a transient runtime failure. `not_ready`
+records `LLM_NOT_READY`, advances to another route candidate immediately, and
+cools that worker only until it should be tried again. A `reject` records
+`LLM_REJECT` and lets the relay try another eligible servant.
 
 EMULLM advertises its own current HTTP and WebSocket routes at
 `GET /emullm/endpoints`. The catalog always contains the single shared
@@ -134,6 +137,8 @@ servant:
 - reuses one stable session, preserving that servant's conversation across
   OpenAI-compatible API calls;
 - persists its configuration under `headless_copilots` in `config.json`;
+- converts admin-uploaded images, audio, and arbitrary files into native
+  Copilot SDK blob attachments;
 - writes adapter output to `runtime/headless_copilots/<worker_id>/servant.log`.
 
 The same complete operations console is also served at `GET /emullm` and
@@ -176,7 +181,9 @@ whose SDK metadata supports that level. It may also be `random`, `most-N`, or
 effort ordering (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 For example, `most-1` chooses the highest supported effort and `least-1` the
 lowest. If live discovery is unavailable, EMULLM falls back to the initial
-model list shown in the Copilot desktop picker.
+model list shown in the Copilot desktop picker. Selecting a model in the
+servant editor displays its SDK-reported context, prompt, output, vision,
+tool-use, streaming, structured-output, reasoning, and billing capabilities.
 
 When a caller sends more input than the selected servant model can accept,
 `chunk_long_prompts: true` ingests the request sequentially and asks for one
@@ -231,7 +238,7 @@ Send that object to `POST /emullm/admin/copilots?start=true`. A session UUID
 is generated and persisted automatically. Use `reset-session` when you
 intentionally want to discard the servant's accumulated Copilot context.
 
-The default identity is `copilot-headless-1`; additional servants created in
+The default identity is `worker-copilot-1`; additional servants created in
 the GUI are persisted and autostart according to their own settings. Their
 models are intentionally unspecified by default, so each start chooses a
 random available Copilot model. Every configured model route uses this ordered
@@ -239,8 +246,8 @@ failover convention:
 
 ```json
 [
-  "copilot-headless-*",
-  "codex-headless-*",
+  "worker-copilot-*",
+  "worker-codex-*",
   "https://llm.a.singularitycompute.com/v1"
 ]
 ```
@@ -248,14 +255,77 @@ failover convention:
 Worker targets are globbed against currently connected worker IDs. The first
 group that answers wins; rejected or unavailable workers fall through to the
 next group, and the final URL is called as an OpenAI-compatible backend.
+`GET /v1/models` includes these configured simulated IDs even when they are not
+native backing-model IDs. Each connected managed servant also advertises a
+stable direct alias such as `worker-copilot-1/gpt-5.6-sol`, with worker kind,
+active backing model, description, and backing-model capability metadata.
+It additionally exports every model returned by the authenticated Copilot SDK
+catalog as `copilot/<model-id>` (for example `copilot/gpt-5.6-sol`). Requesting
+one lazily creates or reuses one of four `worker-copilot-5..8` servants pinned to
+that exact backing model. The slots are a bounded cache: a stopped slot may be
+reassigned, while a fifth model returns a clear capacity error if all four are
+running.
+
+`emullm/default` is always exported as a stable alias to the current
+`services.model` default (or `yourself/same` when no default is configured).
+Giving that alias its own `route_targets` in the Models configurator overrides
+the resolved default route.
+
+`POST /v1/chat/completions` accepts standard OpenAI multimodal message content,
+including `image_url` data URLs and
+`{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}`.
+EMULLM decodes and stores each inline image/audio input, then sends only a
+compact cloud URL and `{file_id, name, mime_type, bytes}` record over
+`WS /emullm/ws`. A managed servant fetches those exact bytes locally and
+supplies them to its resident Copilot session as a native SDK blob. Base64 media
+is therefore present on the client HTTP request but never copied into WebSocket
+or event-log frames. Images and audio each allow up to 12 inputs, 25 MiB per
+input and 50 MiB total; accepted audio formats are WAV, MP3, FLAC, M4A, OGG, and
+WebM.
+
+Media requests add `required_capabilities` to the worker offer. Automatic and
+worker-glob round-robin routes order servants that declared every requirement
+first, retain undeclared/unknown servants as fallback candidates, and skip
+explicit opt-outs. A capable servant that rejects or disconnects still advances
+the request to the next candidate; a transient `not_ready` also advances but
+keeps the servant eligible after its cooldown. Managed-servant `capabilities` may include
+`audio_input`, `vision_input`, or other names; prefix a name with `!` or `-` to
+declare an opt-out and reject a direct incompatible offer before accepting it.
+Vision input is also inferred from the selected Copilot model's SDK media list.
+The configurator's route shortcuts map literally to `worker-in-name`,
+`worker-copilot-*`, `worker-codex-*`, `worker-unknown-*`, and `backend-*`.
+The first resolves the worker prefix embedded in a model ID; `backend-*`
+round-robins configured named backends. Every worker glob still applies
+capability ordering and excludes explicit opt-outs.
+Capabilities are extensible task tags as well as media flags. Chat requests may
+send `required_capabilities` such as `["code"]` or `["summarization"]`; the
+configurator exposes both checkboxes, and arbitrary names can still be edited in
+the model JSON or servant capability list. Codex remains a worker/provider route
+(`worker-codex-*`), not a capability.
 
 The same admin page also provides:
 
+- a **Models configurator** driven directly by `GET /v1/models`. Select any
+  exported model to edit its effective JSON, hide/show it, toggle on-demand,
+  simulated, image, audio, and general-file flags, edit its ordered
+  `route_targets`, choose common servant/backend targets, reset the override,
+  or proactively load a `copilot/<model-id>` into an on-demand slot. Overrides
+  persist in `model_catalog_overrides`, while routes persist in `model_routes`;
 - a **Model test client** that combines live, advertised, and explicitly
   routed model IDs while still accepting any free-form model ID; its separate
   dropdown overwrites the text field when selected, it displays live elapsed
-  seconds, and Cancel aborts the active SDK message while keeping the resident
-  Copilot runtime ready for the next request;
+  seconds, displays the selected model's resolved capabilities/routes, and
+  accepts up to 12 drag-and-drop or selected image, audio, video, and general
+  files (25 MiB each, 50 MiB total). Uploaded bytes are stored once behind
+  `/emullm/cloud/files/{file_id}`; compact metadata travels over the worker
+  WebSocket, then managed Copilot servants fetch and convert it to native SDK
+  blob attachments. Test-client filenames are anonymized as `attachment-1`,
+  `attachment-2`, and so on before the HTTP request leaves the browser, and the
+  server regenerates those names before storage/relay as a second guard. Cancel
+  aborts the active SDK message while keeping the
+  resident Copilot runtime ready for the next request;
+  the attachment area also includes one-click American-flag, ascending-tone,
+  Twinkle melody, and spoken-phrase WAV samples;
 - an **Enable Carol mock worker** checkbox, persisted immediately to
   `agents[].enabled`;
 - **Connected WebSockets → List / refresh**, covering worker, mailbox, and
@@ -637,6 +707,7 @@ types and per-service fallbacks offline.
 | `headless_copilots` | list | Persistent-session Copilot CLI servants managed live through the admin GUI/API. |
 | `subagent_launch` | string / argv | Worker type for discovered subagents (`copilot`/`worker`/`recruit`/argv). |
 | `model_routes` | object | Model ID to one worker ID or an ordered list of worker-ID globs and OpenAI-compatible backend URLs. |
+| `model_catalog_overrides` | object | Per-exported-model `{ hidden, patch }` merge overrides written by the Models configurator. |
 
 **Agents.** Each entry is one answerer -- `kind: "agent"` with a `launch`
 type. It carries a user-facing `description`, an optional `observe` (what

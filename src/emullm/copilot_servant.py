@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import websockets
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from websockets.exceptions import ConnectionClosed
 
 from .copilot_api import HeadlessCopilotConfig
@@ -29,6 +32,7 @@ class ServantRuntimeConfig(HeadlessCopilotConfig):
     selected_reasoning_effort: str | None = None
     selected_model_max_prompt_tokens: int = 64_000
     selected_model_max_output_tokens: int = 0
+    selected_model_supported_media_types: list[str] = Field(default_factory=list)
     copilot_runtime_path: str
     copilot_sdk_path: str
     node_command: str
@@ -50,7 +54,7 @@ def build_prompt(config: ServantRuntimeConfig, request: dict[str, Any]) -> str:
     ]
     if instruction := request.get("persona_instruction"):
         sections.append(f"Persona instruction: {instruction}")
-    for key in ("images", "audio", "files"):
+    for key in ("images", "audio", "files", "attachments"):
         if request.get(key):
             sections.append(f"Attached {key}: {json.dumps(request[key], ensure_ascii=False)}")
     sections.extend(
@@ -121,6 +125,7 @@ class CopilotRunner:
         prompt = build_prompt(self.config, request)
         request_id = str(request.get("id") or "")
         chunks = self._prompt_chunks(prompt)
+        attachments = await self._sdk_attachments(request)
         async with self._lock:
             await self.start()
             started = time.monotonic()
@@ -143,9 +148,14 @@ class CopilotRunner:
                             "been ingested. Produce the final assistant answer to that "
                             "request now, following the instructions contained in the chunks."
                         ),
+                        attachments=attachments,
                     )
                 else:
-                    response = await self._invoke(request_id, prompt)
+                    response = await self._invoke(
+                        request_id,
+                        prompt,
+                        attachments=attachments,
+                    )
             except asyncio.CancelledError:
                 self._cancellation_count += 1
                 active_id = self._bridge_request_id
@@ -173,9 +183,51 @@ class CopilotRunner:
                 last_request_id=request_id,
                 last_duration_ms=round((time.monotonic() - started) * 1000),
                 last_chunk_count=len(chunks),
+                last_attachment_count=len(attachments),
                 last_completed_at=time.time(),
             )
             return output
+
+    async def _sdk_attachments(self, request: dict[str, Any]) -> list[dict[str, Any]]:
+        records = request.get("attachments")
+        if not isinstance(records, list):
+            return []
+        return [
+            await asyncio.to_thread(self._load_sdk_attachment, record)
+            for record in records
+            if isinstance(record, dict)
+        ]
+
+    def _load_sdk_attachment(self, record: dict[str, Any]) -> dict[str, Any]:
+        raw_url = str(record.get("url") or "")
+        if not raw_url:
+            raise CopilotInvocationError("attachment record has no URL")
+        base = self.config.host_ws_url.replace("ws://", "http://", 1).replace(
+            "wss://", "https://", 1
+        )
+        url = urljoin(base.rstrip("/") + "/", raw_url.lstrip("/"))
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310 - relay URL is operator config
+                data = response.read(self.config.max_attachment_bytes + 1)
+        except OSError as error:
+            raise CopilotInvocationError(
+                f"could not fetch attachment '{record.get('name') or raw_url}': {error}"
+            ) from error
+        if len(data) > self.config.max_attachment_bytes:
+            raise CopilotInvocationError(
+                f"attachment '{record.get('name') or raw_url}' exceeds the "
+                f"{self.config.max_attachment_bytes}-byte servant limit"
+            )
+        if not data:
+            raise CopilotInvocationError(
+                f"attachment '{record.get('name') or raw_url}' is empty"
+            )
+        return {
+            "type": "blob",
+            "data": base64.b64encode(data).decode("ascii"),
+            "mimeType": str(record.get("mime_type") or "application/octet-stream"),
+            "displayName": str(record.get("name") or "attachment"),
+        }
 
     def _prompt_chunks(self, prompt: str) -> list[str]:
         token_budget = self.config.chunk_tokens or max(
@@ -200,13 +252,20 @@ class CopilotRunner:
             )
         return chunks
 
-    async def _invoke(self, request_id: str, prompt: str) -> dict[str, Any]:
+    async def _invoke(
+        self,
+        request_id: str,
+        prompt: str,
+        *,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         self._bridge_request_id = request_id
         self._send(
             {
                 "type": "request",
                 "id": request_id,
                 "prompt": prompt,
+                "attachments": attachments or [],
                 "timeout_ms": round(self.config.timeout_seconds * 1000),
             }
         )
@@ -353,14 +412,75 @@ class CopilotRunner:
             await process.wait()
 
 
+def declared_capabilities(config: ServantRuntimeConfig) -> dict[str, bool]:
+    capabilities: dict[str, bool] = {}
+    for configured in config.capabilities:
+        name = configured.strip()
+        if not name:
+            continue
+        enabled = name[0] not in ("!", "-")
+        normalized = name[1:] if not enabled else name
+        if normalized:
+            capabilities[normalized] = enabled
+    media_types = config.selected_model_supported_media_types
+    if any(media_type.startswith("image/") for media_type in media_types):
+        capabilities.setdefault("vision_input", True)
+    if any(media_type.startswith("audio/") for media_type in media_types):
+        capabilities.setdefault("audio_input", True)
+    return capabilities
+
+
+def invocation_is_temporarily_not_ready(error: CopilotInvocationError) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "no assistant message",
+            "empty response",
+            "timed out",
+            "bridge is not running",
+            "bridge exited",
+            "could not fetch attachment",
+        )
+    )
+
+
 async def handle_request(websocket: Any, runner: CopilotRunner, request: dict[str, Any]) -> None:
     request_id = str(request.get("id") or "")
     if not request_id:
+        return
+    required = request.get("required_capabilities")
+    declared = declared_capabilities(runner.config)
+    declined = [
+        capability
+        for capability in required
+        if isinstance(capability, str) and declared.get(capability) is False
+    ] if isinstance(required, list) else []
+    if declined:
+        reason = f"servant explicitly declines: {', '.join(sorted(declined))}"
+        await websocket.send(
+            json.dumps({"type": "reject", "id": request_id, "reason": reason})
+        )
+        print(f"REJECTED {request_id}: {reason}", flush=True)
         return
     await websocket.send(json.dumps({"type": "accept", "id": request_id}))
     try:
         content = await runner.run(request)
     except CopilotInvocationError as error:
+        if invocation_is_temporarily_not_ready(error):
+            retry_after = 15
+            print(f"NOT_READY {request_id}: {error}", flush=True)
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "not_ready",
+                        "id": request_id,
+                        "reason": str(error),
+                        "retry_after": retry_after,
+                    }
+                )
+            )
+            return
         print(f"REJECTED {request_id}: {error}", flush=True)
         await websocket.send(
             json.dumps({"type": "reject", "id": request_id, "reason": str(error)})
@@ -374,7 +494,13 @@ def registration_payload(config: ServantRuntimeConfig) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "register",
         "role": config.role,
-        "capabilities": {name: True for name in config.capabilities},
+        "capabilities": declared_capabilities(config),
+        "worker_kind": "headless-copilot",
+        "runtime_model": config.selected_model,
+        "description": (
+            f"Resident GitHub Copilot servant backed by {config.selected_model}; "
+            f"session {config.session_id}."
+        ),
     }
     if config.modelmasks:
         payload["modelmasks"] = config.modelmasks

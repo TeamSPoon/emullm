@@ -7,7 +7,7 @@
  "subagent_launch": "copilot",
  "headless_copilots": [
   {
-   "worker_id": "copilot-headless-1",
+   "worker_id": "worker-copilot-1",
    "session_id": "173ed2b6-6233-4e59-aa89-62bb9628a43c",
    "model": null,
    "model_pool": [],
@@ -34,10 +34,11 @@
    "chunk_tokens": null,
    "max_chunks": 64,
    "max_prompt_chars": 4000000,
-   "max_output_chars": 200000
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
   },
   {
-   "worker_id": "copilot-headless-2",
+   "worker_id": "worker-copilot-2",
    "session_id": "45f79464-c8d3-4525-ba27-1d1d1e374d43",
    "model": null,
    "model_pool": [],
@@ -64,23 +65,26 @@
    "chunk_tokens": null,
    "max_chunks": 64,
    "max_prompt_chars": 4000000,
-   "max_output_chars": 200000
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
   },
   {
-   "worker_id": "copilot-headless-3",
+   "worker_id": "worker-copilot-3",
    "session_id": "c2d50a44-6347-4fc1-b202-ecd185f974d9",
-   "model": null,
+   "model": "claude-opus-4.8-fast",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [],
    "role": "headless-copilot",
-   "capabilities": [],
+   "capabilities": [
+    "audio_input"
+   ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
    "cwd": null,
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": true,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -94,10 +98,11 @@
    "chunk_tokens": null,
    "max_chunks": 64,
    "max_prompt_chars": 4000000,
-   "max_output_chars": 200000
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
   },
   {
-   "worker_id": "copilot-headless-4",
+   "worker_id": "worker-copilot-4",
    "session_id": "ad288b0b-fbcb-4542-b166-ba16d2a0aeaf",
    "model": null,
    "model_pool": [],
@@ -124,7 +129,164 @@
    "chunk_tokens": null,
    "max_chunks": 64,
    "max_prompt_chars": 4000000,
-   "max_output_chars": 200000
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-5",
+   "session_id": "c8528de3-f3bf-4bf4-92e6-0db26ac97679",
+   "model": "gemini-3.7-flash",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/gemini-3.7-flash"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "vision_input",
+    "audio_input",
+    "file_input",
+    "!code",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": true,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": false,
+   "load_custom_instructions": false,
+   "enable_builtin_mcps": false,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-6",
+   "session_id": "932432f3-eb5c-4d07-a465-bb798ff5454c",
+   "model": "claude-opus-4.8-fast",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/claude-opus-4.8-fast"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "vision_input",
+    "audio_input",
+    "file_input",
+    "!code",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": true,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-7",
+   "session_id": "3ea24917-7afa-4fb9-9ad4-400325bfed01",
+   "model": "claude-fable-5",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/claude-fable-5"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "vision_input",
+    "!audio_input",
+    "file_input",
+    "!code",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": false,
+   "warmup": false,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": false,
+   "load_custom_instructions": false,
+   "enable_builtin_mcps": false,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-8",
+   "session_id": "1be6d183-680f-4759-8cec-e7f52a04a133",
+   "model": "claude-opus-5",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/claude-opus-5"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "vision_input",
+    "!audio_input",
+    "file_input",
+    "!code",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": false,
+   "warmup": false,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": false,
+   "load_custom_instructions": false,
+   "enable_builtin_mcps": false,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
   }
  ],
  "capability_fallback": "stub",
@@ -479,84 +641,895 @@
  "subagent_model": "claude-sonnet-4.5",
  "model_routes": {
   "google/gemma-4-31b-it": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "google/gemma-4-26b-a4b-it": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "deepseek/deepseek-v4-flash-0731": [
-   "copilot-headless-*",
-   "codex-headless-*",
+   "worker-copilot-*",
+   "worker-codex-*",
    "https://llm.a.singularitycompute.com/v1"
   ],
   "openai/gpt-oss-20b": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "openai/gpt-oss-120b": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "minimax/minimax-m2.5": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "minimax/minimax-m2.7": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "minimax/minimax-m3": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "minimax/minimax-m3-f": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "meta-llama/llama-3.3-70b-instruct": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "qwen/qwen3.8-27b": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "asi1": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "asi1-mini": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "WhereIsAI/UAE-Large-V1": [
-   "copilot-headless-*",
-   "codex-headless-*",
-   "https://llm.a.singularitycompute.com/v1"
-  ],
-  "BAAI/bge-base-en-v1.5": [
-   "copilot-headless-*",
-   "codex-headless-*",
+   "worker-copilot-*",
+   "worker-codex-*",
    "https://llm.a.singularitycompute.com/v1"
   ],
   "zira/for_sol": [
-   "copilot-headless-*",
-   "codex-headless-*",
+   "worker-copilot-*",
+   "worker-codex-*",
    "https://llm.a.singularitycompute.com/v1"
+  ],
+  "gpt-4o-audio-preview": [
+   "worker-copilot-*",
+   "worker-codex-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "emullm/default": [
+   "worker-in-name",
+   "worker-copilot-*",
+   "worker-codex-*",
+   "worker-unknown-*",
+   "backend-https://llm.a.singularitycompute.com/v1",
+   "backend-*"
+  ],
+  "worker-copilot-1/same": [
+   "worker-in-name"
+  ],
+  "worker-copilot-1/percent125": [
+   "worker-in-name"
+  ],
+  "worker-copilot-1/percent100": [
+   "worker-in-name"
+  ],
+  "worker-copilot-1/percent75": [
+   "worker-in-name"
+  ],
+  "worker-copilot-1/percent25": [
+   "worker-in-name"
+  ],
+  "worker-copilot-1/percent10": [
+   "worker-in-name"
+  ],
+  "worker-copilot-2/same": [
+   "worker-in-name"
+  ],
+  "worker-copilot-2/percent125": [
+   "worker-in-name"
+  ],
+  "worker-copilot-2/percent100": [
+   "worker-in-name"
+  ],
+  "worker-copilot-2/percent75": [
+   "worker-in-name"
+  ],
+  "worker-copilot-2/percent25": [
+   "worker-in-name"
+  ],
+  "worker-copilot-2/percent10": [
+   "worker-in-name"
+  ],
+  "worker-copilot-3/same": [
+   "worker-in-name"
+  ],
+  "worker-copilot-3/percent125": [
+   "worker-in-name"
+  ],
+  "worker-copilot-3/percent100": [
+   "worker-in-name"
+  ],
+  "worker-copilot-3/percent75": [
+   "worker-in-name"
+  ],
+  "worker-copilot-3/percent25": [
+   "worker-in-name"
+  ],
+  "worker-copilot-3/percent10": [
+   "worker-in-name"
+  ],
+  "worker-copilot-4/same": [
+   "worker-in-name"
+  ],
+  "worker-copilot-4/percent125": [
+   "worker-in-name"
+  ],
+  "worker-copilot-4/percent100": [
+   "worker-in-name"
+  ],
+  "worker-copilot-4/percent75": [
+   "worker-in-name"
+  ],
+  "worker-copilot-4/percent25": [
+   "worker-in-name"
+  ],
+  "worker-copilot-4/percent10": [
+   "worker-in-name"
+  ],
+  "worker-copilot-1/claude-haiku-4.5": [
+   "worker-in-name"
+  ],
+  "worker-copilot-2/gemini-3.1-pro-preview": [
+   "worker-in-name"
+  ],
+  "worker-copilot-3/claude-opus-4.8-fast": [
+   "worker-in-name"
+  ],
+  "worker-copilot-4/gemini-3.7-flash": [
+   "worker-in-name"
   ]
+ },
+ "model_catalog_overrides": {
+  "emullm/default": {
+   "hidden": false,
+   "patch": {
+    "object": "model",
+    "display_name": "EMULLM \u00b7 Default",
+    "description": "Stable alias for the configured default model 'google/gemma-4-31b-it'. An explicit route_targets override on emullm/default takes precedence.",
+    "context_length": 200000,
+    "supported_parameters": [
+     "messages",
+     "temperature",
+     "stream"
+    ],
+    "owned_by": "emullm",
+    "default": true,
+    "resolved_model": "google/gemma-4-31b-it",
+    "simulated": true,
+    "input_modalities": {
+     "attachment_transport": {
+      "supported": true,
+      "media_types": [
+       "*/*"
+      ],
+      "source": "resolved model route"
+     },
+     "image": {
+      "enabled": true,
+      "status": "resolved_model_dependent"
+     },
+     "audio": {
+      "enabled": true,
+      "status": "resolved_model_dependent"
+     },
+     "general_file": {
+      "enabled": true,
+      "status": "transport_supported",
+      "model_comprehension": "resolved-model-dependent"
+     }
+    },
+    "on_demand": false,
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-1/same": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-1/percent125": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-1/percent100": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-1/percent75": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-1/percent25": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-1/percent10": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-2/same": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-2/percent125": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-2/percent100": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-2/percent75": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-2/percent25": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-2/percent10": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-3/same": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-3/percent125": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-3/percent100": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-3/percent75": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-3/percent25": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-3/percent10": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-4/same": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-4/percent125": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-4/percent100": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-4/percent75": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-4/percent25": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-4/percent10": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": false
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": false
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-1/claude-haiku-4.5": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": true
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": true
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-2/gemini-3.1-pro-preview": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": true
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": true
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-3/claude-opus-4.8-fast": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": true
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": true
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  },
+  "worker-copilot-4/gemini-3.7-flash": {
+   "hidden": false,
+   "patch": {
+    "on_demand": false,
+    "simulated": true,
+    "input_modalities": {
+     "image": {
+      "enabled": true
+     },
+     "audio": {
+      "enabled": false
+     },
+     "general_file": {
+      "enabled": true
+     }
+    },
+    "task_capabilities": {
+     "code": {
+      "enabled": false
+     },
+     "summarization": {
+      "enabled": false
+     }
+    }
+   }
+  }
  }
 }

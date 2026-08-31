@@ -143,9 +143,14 @@
     "mailboxWebSocket": { "method": "WS", "path": "/emullm/mailbox/ws", "description": "ws_collab-compatible durable mailbox/event socket." },
     "headlessCopilots": { "method": "GET", "path": "/emullm/admin/copilots", "description": "List and manage persistent-session headless Copilot servants; sibling routes create, update, start, stop, restart, reset, delete, and read logs." },
     "headlessCopilotModels": { "method": "GET", "path": "/emullm/admin/copilots/models", "description": "List models available to the authenticated Copilot CLI account through the bundled SDK, with an explicit fallback catalog." },
+    "models": { "method": "GET", "path": "/v1/models", "description": "OpenAI-compatible catalog of worker personas, configured simulations, stable worker aliases, and every authenticated Copilot backing model under copilot/<model-id> with capability provenance." },
+    "modelConfigurator": { "method": "GET", "path": "/emullm/admin/model-config", "description": "Models configurator metadata for persisted /v1/models merge overrides, route targets, real backends, and four on-demand Copilot worker slots; PUT saves a model and route edit." },
+    "loadCopilotModel": { "method": "POST", "path": "/emullm/admin/model-config/load/{model_id}", "description": "Proactively load an exported copilot/<model-id> into a matching, empty, or stopped worker-copilot-5..8 slot." },
+    "testMediaSamples": { "method": "GET", "path": "/emullm/admin/test-samples", "description": "List built-in American flag, ascending tones, Twinkle melody, and spoken-phrase attachment samples; sibling GET paths return sample bytes." },
+    "chatCompletions": { "method": "POST", "path": "/v1/chat/completions", "description": "OpenAI-compatible chat completions, including image_url and input_audio base64 media persisted to compact cloud-file metadata for native servant delivery over the worker WebSocket." },
     "agents": { "method": "GET", "path": "/emullm/admin/agents", "description": "List configured agents; PUT /emullm/admin/agents/{worker_id}/enabled toggles entries such as Carol." },
     "websocketInventory": { "method": "GET", "path": "/emullm/admin/websockets", "description": "List active worker, mailbox, and interaction-log WebSockets with endpoint metadata and messages-in/messages-out counters." },
-    "modelTestClient": { "method": "POST", "path": "/emullm/admin/test-chat", "description": "Run a cancellable model test from the admin console; DELETE /emullm/admin/test-chat/{request_id} cancels the server task and active worker request." },
+    "modelTestClient": { "method": "POST", "path": "/emullm/admin/test-chat", "description": "Run a cancellable model test with image, audio, video, or arbitrary-file attachments from the admin console; DELETE /emullm/admin/test-chat/{request_id} cancels the server task and active worker request." },
     "restart": { "method": "POST", "path": "/emullm/admin/restart", "description": "Gracefully stop resident servants, replace the standalone EMULLM process, and warm/reconnect configured servants." },
     "shutdown": { "method": "POST", "path": "/emullm/admin/shutdown", "description": "Gracefully stop resident servants and shut down the standalone EMULLM process." },
     "note": "Process controls are loopback-only and available in standalone mode. /emullm/admin/reset clears persisted data; it does not restart the process."
@@ -153,28 +158,12 @@
   "ui": {
     "pages": [
       {
-        "id": "configure",
-        "label": "Configure Workspace Emulation of LLMs",
+        "id": "admin",
+        "label": "EMULLM Admin",
         "kind": "admin",
         "descriptor": "http://127.0.0.1:5173/emullm",
-        "glyph": "⚙",
-        "group": "CAPABILITIES"
-      },
-      {
-        "id": "audio",
-        "label": "Workspace Emulation Router",
-        "kind": "admin",
-        "descriptor": "http://127.0.0.1:5173/emullm/docs/",
-        "glyph": "♪",
-        "group": "SYSTEM"
-      },
-      {
-        "id": "monitor",
-        "label": "Workspace Emulation Monitor",
-        "kind": "user",
-        "descriptor": "http://127.0.0.1:5173/emullm/status",
-        "glyph": "◉",
-        "group": "RUNTIME"
+        "glyph": "μ",
+        "group": "PLUGINS"
       }
     ]
   }

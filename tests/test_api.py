@@ -19,8 +19,11 @@ websocket handshake end-to-end isn't worth the weight for a smoke suite.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
+import shutil
+import subprocess
 import time
 
 import pytest
@@ -76,12 +79,16 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(emullm_api, "_connected_workers", {})
     monkeypatch.setattr(emullm_api, "_native_worker_ids", set())
     monkeypatch.setattr(emullm_api, "_worker_models", {})
+    monkeypatch.setattr(emullm_api, "_worker_kinds", {})
+    monkeypatch.setattr(emullm_api, "_worker_runtime_models", {})
+    monkeypatch.setattr(emullm_api, "_worker_descriptions", {})
     monkeypatch.setattr(emullm_api, "_worker_capabilities", {})
     monkeypatch.setattr(emullm_api, "_worker_roles", {})
     monkeypatch.setattr(emullm_api, "_worker_model_masks", {})
     monkeypatch.setattr(emullm_api, "_worker_usage", {})
     monkeypatch.setattr(emullm_api, "_pending", {})
     monkeypatch.setattr(emullm_api, "_pending_models", {})
+    monkeypatch.setattr(emullm_api, "_worker_not_ready_until", {})
     monkeypatch.setattr(emullm_api, "_admin_test_tasks", {})
     monkeypatch.setattr(emullm_api, "_active_websockets", {})
     monkeypatch.setattr(emullm_api, "_worker_connection_ids", {})
@@ -102,14 +109,409 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_list_models_includes_personas(client: TestClient) -> None:
     data = client.get("/v1/models").json()["data"]
     ids = {entry["id"] for entry in data}
-    assert ids == {
+    assert {
         "yourself/same",
         "yourself/percent125",
         "yourself/percent100",
         "yourself/percent75",
         "yourself/percent25",
         "yourself/percent10",
+    }.issubset(ids)
+    assert "emullm/default" in ids
+    assert any(model_id.startswith("copilot/") for model_id in ids)
+
+
+def test_emullm_default_alias_relays_through_configured_default(
+    client: TestClient,
+) -> None:
+    worker = FakeWorker(reply="default answer")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._advertised_default = "yourself/same"  # noqa: SLF001
+
+    model = client.get("/v1/models/emullm/default")
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "emullm/default",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert model.status_code == 200
+    assert model.json()["resolved_model"] == "yourself/same"
+    assert response.status_code == 200
+    assert response.json()["model"] == "emullm/default"
+    assert response.json()["choices"][0]["message"]["content"] == "default answer"
+    assert worker.sent[0]["model"] == "yourself/same"
+
+
+def test_list_models_exports_complete_copilot_catalog_with_provenance(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    catalog = [
+        {"id": "auto", "name": "Auto"},
+        {
+            "id": "gemini-test",
+            "name": "Gemini Test",
+            "quality_rank": 3,
+            "quality_tier": "highest",
+            "capabilities": {
+                "supports": {"vision": True},
+                "limits": {
+                    "max_context_window_tokens": 123_000,
+                    "vision": {
+                        "max_prompt_images": 3,
+                        "max_prompt_image_size": 1024,
+                        "supported_media_types": ["image/png"],
+                    },
+                },
+            },
+        },
+    ]
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": catalog, "source": "test"},
+    )
+
+    models = {entry["id"]: entry for entry in client.get("/v1/models").json()["data"]}
+
+    assert {"copilot/auto", "copilot/gemini-test"}.issubset(models)
+    gemini = models["copilot/gemini-test"]
+    assert gemini["owned_by"] == "github-copilot"
+    assert gemini["backing_model"] == "gemini-test"
+    assert gemini["on_demand"] is True
+    assert gemini["on_demand_worker_limit"] == 4
+    assert gemini["input_modalities"]["attachment_transport"]["supported"] is True
+    assert gemini["input_modalities"]["image"]["enabled"] is True
+    assert gemini["input_modalities"]["audio"]["status"] == "family_implied"
+    assert gemini["input_modalities"]["audio"]["enabled"] is True
+    assert gemini["task_capabilities"]["code"]["enabled"] is False
+    assert gemini["task_capabilities"]["summarization"]["enabled"] is True
+    assert client.get("/v1/models/copilot/gemini-test").json()["id"] == "copilot/gemini-test"
+
+
+def test_model_configurator_persists_model_patch_visibility_and_route(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    catalog = [{"id": "demo-model", "name": "Demo Model", "capabilities": {}}]
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": catalog, "source": "test"},
+    )
+
+    saved = client.put(
+        "/emullm/admin/model-config",
+        json={
+            "model_id": "copilot/demo-model",
+            "patch": {
+                "display_name": "My edited model",
+                "input_modalities": {
+                    "audio": {"enabled": True, "status": "operator_enabled"}
+                },
+            },
+            "set_route": True,
+            "route": ["worker-copilot-*", "https://models.example/v1"],
+        },
+    )
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["route"] == [
+        "worker-copilot-*",
+        "https://models.example/v1",
+    ]
+    model = client.get("/v1/models/copilot/demo-model").json()
+    assert model["display_name"] == "My edited model"
+    assert model["input_modalities"]["audio"]["enabled"] is True
+    assert emullm_api._model_routes["copilot/demo-model"] == [  # noqa: SLF001
+        "worker-copilot-*",
+        "https://models.example/v1",
+    ]
+
+    hidden = client.put(
+        "/emullm/admin/model-config",
+        json={
+            "model_id": "copilot/demo-model",
+            "hidden": True,
+            "patch": {},
+        },
+    )
+    assert hidden.status_code == 200
+    assert "copilot/demo-model" not in {
+        entry["id"] for entry in client.get("/v1/models").json()["data"]
     }
+    assert client.get("/v1/models/copilot/demo-model").status_code == 404
+
+    reset = client.put(
+        "/emullm/admin/model-config",
+        json={
+            "model_id": "copilot/demo-model",
+            "reset": True,
+        },
+    )
+    assert reset.status_code == 200
+    assert client.get("/v1/models/copilot/demo-model").status_code == 200
+
+
+def test_on_demand_copilot_provisioner_uses_four_named_slots(monkeypatch) -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.instances: dict[str, dict] = {}
+
+        def list(self) -> list[dict]:
+            return list(self.instances.values())
+
+        def create(self, config, *, start=True):
+            self.instances[config.worker_id] = {
+                "worker_id": config.worker_id,
+                "running": start,
+                "config": config.model_dump(mode="json"),
+            }
+
+        def start(self, worker_id):
+            self.instances[worker_id]["running"] = True
+
+        def update(self, worker_id, config, *, restart=True):
+            self.instances[worker_id] = {
+                "worker_id": worker_id,
+                "running": False,
+                "config": config.model_dump(mode="json"),
+            }
+
+    manager = FakeManager()
+    monkeypatch.setattr(emullm_api._copilot_api, "get_manager", lambda: manager)  # noqa: SLF001
+    entry = {
+        "id": "copilot/model",
+        "on_demand": True,
+        "input_modalities": {
+            "image": {"enabled": True},
+            "audio": {"enabled": False},
+            "general_file": {"enabled": True},
+        },
+    }
+
+    workers = [
+        emullm_api._provision_on_demand_copilot(f"model-{index}", entry)[0]  # noqa: SLF001
+        for index in range(1, 5)
+    ]
+
+    assert workers == [f"worker-copilot-{index}" for index in range(5, 9)]
+    assert manager.instances["worker-copilot-5"]["config"]["model"] == "model-1"
+    assert manager.instances["worker-copilot-5"]["config"]["capabilities"] == [
+        "vision_input",
+        "!audio_input",
+        "file_input",
+    ]
+    with pytest.raises(HTTPException, match="all 4 on-demand Copilot workers are busy"):
+        emullm_api._provision_on_demand_copilot("model-5", entry)  # noqa: SLF001
+
+
+def test_model_configurator_lists_only_reserved_on_demand_slots(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    class FakeManager:
+        @staticmethod
+        def list():
+            return [
+                {"worker_id": "worker-copilot-1", "role": "headless-copilot"},
+                {"worker_id": "worker-copilot-5", "role": "on-demand-copilot"},
+            ]
+
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: FakeManager(),
+    )
+    response = client.get("/emullm/admin/model-config")
+
+    assert response.status_code == 200
+    assert [
+        slot["worker_id"] for slot in response.json()["on_demand"]["slots"]
+    ] == ["worker-copilot-5"]
+
+
+def test_copilot_catalog_request_routes_to_ensured_on_demand_worker(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    catalog = [{"id": "demo-model", "name": "Demo Model", "capabilities": {}}]
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": catalog, "source": "test"},
+    )
+    worker = FakeWorker(reply="on-demand answer")
+    emullm_api._connected_workers["worker-copilot-5"] = worker  # noqa: SLF001
+    calls = []
+
+    async def ensure(public_model_id: str, backing_model: str) -> str:
+        calls.append((public_model_id, backing_model))
+        return "worker-copilot-5"
+
+    monkeypatch.setattr(emullm_api, "_ensure_on_demand_copilot", ensure)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "copilot/demo-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "on-demand answer"
+    assert calls == [("copilot/demo-model", "demo-model")]
+    assert worker.sent[0]["model"] == "copilot/demo-model"
+
+
+def test_loaded_copilot_worker_route_requires_matching_backing_model(
+    monkeypatch,
+) -> None:
+    catalog = [
+        {"id": "model-a", "name": "Model A"},
+        {"id": "model-b", "name": "Model B"},
+    ]
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": catalog, "source": "test"},
+    )
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            "worker-copilot-5": FakeWorker(),
+            "worker-copilot-6": FakeWorker(),
+        }
+    )
+    emullm_api._worker_runtime_models.update(  # noqa: SLF001
+        {
+            "worker-copilot-5": "model-a",
+            "worker-copilot-6": "model-b",
+        }
+    )
+
+    assert emullm_api._route_worker_candidates(  # noqa: SLF001
+        "copilot/model-b",
+        "worker-copilot-*",
+    ) == ["worker-copilot-6"]
+
+
+def test_unknown_worker_glob_still_applies_capability_ordering() -> None:
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            "worker-unknown-capable": FakeWorker(),
+            "worker-unknown-unknown": FakeWorker(),
+            "worker-unknown-declined": FakeWorker(),
+            "other-worker": FakeWorker(),
+        }
+    )
+    emullm_api._native_worker_ids.update(emullm_api._connected_workers)  # noqa: SLF001
+    emullm_api._worker_capabilities.update(  # noqa: SLF001
+        {
+            "worker-unknown-capable": {"audio_input": True},
+            "worker-unknown-declined": {"audio_input": False},
+        }
+    )
+
+    assert emullm_api._route_worker_candidates(  # noqa: SLF001
+        "gpt-4o-audio-preview",
+        "worker-unknown-*",
+        {"audio_input"},
+    ) == ["worker-unknown-capable", "worker-unknown-unknown"]
+
+
+def test_worker_in_name_route_targets_named_worker(client: TestClient) -> None:
+    alice = FakeWorker(reply="alice answered")
+    emullm_api._connected_workers["alice"] = alice  # noqa: SLF001
+    emullm_api._model_routes["alice/custom"] = ["worker-in-name"]  # noqa: SLF001
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "alice/custom",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "alice answered"
+    assert len(alice.sent) == 1
+
+
+def test_backend_wildcard_route_expands_configured_backends(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    async def proxy(backend, model, prompt, instruction):
+        calls.append((backend["name"], model, prompt, instruction))
+        return "backend answered"
+
+    monkeypatch.setattr(
+        emullm_api,
+        "_all_backends",
+        lambda: [
+            {"name": "one", "base_url": "https://one.example/v1"},
+            {"name": "two", "base_url": "https://two.example/v1"},
+        ],
+    )
+    monkeypatch.setattr(emullm_api, "_proxy_chat", proxy)
+    emullm_api._model_routes["vendor/model"] = ["backend-*"]  # noqa: SLF001
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "vendor/model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "backend answered"
+    assert calls[0][0] in {"one", "two"}
+
+
+def test_list_models_includes_simulated_routes_and_backing_model_alias(
+    client: TestClient,
+) -> None:
+    emullm_api._model_routes["vendor/simulated"] = [  # noqa: SLF001
+        "worker-copilot-*",
+        "https://llm.example/v1",
+    ]
+    emullm_api._connected_workers["worker-copilot-1"] = FakeWorker(reply="ok")  # noqa: SLF001
+    emullm_api._worker_kinds["worker-copilot-1"] = "headless-copilot"  # noqa: SLF001
+    emullm_api._worker_runtime_models["worker-copilot-1"] = "gpt-5.6-sol"  # noqa: SLF001
+    emullm_api._worker_descriptions["worker-copilot-1"] = "Resident Copilot worker."  # noqa: SLF001
+
+    models = {entry["id"]: entry for entry in client.get("/v1/models").json()["data"]}
+
+    simulated = models["vendor/simulated"]
+    assert simulated["simulated"] is True
+    assert simulated["route_targets"] == [
+        "worker-copilot-*",
+        "https://llm.example/v1",
+    ]
+    assert simulated["active_workers"] == ["worker-copilot-1"]
+    assert simulated["backing_models"] == {"worker-copilot-1": "gpt-5.6-sol"}
+
+    alias = models["worker-copilot-1/gpt-5.6-sol"]
+    assert alias["worker_id"] == "worker-copilot-1"
+    assert alias["worker_kind"] == "headless-copilot"
+    assert alias["backing_model"] == "gpt-5.6-sol"
+    assert "gpt-5.6-sol" in alias["display_name"]
+    assert client.get("/v1/models/worker-copilot-1/gpt-5.6-sol").json()["id"] == alias["id"]
+    reply = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "worker-copilot-1/gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert reply.status_code == 200
+    assert emullm_api._connected_workers["worker-copilot-1"].sent[-1]["model"] == alias["id"]  # noqa: SLF001
 
 
 def test_service_catalog_advertises_one_shared_worker_socket(client: TestClient) -> None:
@@ -163,6 +565,333 @@ def test_chat_completions_without_worker_waits_then_504(client: TestClient, shor
         json={"model": "yourself/same", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 504
+
+
+def test_chat_completions_persists_inline_image_as_native_worker_attachment(
+    client: TestClient,
+) -> None:
+    worker = FakeWorker(reply="American flag")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    image_bytes = b"\x89PNG\r\n\x1a\nflag-image"
+    data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "yourself/same",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the image."},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "American flag"
+    request = worker.sent[0]
+    assert request["kind"] == "vision"
+    assert request["images"] == [request["attachments"][0]["url"]]
+    assert request["attachments"][0]["mime_type"] == "image/png"
+    assert request["attachments"][0]["bytes"] == len(image_bytes)
+    assert data_url not in json.dumps(request)
+    download = client.get(request["attachments"][0]["url"])
+    assert download.status_code == 200
+    assert download.content == image_bytes
+    assert download.headers["content-type"].startswith("image/png")
+
+
+def test_chat_completions_rejects_invalid_inline_image_base64(
+    client: TestClient,
+) -> None:
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="unused")  # noqa: SLF001
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "yourself/same",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,not-valid!"},
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "inline image 1 is not valid base64"
+
+
+def test_chat_completions_persists_input_audio_as_native_worker_attachment(
+    client: TestClient,
+) -> None:
+    worker = FakeWorker(reply="The tones rise in pitch.")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    audio_bytes = b"RIFF\x24\x00\x00\x00WAVEfmt audio-data"
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "yourself/same",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this audio."},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(audio_bytes).decode("ascii"),
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "The tones rise in pitch."
+    request = worker.sent[0]
+    assert request["kind"] == "audio_attachment"
+    assert request["audio"] == request["attachments"][0]["url"]
+    assert request["attachments"][0]["mime_type"] == "audio/wav"
+    assert request["attachments"][0]["bytes"] == len(audio_bytes)
+    assert base64.b64encode(audio_bytes).decode("ascii") not in json.dumps(request)
+    download = client.get(request["attachments"][0]["url"])
+    assert download.status_code == 200
+    assert download.content == audio_bytes
+    assert download.headers["content-type"].startswith("audio/wav")
+
+
+def test_audio_round_robin_prefers_declared_capable_worker(
+    client: TestClient,
+) -> None:
+    unknown = FakeWorker(reply="unknown")
+    capable = FakeWorker(reply="capable")
+    declined = FakeWorker(reply="declined")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            "worker-copilot-1": unknown,
+            "worker-copilot-2": capable,
+            "worker-copilot-3": declined,
+        }
+    )
+    emullm_api._native_worker_ids.update(emullm_api._connected_workers)  # noqa: SLF001
+    emullm_api._worker_capabilities.update(  # noqa: SLF001
+        {
+            "worker-copilot-2": {"audio_input": True},
+            "worker-copilot-3": {"audio_input": False},
+        }
+    )
+    emullm_api._model_routes["gpt-4o-audio-preview"] = ["worker-copilot-*"]  # noqa: SLF001
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-audio-preview",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this audio."},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(b"RIFF audio").decode("ascii"),
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "capable"
+    assert unknown.sent == []
+    assert declined.sent == []
+    assert capable.sent[0]["required_capabilities"] == ["audio_input"]
+
+
+def test_audio_round_robin_tries_unknown_worker_after_capable_worker_rejects(
+    client: TestClient,
+) -> None:
+    class RejectingWorker:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+            await emullm_api._handle_worker_message(  # noqa: SLF001
+                "worker-copilot-1",
+                {"type": "reject", "id": payload["id"], "reason": "audio unavailable"},
+            )
+
+    rejecting = RejectingWorker()
+    fallback = FakeWorker(reply="fallback accepted")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            "worker-copilot-1": rejecting,
+            "worker-copilot-2": fallback,
+        }
+    )
+    emullm_api._native_worker_ids.update(emullm_api._connected_workers)  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"audio_input": True}  # noqa: SLF001
+    emullm_api._model_routes["gpt-4o-mini-audio-preview"] = ["worker-copilot-*"]  # noqa: SLF001
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini-audio-preview",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(b"RIFF audio").decode("ascii"),
+                                "format": "wav",
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "fallback accepted"
+    assert len(rejecting.sent) == 1
+    assert len(fallback.sent) == 1
+
+
+def test_not_ready_worker_defers_and_route_tries_it_again_later(
+    client: TestClient,
+) -> None:
+    class NotReadyWorker:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+            await emullm_api._handle_worker_message(  # noqa: SLF001
+                "worker-copilot-1",
+                {
+                    "type": "not_ready",
+                    "id": payload["id"],
+                    "reason": "runtime temporarily returned no answer",
+                    "retry_after": 15,
+                },
+            )
+
+    deferred = NotReadyWorker()
+    fallback = FakeWorker(reply="fallback completed")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            "worker-copilot-1": deferred,
+            "worker-copilot-2": fallback,
+        }
+    )
+    emullm_api._native_worker_ids.update(emullm_api._connected_workers)  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"audio_input": True}  # noqa: SLF001
+    emullm_api._model_routes["audio/model"] = ["worker-copilot-*"]  # noqa: SLF001
+    payload = {
+        "model": "audio/model",
+        "messages": [{"role": "user", "content": "listen"}],
+        "required_capabilities": ["audio_input"],
+    }
+
+    first = client.post("/v1/chat/completions", json=payload)
+    second = client.post("/v1/chat/completions", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["choices"][0]["message"]["content"] == "fallback completed"
+    assert len(deferred.sent) == 1
+    assert len(fallback.sent) == 2
+    assert emullm_api._worker_retry_delay("worker-copilot-1") > 0  # noqa: SLF001
+    events = client.get(
+        "/emullm/websock_to_llm_user/events",
+        params={"model": "audio/model", "type": "LLM_NOT_READY"},
+    ).json()["events"]
+    assert len(events) == 1
+    assert events[0]["data"]["retry_after"] == 15
+
+
+def test_required_task_capability_prefers_declared_worker(
+    client: TestClient,
+) -> None:
+    unknown = FakeWorker(reply="unknown")
+    coder = FakeWorker(reply="coded")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {"general-worker": unknown, "code-worker": coder}
+    )
+    emullm_api._native_worker_ids.update(emullm_api._connected_workers)  # noqa: SLF001
+    emullm_api._worker_capabilities["code-worker"] = {"code": True}  # noqa: SLF001
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "some-code-model",
+            "required_capabilities": ["code"],
+            "messages": [{"role": "user", "content": "Write a function."}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "coded"
+    assert unknown.sent == []
+    assert coder.sent[0]["required_capabilities"] == ["code"]
+
+
+@pytest.mark.parametrize(
+    ("audio_data", "audio_format", "detail"),
+    [
+        ("not-valid!", "wav", "inline audio 1 is not valid base64"),
+        (base64.b64encode(b"audio").decode("ascii"), "aac", "format must be one of"),
+    ],
+)
+def test_chat_completions_rejects_invalid_input_audio(
+    client: TestClient,
+    audio_data: str,
+    audio_format: str,
+    detail: str,
+) -> None:
+    emullm_api._connected_workers["yourself"] = FakeWorker(reply="unused")  # noqa: SLF001
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "yourself/same",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": audio_data,
+                                "format": audio_format,
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert detail in response.json()["detail"]
 
 
 def test_completions_without_worker_waits_then_504(client: TestClient, short_timeout: None) -> None:
@@ -224,7 +953,9 @@ def test_messages_relay_anthropic_content_and_return_message_shape(client: TestC
     assert worker.sent[0]["prompt"] == (
         "[system] Be concise.\n\n[user] Describe this image.\n\n[user] tool output"
     )
-    assert worker.sent[0]["images"] == ["data:image/png;base64,YWJj"]
+    assert worker.sent[0]["images"] == [worker.sent[0]["attachments"][0]["url"]]
+    assert worker.sent[0]["attachments"][0]["mime_type"] == "image/png"
+    assert client.get(worker.sent[0]["attachments"][0]["url"]).content == b"abc"
     assert worker.sent[0]["kind"] == "vision"
 
 
@@ -290,7 +1021,7 @@ def test_worker_websocket_generates_an_identity_and_applies_model_masks(client: 
     with client.websocket_connect("/emullm/ws?modelmasks=vendor/*,gpt-*") as websocket:
         hello = websocket.receive_json()
         worker_id = hello["worker_id"]
-        assert re.fullmatch(r"servant-[0-9a-f]{16}", worker_id)
+        assert re.fullmatch(r"worker-unknown-[0-9a-f]{16}", worker_id)
         assert hello["modelmasks"] == ["vendor/*", "gpt-*"]
         assert emullm_api._worker_model_masks[worker_id] == ("vendor/*", "gpt-*")  # noqa: SLF001
 
@@ -304,7 +1035,15 @@ def test_worker_websocket_without_model_masks_accepts_all_models(client: TestCli
 def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> None:
     with client.websocket_connect("/emullm/ws?worker_id=tracked-servant") as websocket:
         assert websocket.receive_json()["type"] == "hello"
-        websocket.send_json({"type": "register", "role": "test"})
+        websocket.send_json(
+            {
+                "type": "register",
+                "role": "test",
+                "worker_kind": "headless-copilot",
+                "runtime_model": "gpt-5.6-sol",
+                "description": "Resident Copilot test servant.",
+            }
+        )
         rows = []
         for _ in range(20):
             inventory = client.get("/emullm/admin/websockets").json()
@@ -323,6 +1062,10 @@ def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> N
         assert row["messages_out"] >= 1
         assert row["messages_in"] >= 1
         assert row["connected_seconds"] >= 0
+        caps = client.get("/emullm/caps/tracked-servant").json()
+        assert caps["worker_kind"] == "headless-copilot"
+        assert caps["backing_model"] == "gpt-5.6-sol"
+        assert caps["description"] == "Resident Copilot test servant."
 
     assert client.get("/emullm/admin/websockets").json()["connections"] == []
 
@@ -954,6 +1697,9 @@ def test_worker_caps_lookup(client: TestClient) -> None:
         "models": sorted(emullm_api._PERSONA_SUFFIXES.keys()),
         "capabilities": {},
         "modelmasks": None,
+        "worker_kind": None,
+        "backing_model": None,
+        "description": None,
     }
 
     emullm_api._connected_workers["alice"] = FakeWorker()  # noqa: SLF001
@@ -1582,14 +2328,14 @@ def test_model_routes_admin_get_set_remove(client: TestClient) -> None:
     assert client.get("/admin/emullm/state").json()["model_routes"]["a/b"] == "w1"
     client.post("/admin/emullm/model_routes", json={"routes": {"a/b": ""}})  # empty removes
     assert "a/b" not in client.get("/admin/emullm/model_routes").json()["model_routes"]
-    chain = ["copilot-headless-*", "codex-headless-*", "https://llm.example/v1"]
+    chain = ["worker-copilot-*", "worker-codex-*", "https://llm.example/v1"]
     saved = client.post("/admin/emullm/model_routes", json={"routes": {"a/b": chain}})
     assert saved.json()["model_routes"]["a/b"] == chain
     comma = client.post(
         "/admin/emullm/model_routes",
-        json={"routes": {"c/d": "copilot-headless-*, codex-headless-*"}},
+        json={"routes": {"c/d": "worker-copilot-*, worker-codex-*"}},
     )
-    assert comma.json()["model_routes"]["c/d"] == ["copilot-headless-*", "codex-headless-*"]
+    assert comma.json()["model_routes"]["c/d"] == ["worker-copilot-*", "worker-codex-*"]
 
 
 def test_model_route_relays_catalog_id_to_worker(client: TestClient) -> None:
@@ -1611,11 +2357,11 @@ def test_model_route_chain_prefers_first_matching_worker_glob(client: TestClient
     first = FakeWorker(reply="copilot answer")
     second = FakeWorker(reply="codex answer")
     emullm_api._connected_workers.update(  # noqa: SLF001
-        {"copilot-headless-2": first, "codex-headless-1": second}
+        {"worker-copilot-2": first, "worker-codex-1": second}
     )
     emullm_api._model_routes["vendor/model"] = [  # noqa: SLF001
-        "copilot-headless-*",
-        "codex-headless-*",
+        "worker-copilot-*",
+        "worker-codex-*",
         "https://llm.example/v1",
     ]
 
@@ -1634,15 +2380,15 @@ def test_model_route_chain_retries_next_worker_group_after_rejection(client: Tes
     class RejectingWorker:
         async def send_json(self, payload: dict) -> None:
             future = emullm_api._pending[payload["id"]]  # noqa: SLF001
-            future.set_exception(emullm_api._WorkerRejected("copilot-headless-1", "declined"))  # noqa: SLF001
+            future.set_exception(emullm_api._WorkerRejected("worker-copilot-1", "declined"))  # noqa: SLF001
 
     fallback = FakeWorker(reply="codex fallback")
     emullm_api._connected_workers.update(  # noqa: SLF001
-        {"copilot-headless-1": RejectingWorker(), "codex-headless-1": fallback}
+        {"worker-copilot-1": RejectingWorker(), "worker-codex-1": fallback}
     )
     emullm_api._model_routes["vendor/model"] = [  # noqa: SLF001
-        "copilot-headless-*",
-        "codex-headless-*",
+        "worker-copilot-*",
+        "worker-codex-*",
     ]
 
     response = client.post(
@@ -1671,8 +2417,8 @@ def test_model_route_chain_falls_back_to_its_backend_url(
 
     monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
     emullm_api._model_routes["vendor/model"] = [  # noqa: SLF001
-        "copilot-headless-*",
-        "codex-headless-*",
+        "worker-copilot-*",
+        "worker-codex-*",
         backend_url,
     ]
 
@@ -1722,6 +2468,151 @@ def test_admin_test_client_cancellation_clears_pending_and_notifies_worker(
     assert emullm_api._pending == {}  # noqa: SLF001
     assert emullm_api._admin_test_tasks == {}  # noqa: SLF001
     assert [message["type"] for message in worker.sent] == ["request", "cancel"]
+
+
+def test_admin_test_client_relays_image_audio_and_general_file_attachments(
+    client: TestClient,
+) -> None:
+    worker = FakeWorker(reply="I received all three attachments.")
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    attachments = [
+        ("pixel.png", "image/png", b"\x89PNG\r\n\x1a\nimage"),
+        ("sample.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEaudio"),
+        ("notes.txt", "text/plain", b"arbitrary attached text"),
+    ]
+
+    response = client.post(
+        "/emullm/admin/test-chat",
+        json={
+            "request_id": "multimodal-test",
+            "model": "yourself/same",
+            "prompt": "Describe every attachment.",
+            "attachments": [
+                {
+                    "name": name,
+                    "mime_type": mime_type,
+                    "data_b64": base64.b64encode(data).decode("ascii"),
+                }
+                for name, mime_type, data in attachments
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["request_kind"] == "vision"
+    assert body["choices"][0]["message"]["content"] == "I received all three attachments."
+    assert [entry["name"] for entry in body["attachments"]] == [
+        "attachment-1",
+        "attachment-2",
+        "attachment-3",
+    ]
+    request = worker.sent[0]
+    assert request["kind"] == "vision"
+    assert request["images"] == [body["attachments"][0]["url"]]
+    assert request["audio"] == body["attachments"][1]["url"]
+    assert request["attachments"] == body["attachments"]
+    assert request["files"]["attachments"] == body["attachments"]
+    serialized_request = json.dumps(request)
+    assert all(original_name not in serialized_request for original_name, _, _ in attachments)
+    for metadata, (_, mime_type, expected) in zip(body["attachments"], attachments):
+        download = client.get(metadata["url"])
+        assert download.status_code == 200
+        assert download.content == expected
+        assert download.headers["content-type"].startswith(mime_type)
+
+
+def test_admin_test_client_rejects_invalid_attachment_base64(client: TestClient) -> None:
+    response = client.post(
+        "/emullm/admin/test-chat",
+        json={
+            "request_id": "bad-attachment",
+            "model": "yourself/same",
+            "prompt": "Read this.",
+            "attachments": [
+                {
+                    "name": "bad.bin",
+                    "mime_type": "application/octet-stream",
+                    "data_b64": "not base64!",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "attachment 'attachment-1' is not valid base64"
+
+
+def test_admin_test_client_enforces_per_file_and_total_attachment_limits(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    encoded = base64.b64encode(b"1234").decode("ascii")
+    payload = {
+        "request_id": "attachment-limit",
+        "model": "yourself/same",
+        "prompt": "Read this.",
+        "attachments": [
+            {
+                "name": "one.bin",
+                "mime_type": "application/octet-stream",
+                "data_b64": encoded,
+            }
+        ],
+    }
+    monkeypatch.setattr(emullm_api, "_MAX_ADMIN_TEST_ATTACHMENT_BYTES", 3)
+    response = client.post("/emullm/admin/test-chat", json=payload)
+    assert response.status_code == 413
+    assert response.json()["detail"] == "attachment 'attachment-1' exceeds the 3-byte limit"
+
+    monkeypatch.setattr(emullm_api, "_MAX_ADMIN_TEST_ATTACHMENT_BYTES", 10)
+    monkeypatch.setattr(emullm_api, "_MAX_ADMIN_TEST_ATTACHMENTS_TOTAL_BYTES", 7)
+    payload["attachments"].append(
+        {
+            "name": "two.bin",
+            "mime_type": "application/octet-stream",
+            "data_b64": encoded,
+        }
+    )
+    response = client.post("/emullm/admin/test-chat", json=payload)
+    assert response.status_code == 413
+    assert "exceed the 7-byte total limit" in response.json()["detail"]
+
+
+def test_admin_attachment_samples_are_listed_and_downloadable(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        emullm_api,
+        "test_media_samples",
+        lambda: {
+            "sample-audio": {
+                "id": "sample-audio",
+                "name": "sample.wav",
+                "mime_type": "audio/wav",
+                "description": "Test speech",
+                "data": b"RIFF sample",
+            }
+        },
+    )
+
+    listing = client.get("/emullm/admin/test-samples")
+    assert listing.status_code == 200
+    assert listing.json()["samples"] == [
+        {
+            "id": "sample-audio",
+            "name": "sample.wav",
+            "mime_type": "audio/wav",
+            "description": "Test speech",
+            "bytes": 11,
+            "url": "/emullm/admin/test-samples/sample-audio",
+        }
+    ]
+    download = client.get("/emullm/admin/test-samples/sample-audio")
+    assert download.status_code == 200
+    assert download.content == b"RIFF sample"
+    assert download.headers["content-type"].startswith("audio/wav")
+    assert client.get("/emullm/admin/test-samples/missing").status_code == 404
 
 
 @pytest.mark.parametrize("path", ["/v1/files", "/v1/assistants", "/v1/threads"])
@@ -2718,6 +3609,7 @@ def test_admin_page_renders_html(client: TestClient) -> None:
         response = client.get(url)
         assert response.status_code == 200, url
         assert "text/html" in response.headers["content-type"]
+        assert response.headers["cache-control"] == "no-store"
         assert "EMULLM // CONTROL PLANE" in response.text
     # The page resolves its REST calls relative to wherever it's served.
     html = client.get("/emullm/admin").text
@@ -2749,6 +3641,50 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     assert "new AbortController()" in html
     assert "r.status === 499" in html
     assert "toFixed(1) + 's'" in html
+    assert 'id="model-test-files"' in html
+    assert 'id="model-test-drop"' in html
+    assert 'id="model-test-attachments"' in html
+    assert 'id="model-test-uploaded"' in html
+    assert 'id="cp-model-capabilities"' in html
+    assert 'id="api-model-capabilities"' in html
+    assert "model.display_name || model.name || model.id" in html
+    assert "<strong>Native audio:</strong>" in html
+    assert 'id="model-configurator"' in html
+    assert 'id="model-config-list" size="18" multiple' in html
+    assert 'id="model-config-json"' in html
+    assert 'id="model-config-route"' in html
+    assert 'id="model-route-order"' in html
+    assert "data-route-move" in html
+    assert 'id="model-config-audio"' in html
+    assert 'id="model-config-code"' in html
+    assert 'id="model-config-summary"' in html
+    assert 'id="model-config-save"' in html
+    assert 'id="model-config-load"' in html
+    assert 'id="model-test-configure"' in html
+    assert 'id="model-test-capabilities"' in html
+    assert 'id="model-test-samples"' in html
+    assert "refreshModelTestSamples" in html
+
+
+def test_admin_page_javascript_has_valid_syntax(
+    client: TestClient,
+    tmp_path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable")
+    html = client.get("/emullm").text
+    scripts = re.findall(r"<script>(.*?)</script>", html, flags=re.DOTALL)
+    assert scripts
+    script_path = tmp_path / "admin-page.js"
+    script_path.write_text("\n".join(scripts), encoding="utf-8")
+    result = subprocess.run(
+        [node, "--check", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
     assert "'/test-chat'" in html
     assert 'id="refresh-websockets"' in html
     assert 'id="websocket-connections"' in html

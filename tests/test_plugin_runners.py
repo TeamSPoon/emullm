@@ -35,6 +35,10 @@ def test_manifest_uses_native_service_catalog() -> None:
     assert endpoints["workerWebSocket"]["path"] == "/emullm/ws"
     assert endpoints["mailboxWebSocket"]["path"] == "/emullm/mailbox/ws"
     assert endpoints["headlessCopilots"]["path"] == "/emullm/admin/copilots"
+    assert endpoints["chatCompletions"]["path"] == "/v1/chat/completions"
+    assert endpoints["modelConfigurator"]["path"] == "/emullm/admin/model-config"
+    assert endpoints["loadCopilotModel"]["path"].endswith("/{model_id}")
+    assert endpoints["testMediaSamples"]["path"] == "/emullm/admin/test-samples"
     assert endpoints["agents"]["path"] == "/emullm/admin/agents"
     assert endpoints["websocketInventory"]["path"] == "/emullm/admin/websockets"
     assert endpoints["modelTestClient"]["path"] == "/emullm/admin/test-chat"

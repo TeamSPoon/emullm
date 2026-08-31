@@ -94,7 +94,10 @@ async function handleRequest(message) {
   active = current;
   try {
     const response = await session.sendAndWait(
-      String(message.prompt ?? ""),
+      {
+        prompt: String(message.prompt ?? ""),
+        attachments: Array.isArray(message.attachments) ? message.attachments : [],
+      },
       Number(message.timeout_ms ?? 60000),
     );
     if (current.cancelled) return;

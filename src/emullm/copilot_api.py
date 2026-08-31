@@ -124,7 +124,13 @@ class HeadlessCopilotConfig(BaseModel):
         description="OpenAI-compatible model glob patterns handled by this servant; empty accepts all.",
     )
     role: str = Field(default="headless-copilot", min_length=1, max_length=100)
-    capabilities: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Declared service/input capabilities such as audio_input; prefix a "
+            "name with ! or - to explicitly decline it."
+        ),
+    )
     system_prompt: str = Field(default=DEFAULT_SYSTEM_PROMPT, min_length=1, max_length=20_000)
     cwd: str | None = None
     host_ws_url: str | None = None
@@ -158,6 +164,12 @@ class HeadlessCopilotConfig(BaseModel):
     max_chunks: int = Field(default=64, ge=1, le=1_000)
     max_prompt_chars: int = Field(default=4_000_000, ge=1_000, le=20_000_000)
     max_output_chars: int = Field(default=200_000, ge=1_000, le=2_000_000)
+    max_attachment_bytes: int = Field(
+        default=25 * 1024 * 1024,
+        ge=1_024,
+        le=100 * 1024 * 1024,
+        description="Maximum bytes fetched for one native SDK attachment.",
+    )
 
     @field_validator("model_pool", "modelmasks", "capabilities")
     @classmethod
@@ -616,6 +628,12 @@ class CopilotInstanceManager:
             else {}
         )
         limits = capabilities.get("limits") if isinstance(capabilities, dict) else {}
+        vision = limits.get("vision") if isinstance(limits, dict) else {}
+        supported_media_types = (
+            vision.get("supported_media_types")
+            if isinstance(vision, dict)
+            else []
+        )
         copilot_command = resolve_copilot_command(config.copilot_command)
         node_command = shutil.which("node")
         if not node_command:
@@ -636,6 +654,11 @@ class CopilotInstanceManager:
                     int(limits.get("max_output_tokens") or 0)
                     if isinstance(limits, dict)
                     else 0
+                ),
+                "selected_model_supported_media_types": (
+                    [str(media_type) for media_type in supported_media_types]
+                    if isinstance(supported_media_types, list)
+                    else []
                 ),
                 "host_ws_url": config.host_ws_url or self.default_host_ws_url,
                 "copilot_command": copilot_command,
@@ -855,9 +878,12 @@ class CopilotInstanceManager:
         with self._lock:
             used = set(self._configs)
         index = 1
-        while f"copilot-headless-{index}" in used:
+        while (
+            f"worker-copilot-{index}" in used
+            or 5 <= index <= 8
+        ):
             index += 1
-        return f"copilot-headless-{index}"
+        return f"worker-copilot-{index}"
 
     def _selected_model(self, worker_id: str) -> str | None:
         path = self._runtime_config_path(worker_id)
@@ -951,7 +977,7 @@ def list_copilots() -> dict[str, Any]:
         "manager_active": manager is not None,
         "copilot_available": command is not None,
         "copilot_command": command,
-        "next_worker_id": manager.next_worker_id() if manager else "copilot-headless-1",
+        "next_worker_id": manager.next_worker_id() if manager else "worker-copilot-1",
         "instances": manager.list() if manager else [],
     }
 

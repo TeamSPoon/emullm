@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sys
 import uuid
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -88,6 +90,7 @@ def test_resident_bridge_maps_session_and_security_configuration(tmp_path) -> No
     assert str(config.session_id)
     assert "client.resumeSession(config.session_id" in bridge
     assert "session.sendAndWait" in bridge
+    assert "attachments: Array.isArray(message.attachments)" in bridge
     assert "availableTools: config.allow_all ? undefined : []" in bridge
     assert "onPermissionRequest: config.allow_all ? approveAll : undefined" in bridge
     assert "skipCustomInstructions: !config.load_custom_instructions" in bridge
@@ -122,6 +125,21 @@ def test_empty_model_masks_are_omitted_from_registration_to_mean_all_models(tmp_
     assert masked["modelmasks"] == ["openai/*"]
 
 
+def test_registration_declares_configured_and_model_media_capabilities(tmp_path) -> None:
+    payload = registration_payload(
+        runtime_config(
+            tmp_path,
+            capabilities=["audio_input", "!file_input"],
+            selected_model_supported_media_types=["image/png", "application/pdf"],
+        )
+    )
+    assert payload["capabilities"] == {
+        "audio_input": True,
+        "file_input": False,
+        "vision_input": True,
+    }
+
+
 def test_manager_persists_and_controls_instances(tmp_path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text('{"mode":"mock"}', encoding="utf-8")
@@ -151,7 +169,7 @@ def test_manager_persists_and_controls_instances(tmp_path) -> None:
     assert created["running"] is True
     assert created["connected"] is True
     assert created["pid"] == 1000
-    assert manager.next_worker_id() == "copilot-headless-1"
+    assert manager.next_worker_id() == "worker-copilot-1"
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["mode"] == "mock"
     assert saved["headless_copilots"][0]["worker_id"] == "copilot-one"
@@ -196,7 +214,7 @@ def test_headless_copilot_admin_api_crud(tmp_path) -> None:
             listing = client.get("/admin/emullm/copilots").json()
             assert listing["manager_active"] is True
             assert listing["instances"][0]["worker_id"] == "api-servant"
-            assert listing["next_worker_id"] == "copilot-headless-1"
+            assert listing["next_worker_id"] == "worker-copilot-1"
 
             assert client.post("/emullm/admin/copilots/api-servant/stop").status_code == 200
             assert client.post("/admin/emullm/copilots/api-servant/reset-session").status_code == 200
@@ -290,6 +308,51 @@ def test_request_handler_accepts_then_replies_or_rejects(tmp_path) -> None:
         {"type": "reject", "id": "req-2", "reason": "model unavailable"},
     ]
 
+    websocket = FakeWebSocket()
+    asyncio.run(
+        handle_request(
+            websocket,
+            FakeRunner(
+                config,
+                CopilotInvocationError("Copilot SDK returned no assistant message"),
+            ),
+            {"type": "request", "id": "req-not-ready", "prompt": "hello"},
+        )
+    )
+    assert websocket.messages == [
+        {"type": "accept", "id": "req-not-ready"},
+        {
+            "type": "not_ready",
+            "id": "req-not-ready",
+            "reason": "Copilot SDK returned no assistant message",
+            "retry_after": 15,
+        },
+    ]
+
+    websocket = FakeWebSocket()
+    asyncio.run(
+        handle_request(
+            websocket,
+            FakeRunner(
+                runtime_config(tmp_path, capabilities=["!audio_input"]),
+                "should not run",
+            ),
+            {
+                "type": "request",
+                "id": "req-3",
+                "prompt": "listen",
+                "required_capabilities": ["audio_input"],
+            },
+        )
+    )
+    assert websocket.messages == [
+        {
+            "type": "reject",
+            "id": "req-3",
+            "reason": "servant explicitly declines: audio_input",
+        }
+    ]
+
 
 class FakeBridgeProcess:
     def __init__(self, *, hold_requests: bool = False) -> None:
@@ -368,6 +431,66 @@ class _FakeBridgeStdin:
             elif message["type"] == "shutdown":
                 self.process.returncode = 0
                 self.process.done.set()
+
+
+class _AttachmentResponse(BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def test_runner_fetches_cloud_attachment_as_native_sdk_blob(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    process = None
+
+    async def create_process(*args, **kwargs):
+        nonlocal process
+        process = FakeBridgeProcess()
+        return process
+
+    monkeypatch.setattr(copilot_servant.asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        copilot_servant.urllib.request,
+        "urlopen",
+        lambda url, timeout: _AttachmentResponse(b"image-bytes"),
+    )
+
+    async def scenario() -> None:
+        runner = copilot_servant.CopilotRunner(runtime_config(tmp_path))
+        response = await runner.run(
+            {
+                "id": "with-file",
+                "model": "demo/model",
+                "kind": "vision",
+                "prompt": "Describe it.",
+                "attachments": [
+                    {
+                        "name": "photo.png",
+                        "mime_type": "image/png",
+                        "bytes": 11,
+                        "url": "/emullm/cloud/files/file-1",
+                    }
+                ],
+            }
+        )
+        assert response == "answer-with-file"
+        assert process is not None
+        sent = next(message for message in process.messages if message["type"] == "request")
+        assert sent["attachments"] == [
+            {
+                "type": "blob",
+                "data": base64.b64encode(b"image-bytes").decode("ascii"),
+                "mimeType": "image/png",
+                "displayName": "photo.png",
+            }
+        ]
+        await runner.close()
+
+    asyncio.run(scenario())
 
 
 def test_runner_reuses_one_resident_bridge_for_multiple_requests(tmp_path, monkeypatch) -> None:
@@ -664,13 +787,13 @@ def test_next_worker_id_fills_first_available_number(tmp_path) -> None:
         base_dir=tmp_path,
         default_host_ws_url="ws://127.0.0.1:8801",
         definitions=[
-            {"worker_id": "copilot-headless-1", "model": "gpt-5-mini"},
-            {"worker_id": "copilot-headless-3", "model": "gpt-5-mini"},
+            {"worker_id": "worker-copilot-1", "model": "gpt-5-mini"},
+            {"worker_id": "worker-copilot-3", "model": "gpt-5-mini"},
             {"worker_id": "custom-name", "model": "gpt-5-mini"},
         ],
         spawn=lambda _spec: FakeProc(),
     )
-    assert manager.next_worker_id() == "copilot-headless-2"
+    assert manager.next_worker_id() == "worker-copilot-2"
 
 
 def test_spawn_strips_host_agent_session_from_servant_environment(tmp_path, monkeypatch) -> None:
@@ -715,11 +838,11 @@ def test_default_config_includes_random_model_headless_copilot_one() -> None:
     config = json.loads((Path(__file__).parents[1] / "config.json").read_text(encoding="utf-8"))
     instances = config["headless_copilots"]
     assert instances
-    instance = next(item for item in instances if item["worker_id"] == "copilot-headless-1")
-    assert instance["worker_id"] == "copilot-headless-1"
+    instance = next(item for item in instances if item["worker_id"] == "worker-copilot-1")
+    assert instance["worker_id"] == "worker-copilot-1"
     assert uuid.UUID(instance["session_id"])
     assert instance["autostart"] is True
-    assert all(item["warmup"] is True for item in instances)
+    assert instance["warmup"] is True
     assert all(item["warmup_prompt"] for item in instances)
     assert all(item["model_selector"] == "random" for item in instances)
     assert all(item["chunk_long_prompts"] is True for item in instances)
@@ -728,11 +851,11 @@ def test_default_config_includes_random_model_headless_copilot_one() -> None:
     assert instance["modelmasks"] == []
     assert not instance.get("model")
     expected_route = [
-        "copilot-headless-*",
-        "codex-headless-*",
+        "worker-copilot-*",
+        "worker-codex-*",
         "https://llm.a.singularitycompute.com/v1",
     ]
     assert config["model_routes"]
-    assert all(route == expected_route for route in config["model_routes"].values())
+    assert config["model_routes"]["google/gemma-4-31b-it"] == expected_route
     carol = next(agent for agent in config["agents"] if agent["id"] == "carol")
     assert carol["enabled"] is False

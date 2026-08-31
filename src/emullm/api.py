@@ -163,6 +163,7 @@ from starlette.datastructures import UploadFile
 
 from . import copilot_api as _copilot_api
 from . import process_control as _process_control
+from .test_media import test_media_samples
 from . import supervisor as _sup
 
 router = APIRouter()
@@ -321,6 +322,18 @@ class _WorkerRejected(Exception):
         super().__init__(f"worker '{worker_id}' rejected the request: {reason}")
 
 
+class _WorkerNotReady(Exception):
+    """A worker encountered a transient failure and asked to be retried later."""
+
+    def __init__(self, worker_id: str, reason: str, retry_after: float) -> None:
+        self.worker_id = worker_id
+        self.reason = reason
+        self.retry_after = retry_after
+        super().__init__(
+            f"worker '{worker_id}' is not ready for {retry_after:g}s: {reason}"
+        )
+
+
 def _current_modes() -> list[str]:
     """The ordered fallback chain of run modes. ``_SERVER_MODE`` may be a
     single mode, a comma-separated string ("recruit,proxy,mock"), or a list;
@@ -417,6 +430,10 @@ def register_mock_workers(specs: list[dict[str, Any]]) -> list[str]:
             _worker_capabilities[worker_id] = {str(k): bool(v) for k, v in caps.items()}
         role = spec.get("role")
         _worker_roles[worker_id] = str(role) if role else "mock"
+        _worker_kinds[worker_id] = "mock"
+        _worker_descriptions[worker_id] = str(
+            spec.get("description") or f"Configured mock worker {worker_id}."
+        )
         models = spec.get("models")
         if isinstance(models, dict) and models:
             _worker_models[worker_id] = models
@@ -438,6 +455,9 @@ def unregister_mock_workers(worker_ids: list[str]) -> None:
         _worker_roles.pop(worker_id, None)
         _worker_models.pop(worker_id, None)
         _worker_model_masks.pop(worker_id, None)
+        _worker_kinds.pop(worker_id, None)
+        _worker_runtime_models.pop(worker_id, None)
+        _worker_descriptions.pop(worker_id, None)
 
 
 # --- Proxy backends (proxy / proxy-observe modes) --------------------------
@@ -685,10 +705,29 @@ _native_worker_ids: set[str] = set()
 _worker_lock = asyncio.Lock()
 _pending: dict[str, "asyncio.Future[Any]"] = {}
 _pending_models: dict[str, str] = {}
+_worker_not_ready_until: dict[str, float] = {}
 _admin_test_tasks: dict[str, "asyncio.Task[Any]"] = {}
 _active_websockets: dict[str, dict[str, Any]] = {}
 _active_websockets_lock = threading.RLock()
 _worker_connection_ids: dict[str, str] = {}
+_ON_DEMAND_COPILOT_PREFIX = "worker-copilot-"
+_ON_DEMAND_COPILOT_START = 5
+_MAX_ON_DEMAND_COPILOTS = 4
+_on_demand_copilot_lock = threading.RLock()
+
+
+def _on_demand_copilot_ids() -> list[str]:
+    return [
+        f"{_ON_DEMAND_COPILOT_PREFIX}{index}"
+        for index in range(
+            _ON_DEMAND_COPILOT_START,
+            _ON_DEMAND_COPILOT_START + _MAX_ON_DEMAND_COPILOTS,
+        )
+    ]
+
+
+def _is_on_demand_copilot(worker_id: str) -> bool:
+    return worker_id in _on_demand_copilot_ids()
 
 
 def _register_active_websocket(
@@ -766,6 +805,9 @@ def _active_websocket_rows() -> list[dict[str, Any]]:
 # below, so a bare-bones/older worker still gets a sensible default menu
 # without having to declare anything itself.
 _worker_models: dict[str, dict[str, dict[str, Any]]] = {}
+_worker_kinds: dict[str, str] = {}
+_worker_runtime_models: dict[str, str] = {}
+_worker_descriptions: dict[str, str] = {}
 
 # A worker can ALSO opt in, at register time, to "pretending" for the
 # non-text stub surfaces below (embeddings/moderations/images/audio) --
@@ -824,6 +866,7 @@ _PERSONA_SUFFIXES: dict[str, dict[str, Any]] = {
     },
 }
 _DEFAULT_MODEL_ID = f"{_DEFAULT_WORKER_ID}/same"
+_EMULLM_DEFAULT_MODEL_ID = "emullm/default"
 
 
 def _split_model_id(model: str) -> tuple[str, str]:
@@ -867,19 +910,69 @@ def _set_worker_model_masks(worker_id: str, masks: tuple[str, ...] | None) -> No
 def _new_automatic_worker_id() -> str:
     """Create a collision-resistant mailbox-safe identity for an anonymous socket."""
     while True:
-        worker_id = f"servant-{uuid.uuid4().hex[:16]}"
+        worker_id = f"worker-unknown-{uuid.uuid4().hex[:16]}"
         if worker_id not in _connected_workers:
             return worker_id
 
 
-def _worker_candidates_for_model(model: str, resolved_worker_id: str) -> list[str]:
+def _worker_retry_delay(worker_id: str) -> float:
+    retry_at = _worker_not_ready_until.get(worker_id)
+    if retry_at is None:
+        return 0.0
+    if retry_at <= time.monotonic():
+        _worker_not_ready_until.pop(worker_id, None)
+        return 0.0
+    return retry_at - time.monotonic()
+
+
+def _worker_ready_for_offer(worker_id: str) -> bool:
+    return _worker_retry_delay(worker_id) <= 0
+
+
+def _capability_ordered_workers(
+    worker_ids: list[str],
+    required_capabilities: set[str] | None,
+) -> list[str]:
+    """Prefer declared-capable workers, retain unknowns, and skip opt-outs."""
+    worker_ids = [
+        worker_id
+        for worker_id in worker_ids
+        if _worker_ready_for_offer(worker_id)
+    ]
+    if not required_capabilities:
+        return worker_ids
+    capable: list[str] = []
+    unknown: list[str] = []
+    for worker_id in worker_ids:
+        declared = _worker_capabilities.get(worker_id, {})
+        states = [declared.get(capability) for capability in required_capabilities]
+        if any(state is False for state in states):
+            continue
+        if all(state is True for state in states):
+            capable.append(worker_id)
+        else:
+            unknown.append(worker_id)
+    return capable + unknown
+
+
+def _worker_candidates_for_model(
+    model: str,
+    resolved_worker_id: str,
+    required_capabilities: set[str] | None = None,
+) -> list[str]:
     """Return live workers eligible to accept a model offer, in try order."""
     if isinstance(_model_routes.get(model), str):
-        return [resolved_worker_id]  # Explicit operator route always wins.
+        return _capability_ordered_workers(
+            [resolved_worker_id],
+            required_capabilities,
+        )  # Explicit operator route always wins unless temporarily not ready.
 
     requested_worker_id, _ = _split_model_id(model)
     if requested_worker_id != _DEFAULT_WORKER_ID and requested_worker_id in _connected_workers:
-        return [requested_worker_id]  # Preserve explicit named-worker routing.
+        return _capability_ordered_workers(
+            [requested_worker_id],
+            required_capabilities,
+        )  # Preserve explicit named-worker routing.
 
     matching = sorted(
         worker_id
@@ -897,7 +990,10 @@ def _worker_candidates_for_model(model: str, resolved_worker_id: str) -> list[st
         if candidates:
             _, rotated = select_from_catalog(candidates, "round-robin", key=key)
             ordered.extend(rotated)
-    return ordered or [resolved_worker_id]
+    return _capability_ordered_workers(
+        ordered or [resolved_worker_id],
+        required_capabilities,
+    )
 
 
 def _is_known_worker_id(worker_id: str) -> bool:
@@ -981,6 +1077,7 @@ _server_description: str | None = None                    # user-facing server d
 _advertised_base: list[str] = []                          # services.models (manual base)
 _advertised_default: str | None = None                    # services.model (default advertised)
 _advertised_agents: list[dict[str, Any]] = []             # agents flagged to contribute their models
+_model_catalog_overrides: dict[str, dict[str, Any]] = {}  # exported id -> {hidden, patch}
 _model_fetch_cache: dict[str, dict[str, Any]] = {}        # base_url -> {fetched_at, models}
 _MODEL_FETCH_TTL_SECONDS = 86400.0                        # fallback TTL when nothing set
 _DEFAULT_VALIDATION_INTERVAL = "1week"                    # server-level default cadence
@@ -1076,6 +1173,7 @@ def clear_agent_policies() -> None:
     _advertised_base.clear()
     _advertised_default = None
     _advertised_agents.clear()
+    _model_catalog_overrides.clear()
     _validation_interval = _DEFAULT_VALIDATION_INTERVAL
     _validation_interval_override = None
     # note: _model_fetch_cache intentionally NOT cleared -- it's a daily cache
@@ -1097,6 +1195,11 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
     _validation_interval_override = config.get("validation_interval_override")
     if isinstance(config.get("description"), str):
         _server_description = config["description"]
+    model_overrides = config.get("model_catalog_overrides")
+    if isinstance(model_overrides, dict):
+        for model_id, override in model_overrides.items():
+            if isinstance(model_id, str) and isinstance(override, dict):
+                _model_catalog_overrides[model_id] = dict(override)
     services = config.get("services")
     if isinstance(services, dict):
         if isinstance(services.get("models"), list):
@@ -1821,6 +1924,203 @@ def _extract_images(content: Any) -> list[str]:
     return urls
 
 
+_MAX_V1_INLINE_IMAGES = 12
+_MAX_V1_INLINE_IMAGE_BYTES = max(
+    1,
+    int(os.environ.get("EMULLM_V1_INLINE_IMAGE_BYTES", str(25 * 1024 * 1024))),
+)
+_MAX_V1_INLINE_IMAGES_TOTAL_BYTES = max(
+    _MAX_V1_INLINE_IMAGE_BYTES,
+    int(
+        os.environ.get(
+            "EMULLM_V1_INLINE_IMAGES_TOTAL_BYTES",
+            str(50 * 1024 * 1024),
+        )
+    ),
+)
+
+
+def _store_relay_attachment(
+    data: bytes,
+    filename: str,
+    mime_type: str,
+    purpose: str,
+) -> dict[str, Any]:
+    record = _store_cloud_bytes(data, filename, purpose=purpose)
+    return {
+        "file_id": record["id"],
+        "name": record["filename"],
+        "mime_type": mime_type,
+        "bytes": len(data),
+        "url": _cloud_file_url(record["id"]),
+    }
+
+
+def _prepare_inline_image_attachments(
+    image_urls: list[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Persist OpenAI/Anthropic base64 data URLs and return compact worker input."""
+    if len(image_urls) > _MAX_V1_INLINE_IMAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"at most {_MAX_V1_INLINE_IMAGES} inline images are allowed",
+        )
+    normalized_urls: list[str] = []
+    attachments: list[dict[str, Any]] = []
+    total_bytes = 0
+    for index, image_url in enumerate(image_urls, start=1):
+        if not image_url.startswith("data:"):
+            normalized_urls.append(image_url)
+            continue
+        if "," not in image_url:
+            raise HTTPException(status_code=422, detail=f"inline image {index} is malformed")
+        header, encoded = image_url.split(",", 1)
+        parts = header[5:].split(";")
+        mime_type = (parts[0] or "application/octet-stream").strip().lower()
+        if mime_type == "image/jpg":
+            mime_type = "image/jpeg"
+        if not mime_type.startswith("image/") or "base64" not in parts[1:]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"inline image {index} must be a base64 image data URL",
+            )
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=f"inline image {index} is not valid base64",
+            ) from error
+        if not data:
+            raise HTTPException(status_code=422, detail=f"inline image {index} is empty")
+        if len(data) > _MAX_V1_INLINE_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"inline image {index} exceeds the "
+                    f"{_MAX_V1_INLINE_IMAGE_BYTES}-byte limit"
+                ),
+            )
+        total_bytes += len(data)
+        if total_bytes > _MAX_V1_INLINE_IMAGES_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "inline images exceed the "
+                    f"{_MAX_V1_INLINE_IMAGES_TOTAL_BYTES}-byte total limit"
+                ),
+            )
+        filename = f"input-image-{index}{_ext_for_mime(mime_type)}"
+        attachment = _store_relay_attachment(
+            data,
+            filename,
+            mime_type,
+            "vision",
+        )
+        normalized_urls.append(attachment["url"])
+        attachments.append(attachment)
+    return normalized_urls, attachments
+
+
+_V1_AUDIO_FORMATS = {
+    "flac": ("audio/flac", ".flac"),
+    "m4a": ("audio/mp4", ".m4a"),
+    "mp3": ("audio/mpeg", ".mp3"),
+    "ogg": ("audio/ogg", ".ogg"),
+    "wav": ("audio/wav", ".wav"),
+    "webm": ("audio/webm", ".webm"),
+}
+_MAX_V1_INLINE_AUDIO_FILES = 12
+_MAX_V1_INLINE_AUDIO_BYTES = max(
+    1,
+    int(os.environ.get("EMULLM_V1_INLINE_AUDIO_BYTES", str(25 * 1024 * 1024))),
+)
+_MAX_V1_INLINE_AUDIO_TOTAL_BYTES = max(
+    _MAX_V1_INLINE_AUDIO_BYTES,
+    int(
+        os.environ.get(
+            "EMULLM_V1_INLINE_AUDIO_TOTAL_BYTES",
+            str(50 * 1024 * 1024),
+        )
+    ),
+)
+
+
+def _extract_audio_inputs(content: Any) -> list[tuple[str, str]]:
+    """Pull standard OpenAI input_audio base64 payloads from message content."""
+    inputs: list[tuple[str, str]] = []
+    if not isinstance(content, list):
+        return inputs
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "input_audio":
+            continue
+        audio = item.get("input_audio")
+        if not isinstance(audio, dict) or not isinstance(audio.get("data"), str):
+            continue
+        inputs.append((audio["data"], str(audio.get("format") or "").lower()))
+    return inputs
+
+
+def _prepare_inline_audio_attachments(
+    audio_inputs: list[tuple[str, str]],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Persist OpenAI input_audio payloads and return compact worker input."""
+    if len(audio_inputs) > _MAX_V1_INLINE_AUDIO_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"at most {_MAX_V1_INLINE_AUDIO_FILES} inline audio files are allowed",
+        )
+    audio_urls: list[str] = []
+    attachments: list[dict[str, Any]] = []
+    total_bytes = 0
+    for index, (encoded, audio_format) in enumerate(audio_inputs, start=1):
+        format_entry = _V1_AUDIO_FORMATS.get(audio_format)
+        if format_entry is None:
+            supported = ", ".join(sorted(_V1_AUDIO_FORMATS))
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"inline audio {index} format must be one of: {supported}"
+                ),
+            )
+        mime_type, extension = format_entry
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=f"inline audio {index} is not valid base64",
+            ) from error
+        if not data:
+            raise HTTPException(status_code=422, detail=f"inline audio {index} is empty")
+        if len(data) > _MAX_V1_INLINE_AUDIO_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"inline audio {index} exceeds the "
+                    f"{_MAX_V1_INLINE_AUDIO_BYTES}-byte limit"
+                ),
+            )
+        total_bytes += len(data)
+        if total_bytes > _MAX_V1_INLINE_AUDIO_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "inline audio files exceed the "
+                    f"{_MAX_V1_INLINE_AUDIO_TOTAL_BYTES}-byte total limit"
+                ),
+            )
+        attachment = _store_relay_attachment(
+            data,
+            f"input-audio-{index}{extension}",
+            mime_type,
+            "audio",
+        )
+        audio_urls.append(attachment["url"])
+        attachments.append(attachment)
+    return audio_urls, attachments
+
+
 def _flatten_anthropic_content(content: Any) -> str:
     """Like :func:`_flatten_content`, but also descends into Anthropic
     ``tool_result`` blocks (whose ``content`` may itself be a string or a
@@ -1896,19 +2196,381 @@ def _dataurl_to_b64(url: str | None) -> str | None:
 
 
 
+def _copilot_public_model_id(backing_model: str) -> str:
+    return f"copilot/{backing_model}"
+
+
+def _resolved_emullm_default_model() -> str:
+    if _advertised_default and _advertised_default != _EMULLM_DEFAULT_MODEL_ID:
+        return _advertised_default
+    return _DEFAULT_MODEL_ID
+
+
+def _emullm_default_model_entry() -> dict[str, Any]:
+    resolved_model = _resolved_emullm_default_model()
+    route = _model_routes.get(_EMULLM_DEFAULT_MODEL_ID)
+    if route is None:
+        route = _model_routes.get(resolved_model)
+    route_targets = [route] if isinstance(route, str) else list(route or [])
+    return {
+        "id": _EMULLM_DEFAULT_MODEL_ID,
+        "object": "model",
+        "display_name": "EMULLM · Default",
+        "description": (
+            f"Stable alias for the configured default model '{resolved_model}'. "
+            "An explicit route_targets override on emullm/default takes precedence."
+        ),
+        "context_length": 200000,
+        "supported_parameters": ["messages", "temperature", "stream"],
+        "owned_by": "emullm",
+        "connected": bool(_connected_workers),
+        "default": True,
+        "resolved_model": resolved_model,
+        "route_targets": route_targets,
+        "routing_mode": "configured" if route_targets else "default_model",
+        "simulated": True,
+        "input_modalities": {
+            "attachment_transport": {
+                "supported": True,
+                "media_types": ["*/*"],
+                "source": "resolved model route",
+            },
+            "image": {"enabled": True, "status": "resolved_model_dependent"},
+            "audio": {"enabled": True, "status": "resolved_model_dependent"},
+            "general_file": {
+                "enabled": True,
+                "status": "transport_supported",
+                "model_comprehension": "resolved-model-dependent",
+            },
+        },
+    }
+
+
+def _merge_model_patch(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in patch.items():
+        if value is None:
+            merged.pop(key, None)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_model_patch(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _apply_model_catalog_override(
+    entry: dict[str, Any],
+) -> dict[str, Any] | None:
+    model_id = str(entry["id"])
+    override = _model_catalog_overrides.get(model_id)
+    if not isinstance(override, dict):
+        return entry
+    if override.get("hidden") is True:
+        return None
+    patch = override.get("patch")
+    merged = _merge_model_patch(entry, patch) if isinstance(patch, dict) else dict(entry)
+    merged["id"] = model_id
+    return merged
+
+
+def _copilot_model_metadata(backing_model: str) -> dict[str, Any] | None:
+    return next(
+        (
+            model
+            for model in _copilot_api.copilot_models()["models"]
+            if model.get("id") == backing_model
+        ),
+        None,
+    )
+
+
+def _copilot_backing_model(public_model_id: str) -> str | None:
+    prefix = "copilot/"
+    if not public_model_id.startswith(prefix):
+        return None
+    backing_model = public_model_id[len(prefix) :]
+    return backing_model if _copilot_model_metadata(backing_model) is not None else None
+
+
+def _copilot_input_modalities(
+    backing_model: str,
+    metadata: dict[str, Any],
+    active_workers: list[str],
+) -> dict[str, Any]:
+    capabilities = metadata.get("capabilities")
+    limits = capabilities.get("limits") if isinstance(capabilities, dict) else {}
+    vision = limits.get("vision") if isinstance(limits, dict) else {}
+    media_types = (
+        [str(value) for value in vision.get("supported_media_types", [])]
+        if isinstance(vision, dict)
+        else []
+    )
+    audio_media_types = [
+        media_type for media_type in media_types if media_type.startswith("audio/")
+    ]
+    declared_audio = any(
+        _worker_capabilities.get(worker_id, {}).get("audio_input") is True
+        for worker_id in active_workers
+    )
+    if audio_media_types:
+        audio_status = "sdk_advertised"
+        audio_source = "copilot_model_catalog"
+    elif declared_audio:
+        audio_status = "operator_declared"
+        audio_source = "connected_servant capability declaration"
+    elif backing_model.startswith("gemini-"):
+        audio_status = "family_implied"
+        audio_source = "native_model_family; Copilot SDK does not advertise audio"
+    else:
+        audio_status = "not_advertised"
+        audio_source = "Copilot SDK schema has no audio capability field"
+    return {
+        "attachment_transport": {
+            "supported": True,
+            "source": "Copilot SDK blob attachments via EMULLM cloud-file transport",
+            "media_types": ["*/*"],
+        },
+        "image": {
+            "status": "sdk_advertised" if media_types else "not_advertised",
+            "media_types": media_types,
+            "enabled": bool(media_types),
+        },
+        "audio": {
+            "status": audio_status,
+            "source": audio_source,
+            "media_types": audio_media_types,
+            "transport_supported": True,
+            "enabled": audio_status != "not_advertised",
+        },
+        "general_file": {
+            "status": "transport_supported",
+            "model_comprehension": "model-dependent",
+            "enabled": True,
+        },
+    }
+
+
+def _copilot_task_capabilities(
+    backing_model: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = backing_model.lower()
+    code_implied = any(token in normalized for token in ("code", "codex"))
+    capabilities = metadata.get("capabilities")
+    model_type = (
+        capabilities.get("type")
+        if isinstance(capabilities, dict)
+        else None
+    )
+    return {
+        "code": {
+            "enabled": code_implied,
+            "status": "model_name_implied" if code_implied else "not_advertised",
+        },
+        "summarization": {
+            "enabled": model_type in (None, "chat"),
+            "status": "general_chat_capability",
+        },
+    }
+
+
+def _copilot_catalog_model_entry(metadata: dict[str, Any]) -> dict[str, Any]:
+    backing_model = str(metadata["id"])
+    public_model_id = _copilot_public_model_id(backing_model)
+    route = _model_routes.get(public_model_id)
+    route_targets = [route] if isinstance(route, str) else list(route or [])
+    active_workers = sorted(
+        worker_id
+        for worker_id, runtime_model in _worker_runtime_models.items()
+        if runtime_model == backing_model and worker_id in _connected_workers
+    )
+    capabilities = metadata.get("capabilities")
+    limits = capabilities.get("limits") if isinstance(capabilities, dict) else {}
+    return {
+        "id": public_model_id,
+        "object": "model",
+        "display_name": f"GitHub Copilot · {metadata.get('name') or backing_model}",
+        "description": (
+            f"Authenticated GitHub Copilot backing model '{backing_model}'. "
+            f"Requesting this ID lazily starts or reuses one of "
+            f"{_MAX_ON_DEMAND_COPILOTS} workers "
+            f"({_ON_DEMAND_COPILOT_PREFIX}{_ON_DEMAND_COPILOT_START}.."
+            f"{_ON_DEMAND_COPILOT_START + _MAX_ON_DEMAND_COPILOTS - 1})."
+        ),
+        "context_length": (
+            limits.get("max_context_window_tokens", 200000)
+            if isinstance(limits, dict)
+            else 200000
+        ),
+        "supported_parameters": ["messages", "temperature", "stream"],
+        "owned_by": "github-copilot",
+        "provider": "github-copilot",
+        "backing_model": backing_model,
+        "connected": bool(active_workers),
+        "active_workers": active_workers,
+        "route_targets": route_targets,
+        "routing_mode": "configured" if route_targets else "on_demand",
+        "on_demand": True,
+        "on_demand_worker_prefix": _ON_DEMAND_COPILOT_PREFIX,
+        "on_demand_worker_start": _ON_DEMAND_COPILOT_START,
+        "on_demand_worker_limit": _MAX_ON_DEMAND_COPILOTS,
+        "simulated": False,
+        "capabilities": capabilities or {},
+        "billing": metadata.get("billing", {}),
+        "policy": metadata.get("policy", {}),
+        "quality_rank": metadata.get("quality_rank"),
+        "quality_tier": metadata.get("quality_tier"),
+        "input_modalities": _copilot_input_modalities(
+            backing_model,
+            metadata,
+            active_workers,
+        ),
+        "task_capabilities": _copilot_task_capabilities(
+            backing_model,
+            metadata,
+        ),
+    }
+
+
 def _model_entry(worker_id: str, suffix: str, persona: dict[str, Any]) -> dict[str, Any]:
     model_id = f"{worker_id}/{suffix}"
+    worker_kind = _worker_kinds.get(worker_id)
+    runtime_model = _worker_runtime_models.get(worker_id)
+    worker_description = _worker_descriptions.get(worker_id)
+    worker_label = worker_id
+    if worker_kind:
+        worker_label += f" · {worker_kind}"
+    if runtime_model:
+        worker_label += f" ({runtime_model})"
+    persona_name = str(persona.get("display_name") or suffix)
+    description_parts = [
+        value
+        for value in (
+            worker_description,
+            f"Stable worker ID: {worker_id}.",
+            f"Backing model: {runtime_model}." if runtime_model else None,
+            str(persona.get("instruction") or "") or None,
+        )
+        if value
+    ]
     return {
         "id": model_id,
         "object": "model",
-        "display_name": f"{worker_id} {persona['display_name']}",
+        "display_name": f"{worker_label} · {persona_name}",
+        "description": " ".join(description_parts),
         "context_length": 200000,
         "supported_parameters": [],
         "owned_by": worker_id,
         "connected": worker_id in _connected_workers,
+        "worker_id": worker_id,
+        "worker_kind": worker_kind,
+        "backing_model": runtime_model,
+        "simulated": True,
     }
 
 
+def _active_workers_for_route(
+    route: str | list[str] | None,
+    model_id: str | None = None,
+) -> list[str]:
+    targets = [route] if isinstance(route, str) else (route or [])
+    active: list[str] = []
+    for target in targets:
+        if target.startswith(("http://", "https://", "backend-")):
+            continue
+        if target == "worker-in-name" and model_id:
+            worker_id, _ = _split_model_id(model_id)
+            if worker_id in _connected_workers and worker_id not in active:
+                active.append(worker_id)
+            continue
+        for worker_id in sorted(_connected_workers):
+            if fnmatchcase(worker_id, target) and worker_id not in active:
+                active.append(worker_id)
+    return active
+
+
+def _configured_model_entry(model_id: str) -> dict[str, Any]:
+    route = _model_routes.get(model_id)
+    targets = [route] if isinstance(route, str) else list(route or [])
+    active_workers = _active_workers_for_route(route, model_id)
+    backing_models = {
+        worker_id: _worker_runtime_models.get(worker_id)
+        for worker_id in active_workers
+        if _worker_runtime_models.get(worker_id)
+    }
+    return {
+        "id": model_id,
+        "object": "model",
+        "display_name": f"{model_id} · simulated by EMULLM",
+        "description": (
+            "Configured simulated model. "
+            + (
+                f"Ordered route: {' -> '.join(targets)}."
+                if targets
+                else "Uses the default EMULLM worker-selection policy."
+            )
+        ),
+        "context_length": 200000,
+        "supported_parameters": ["messages", "temperature", "stream"],
+        "owned_by": "emullm",
+        "connected": bool(
+            active_workers
+            or any(target.startswith(("http://", "https://")) for target in targets)
+        ),
+        "simulated": True,
+        "route_targets": targets,
+        "active_workers": active_workers,
+        "backing_models": backing_models,
+    }
+
+
+def _backing_model_alias_entry(worker_id: str) -> dict[str, Any] | None:
+    backing_model = _worker_runtime_models.get(worker_id)
+    if not backing_model:
+        return None
+    metadata = next(
+        (
+            model
+            for model in _copilot_api.copilot_models()["models"]
+            if model.get("id") == backing_model
+        ),
+        {},
+    )
+    alias_id = f"{worker_id}/{backing_model}"
+    worker_kind = _worker_kinds.get(worker_id) or "worker"
+    return {
+        "id": alias_id,
+        "object": "model",
+        "display_name": (
+            f"{worker_id} · {worker_kind} backed by "
+            f"{metadata.get('name') or backing_model} ({backing_model})"
+        ),
+        "description": (
+            f"Direct alias for stable worker '{worker_id}' using its active "
+            f"backing model '{backing_model}'."
+        ),
+        "context_length": (
+            metadata.get("capabilities", {})
+            .get("limits", {})
+            .get("max_context_window_tokens", 200000)
+        ),
+        "supported_parameters": ["messages", "temperature", "stream"],
+        "owned_by": worker_id,
+        "connected": worker_id in _connected_workers,
+        "worker_id": worker_id,
+        "worker_kind": worker_kind,
+        "backing_model": backing_model,
+        "simulated": True,
+        "capabilities": metadata.get("capabilities", {}),
+        "billing": metadata.get("billing", {}),
+        "quality_rank": metadata.get("quality_rank"),
+        "quality_tier": metadata.get("quality_tier"),
+        "input_modalities": _copilot_input_modalities(
+            backing_model,
+            metadata,
+            [worker_id],
+        ),
+    }
 class ChatMessage(BaseModel):
     role: str
     content: Any = ""
@@ -1917,6 +2579,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     model: str = _DEFAULT_MODEL_ID
     messages: list[ChatMessage] = Field(default_factory=list)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=32)
     temperature: float | None = Field(default=None, ge=0, le=2)
     stream: bool = False
 
@@ -2055,16 +2718,75 @@ def _route_backend(target: str) -> dict[str, Any]:
     }
 
 
-def _route_worker_candidates(model: str, target: str) -> list[str]:
+def _route_backend_candidates(target: str) -> list[dict[str, Any]]:
+    if not target.startswith("backend-"):
+        return []
+    pattern = target[len("backend-") :]
+    matches = [
+        backend
+        for backend in _all_backends()
+        if fnmatchcase(str(backend.get("name") or ""), pattern)
+    ]
+    if len(matches) < 2:
+        return matches
+    names = [str(backend.get("name") or "") for backend in matches]
+    _, rotated_names = select_from_catalog(
+        names,
+        "round-robin",
+        key=f"backend-route:{target}",
+    )
+    by_name = {
+        str(backend.get("name") or ""): backend
+        for backend in matches
+    }
+    return [by_name[name] for name in rotated_names]
+
+
+def _required_input_capabilities(extra: dict[str, Any] | None) -> set[str]:
+    required: set[str] = set()
+    explicit = extra.get("required_capabilities") if extra else None
+    if isinstance(explicit, list):
+        required.update(
+            capability
+            for capability in explicit
+            if isinstance(capability, str) and capability
+        )
+    if extra and extra.get("images"):
+        required.add("vision_input")
+    if extra and extra.get("audio"):
+        required.add("audio_input")
+    return required
+
+
+def _route_worker_candidates(
+    model: str,
+    target: str,
+    required_capabilities: set[str] | None = None,
+) -> list[str]:
+    if target == "worker-in-name":
+        worker_id, _ = _split_model_id(model)
+        if worker_id not in _connected_workers:
+            return []
+        return _capability_ordered_workers(
+            [worker_id],
+            required_capabilities,
+        )
+    requested_backing = _copilot_backing_model(model)
     matches = sorted(
-        worker_id for worker_id in _connected_workers if fnmatchcase(worker_id, target)
+        worker_id
+        for worker_id in _connected_workers
+        if fnmatchcase(worker_id, target)
+        if _worker_ready_for_offer(worker_id)
+        if not _is_on_demand_copilot(worker_id)
+        or requested_backing is None
+        or _worker_runtime_models.get(worker_id) == requested_backing
     )
     if not matches:
         return []
     _, rotated = select_from_catalog(
         matches, "round-robin", key=f"model-route:{model}:{target}"
     )
-    return rotated
+    return _capability_ordered_workers(rotated, required_capabilities)
 
 
 async def _relay_model_route_chain(
@@ -2075,8 +2797,35 @@ async def _relay_model_route_chain(
 ) -> Any:
     """Try worker-ID globs and OpenAI-compatible backend URLs in order."""
     instruction = f"You are serving model id '{model}'. Emulate that model faithfully."
+    required_capabilities = _required_input_capabilities(extra)
     failures: list[str] = []
+    retry_delays: list[float] = []
     for target in targets:
+        if target.startswith("backend-"):
+            backend_candidates = _route_backend_candidates(target)
+            if not backend_candidates:
+                failures.append(f"{target}: no configured backend matched")
+                continue
+            for backend in backend_candidates:
+                backend_name = str(backend.get("name") or target)
+                try:
+                    reply = await _proxy_chat(
+                        backend,
+                        model,
+                        prompt_text,
+                        instruction,
+                    )
+                except HTTPException as error:
+                    failures.append(f"backend-{backend_name}: {error.detail}")
+                    continue
+                await _mirror_to_observers(
+                    f"backend-{backend_name}",
+                    model,
+                    prompt_text,
+                    reply,
+                )
+                return reply
+            continue
         if target.startswith(("http://", "https://")):
             try:
                 reply = await _proxy_chat(_route_backend(target), model, prompt_text, instruction)
@@ -2086,7 +2835,7 @@ async def _relay_model_route_chain(
             await _mirror_to_observers(target, model, prompt_text, reply)
             return reply
 
-        candidates = _route_worker_candidates(model, target)
+        candidates = _route_worker_candidates(model, target, required_capabilities)
         if not candidates:
             failures.append(f"{target}: no connected worker matched")
             continue
@@ -2101,6 +2850,12 @@ async def _relay_model_route_chain(
                     wait=False,
                     extra=extra,
                 )
+            except _WorkerNotReady as error:
+                retry_delays.append(error.retry_after)
+                failures.append(
+                    f"{worker_id}: not ready for {error.retry_after:g}s ({error.reason})"
+                )
+                continue
             except _WorkerRejected as error:
                 failures.append(f"{worker_id}: {error.reason}")
                 continue
@@ -2117,12 +2872,186 @@ async def _relay_model_route_chain(
     raise HTTPException(
         status_code=503,
         detail=f"all configured routes failed for model '{model}' ({detail})",
+        headers=(
+            {"Retry-After": str(max(1, round(min(retry_delays))))}
+            if retry_delays
+            else None
+        ),
     )
 
 
 def _token_count(value: Any) -> int:
     text = _flatten_content(value)
     return len(text.split()) if text else 0
+
+
+def _on_demand_copilot_capabilities(model_entry: dict[str, Any]) -> list[str]:
+    modalities = model_entry.get("input_modalities")
+    if not isinstance(modalities, dict):
+        return []
+    configured: list[str] = []
+    for modality, capability in (
+        ("image", "vision_input"),
+        ("audio", "audio_input"),
+        ("general_file", "file_input"),
+    ):
+        value = modalities.get(modality)
+        if not isinstance(value, dict) or not isinstance(value.get("enabled"), bool):
+            continue
+        configured.append(capability if value["enabled"] else f"!{capability}")
+    tasks = model_entry.get("task_capabilities")
+    if isinstance(tasks, dict):
+        for capability, value in tasks.items():
+            if not isinstance(value, dict) or not isinstance(value.get("enabled"), bool):
+                continue
+            configured.append(
+                str(capability)
+                if value["enabled"]
+                else f"!{capability}"
+            )
+    return configured
+
+
+def _new_on_demand_copilot_config(
+    worker_id: str,
+    backing_model: str,
+    model_entry: dict[str, Any],
+) -> _copilot_api.HeadlessCopilotConfig:
+    return _copilot_api.HeadlessCopilotConfig(
+        worker_id=worker_id,
+        model=backing_model,
+        modelmasks=[_copilot_public_model_id(backing_model)],
+        role="on-demand-copilot",
+        capabilities=_on_demand_copilot_capabilities(model_entry),
+        autostart=False,
+        warmup=False,
+    )
+
+
+def _provision_on_demand_copilot(
+    backing_model: str,
+    model_entry: dict[str, Any],
+) -> tuple[str, Any]:
+    if model_entry.get("on_demand") is False:
+        raise HTTPException(
+            status_code=409,
+            detail=f"on-demand loading is disabled for '{model_entry['id']}'",
+        )
+    manager = _copilot_api.get_manager()
+    if manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="headless Copilot manager is unavailable",
+        )
+    with _on_demand_copilot_lock:
+        instances = manager.list()
+        dynamic = {
+            str(instance["worker_id"]): instance
+            for instance in instances
+            if _is_on_demand_copilot(str(instance.get("worker_id") or ""))
+        }
+        matching = next(
+            (
+                instance
+                for instance in dynamic.values()
+                if (instance.get("config") or {}).get("model") == backing_model
+            ),
+            None,
+        )
+        if matching is not None:
+            worker_id = str(matching["worker_id"])
+            if not matching.get("running"):
+                manager.start(worker_id)
+            return worker_id, manager
+
+        for worker_id in _on_demand_copilot_ids():
+            if worker_id in dynamic:
+                continue
+            manager.create(
+                _new_on_demand_copilot_config(
+                    worker_id,
+                    backing_model,
+                    model_entry,
+                ),
+                start=True,
+            )
+            return worker_id, manager
+
+        reusable = next(
+            (
+                instance
+                for instance in sorted(
+                    dynamic.values(),
+                    key=lambda item: str(item.get("worker_id") or ""),
+                )
+                if not instance.get("running")
+            ),
+            None,
+        )
+        if reusable is not None:
+            worker_id = str(reusable["worker_id"])
+            manager.update(
+                worker_id,
+                _new_on_demand_copilot_config(
+                    worker_id,
+                    backing_model,
+                    model_entry,
+                ),
+                restart=False,
+            )
+            manager.start(worker_id)
+            return worker_id, manager
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            f"all {_MAX_ON_DEMAND_COPILOTS} on-demand Copilot workers are busy; "
+            "stop one in the admin UI before loading another model"
+        ),
+    )
+
+
+async def _ensure_on_demand_copilot(
+    public_model_id: str,
+    backing_model: str,
+) -> str:
+    metadata = _copilot_model_metadata(backing_model)
+    if metadata is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown Copilot backing model '{backing_model}'",
+        )
+    entry = _apply_model_catalog_override(
+        _copilot_catalog_model_entry(metadata)
+    )
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"model '{public_model_id}' is hidden",
+        )
+    worker_id, manager = await asyncio.to_thread(
+        _provision_on_demand_copilot,
+        backing_model,
+        entry,
+    )
+    deadline = time.monotonic() + min(90.0, _REQUEST_TIMEOUT_SECONDS)
+    while time.monotonic() < deadline:
+        instance = await asyncio.to_thread(manager.get, worker_id)
+        if instance.get("connected"):
+            return worker_id
+        if not instance.get("running") and instance.get("returncode") is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"on-demand worker '{worker_id}' exited with "
+                    f"code {instance['returncode']}"
+                ),
+            )
+        await asyncio.sleep(0.2)
+    raise HTTPException(
+        status_code=504,
+        detail=f"on-demand worker '{worker_id}' did not connect in time",
+    )
 
 
 async def _relay_full(
@@ -2132,7 +3061,9 @@ async def _relay_full(
     images: list[str] | None = None,
     audio: str | None = None,
     files: dict[str, Any] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
     kind: str | None = None,
+    required_capabilities: set[str] | None = None,
 ) -> Any:
     """Forward prompt_text (and optionally real media -- ``images`` for a
     vision/image job, ``audio`` for a speech/transcription job, ``files`` for a
@@ -2162,24 +3093,108 @@ async def _relay_full(
         extra["audio"] = audio
     if files:
         extra["files"] = files
+    if attachments:
+        extra["attachments"] = attachments
     if kind:
         extra["kind"] = kind
+    if required_capabilities:
+        extra["required_capabilities"] = sorted(required_capabilities)
+    resolved_capabilities = _required_input_capabilities(extra)
+    if resolved_capabilities:
+        extra["required_capabilities"] = sorted(resolved_capabilities)
 
     configured_route = _model_routes.get(model)
     if isinstance(configured_route, list):
-        return await _relay_model_route_chain(model, configured_route, prompt_text, extra or None)
+        return await _relay_model_route_chain(
+            model,
+            configured_route,
+            prompt_text,
+            extra or None,
+        )
+
+    if model == _EMULLM_DEFAULT_MODEL_ID and configured_route is None:
+        return await _relay_full(
+            _resolved_emullm_default_model(),
+            prompt_text,
+            images=images,
+            audio=audio,
+            files=files,
+            attachments=attachments,
+            kind=kind,
+            required_capabilities=resolved_capabilities,
+        )
+
+    if configured_route is None and (
+        backing_model := _copilot_backing_model(model)
+    ):
+        worker_id = await _ensure_on_demand_copilot(model, backing_model)
+        retry_delay = _worker_retry_delay(worker_id)
+        if retry_delay > 0:
+            raise HTTPException(
+                status_code=503,
+                detail=f"on-demand worker '{worker_id}' is temporarily not ready",
+                headers={"Retry-After": str(max(1, round(retry_delay)))},
+            )
+        _check_and_record_usage(worker_id)
+        try:
+            result = await _relay_to_worker(
+                worker_id,
+                model,
+                prompt_text,
+                (
+                    f"You are the GitHub Copilot backing model '{backing_model}'. "
+                    "Answer directly at your native capability."
+                ),
+                wait=True,
+                extra=extra or None,
+            )
+        except _WorkerNotReady as error:
+            retry_after = max(1, round(error.retry_after))
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"on-demand worker '{worker_id}' is temporarily not ready: "
+                    f"{error.reason}"
+                ),
+                headers={"Retry-After": str(retry_after)},
+            ) from error
+        except _WorkerRejected as error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"on-demand worker '{worker_id}' rejected the request: {error.reason}",
+            ) from error
+        if result is _PASS:
+            raise HTTPException(
+                status_code=503,
+                detail=f"on-demand worker '{worker_id}' disconnected before accepting",
+            )
+        await _mirror_to_observers(
+            worker_id,
+            model,
+            prompt_text,
+            _reply_content(result),
+        )
+        return result
 
     resolved_worker_id, _, persona = _require_model(model)
-    worker_ids = _worker_candidates_for_model(model, resolved_worker_id)
+    worker_ids = _worker_candidates_for_model(
+        model,
+        resolved_worker_id,
+        resolved_capabilities,
+    )
     instruction = persona.get("instruction")
 
     modes = _current_modes()
     rejections: list[_WorkerRejected] = []
+    not_ready: list[_WorkerNotReady] = []
     for worker_id in worker_ids:
         _check_and_record_usage(worker_id)
         for mode in modes:
             try:
                 result = await _relay_step(mode, worker_id, model, prompt_text, instruction, extra or None)
+            except _WorkerNotReady as deferred:
+                not_ready.append(deferred)
+                break
             except _WorkerRejected as rejection:
                 rejections.append(rejection)
                 break
@@ -2191,9 +3206,28 @@ async def _relay_full(
         # A rejection is an explicit refusal, so offer the request to the next
         # matching/all-model worker instead of manufacturing a reply.
         continue
-    if rejections:
-        reasons = "; ".join(f"{item.worker_id}: {item.reason}" for item in rejections)
-        raise HTTPException(status_code=503, detail=f"all eligible workers rejected model '{model}' ({reasons})")
+    if rejections or not_ready:
+        reasons = "; ".join(
+            [
+                *(f"{item.worker_id}: rejected ({item.reason})" for item in rejections),
+                *(
+                    f"{item.worker_id}: not ready for {item.retry_after:g}s ({item.reason})"
+                    for item in not_ready
+                ),
+            ]
+        )
+        headers = None
+        if not_ready:
+            headers = {
+                "Retry-After": str(
+                    max(1, round(min(item.retry_after for item in not_ready)))
+                )
+            }
+        raise HTTPException(
+            status_code=503,
+            detail=f"no eligible worker completed model '{model}' ({reasons})",
+            headers=headers,
+        )
     # Every step passed (e.g. `recruit` with nobody connected and no fallback).
     raise HTTPException(
         status_code=504,
@@ -2366,21 +3400,113 @@ def list_models() -> dict[str, Any]:
     worker, plus the default worker_id's fallback menu even if it isn't
     connected right now (so the primary identity is always discoverable)."""
     worker_ids = sorted(set(_connected_workers) | {_DEFAULT_WORKER_ID})
-    data = [
+    worker_data = [
         _model_entry(worker_id, suffix, persona)
         for worker_id in worker_ids
         for suffix, persona in _models_for(worker_id).items()
     ]
+    backing_aliases = [
+        alias
+        for worker_id in sorted(_connected_workers)
+        if (alias := _backing_model_alias_entry(worker_id)) is not None
+    ]
+    seen = {entry["id"] for entry in [*worker_data, *backing_aliases]}
+    seen.add(_EMULLM_DEFAULT_MODEL_ID)
+    configured_ids = [
+        model_id
+        for model_id in [*advertised_catalog()["models"], *_model_routes.keys()]
+        if model_id and model_id not in seen and not seen.add(model_id)
+    ]
+    configured_data = [
+        _configured_model_entry(model_id) for model_id in configured_ids
+    ]
+    seen.update(entry["id"] for entry in configured_data)
+    copilot_data = [
+        _copilot_catalog_model_entry(metadata)
+        for metadata in _copilot_api.copilot_models()["models"]
+        if _copilot_public_model_id(str(metadata["id"])) not in seen
+    ]
+    base_data = [
+        _emullm_default_model_entry(),
+        *worker_data,
+        *backing_aliases,
+        *configured_data,
+        *copilot_data,
+    ]
+    data = [
+        configured
+        for entry in base_data
+        if (configured := _apply_model_catalog_override(entry)) is not None
+    ]
+    base_ids = {entry["id"] for entry in base_data}
+    for model_id, override in _model_catalog_overrides.items():
+        if model_id in base_ids or override.get("hidden") is True:
+            continue
+        patch = override.get("patch")
+        if not isinstance(patch, dict):
+            continue
+        custom = _apply_model_catalog_override(
+            {
+                "id": model_id,
+                "object": "model",
+                "owned_by": "emullm-operator",
+                "connected": False,
+                "simulated": True,
+            }
+        )
+        if custom is not None:
+            data.append(custom)
     return {"object": "list", "data": data}
 
 
 @router.get("/v1/models/{model_id:path}")
 def get_model(model_id: str) -> dict[str, Any]:
+    if model_id == _EMULLM_DEFAULT_MODEL_ID:
+        entry = _apply_model_catalog_override(_emullm_default_model_entry())
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
+        return entry
+    if model_id in _model_routes or model_id in advertised_catalog()["models"]:
+        entry = _apply_model_catalog_override(_configured_model_entry(model_id))
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
+        return entry
+    if backing_model := _copilot_backing_model(model_id):
+        metadata = _copilot_model_metadata(backing_model)
+        if metadata is not None:
+            entry = _apply_model_catalog_override(
+                _copilot_catalog_model_entry(metadata)
+            )
+            if entry is None:
+                raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
+            return entry
     worker_id, suffix = _split_model_id(model_id)
+    if suffix == _worker_runtime_models.get(worker_id):
+        alias = _backing_model_alias_entry(worker_id)
+        if alias is not None:
+            return alias
     persona = _models_for(worker_id).get(suffix)
     if persona is None:
+        override = _model_catalog_overrides.get(model_id)
+        if isinstance(override, dict) and isinstance(override.get("patch"), dict):
+            entry = _apply_model_catalog_override(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "owned_by": "emullm-operator",
+                    "connected": False,
+                    "simulated": True,
+                }
+            )
+            if entry is not None:
+                return entry
         raise HTTPException(status_code=404, detail=f"unknown model '{model_id}'")
-    return _model_entry(worker_id, suffix, persona)
+    entry = _apply_model_catalog_override(
+        _model_entry(worker_id, suffix, persona)
+    )
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
+    return entry
 
 
 @router.get("/emullm/caps/{worker_id}")
@@ -2396,6 +3522,9 @@ def worker_caps(worker_id: str) -> dict[str, Any]:
         "models": sorted(_models_for(worker_id).keys()),
         "capabilities": _worker_capabilities.get(worker_id, {}),
         "modelmasks": list(_worker_model_masks[worker_id]) if worker_id in _worker_model_masks else None,
+        "worker_kind": _worker_kinds.get(worker_id),
+        "backing_model": _worker_runtime_models.get(worker_id),
+        "description": _worker_descriptions.get(worker_id),
     }
 
 
@@ -2596,9 +3725,33 @@ async def chat_completions(body: ChatRequest) -> Any:
         raise HTTPException(status_code=400, detail="messages is required")
     prompt_text = "\n\n".join(f"[{m.role}] {_flatten_content(m.content)}" for m in body.messages)
     images: list[str] = []
+    audio_inputs: list[tuple[str, str]] = []
     for m in body.messages:
         images.extend(_extract_images(m.content))
-    result = await _relay_full(body.model, prompt_text, images=images or None, kind="vision" if images else "chat")
+        audio_inputs.extend(_extract_audio_inputs(m.content))
+    images, image_attachments = _prepare_inline_image_attachments(images)
+    audio_urls, audio_attachments = _prepare_inline_audio_attachments(audio_inputs)
+    if images and audio_urls:
+        request_kind = "multimodal"
+    elif images:
+        request_kind = "vision"
+    elif audio_urls:
+        request_kind = "audio_attachment"
+    else:
+        request_kind = "chat"
+    result = await _relay_full(
+        body.model,
+        prompt_text,
+        images=images or None,
+        audio=audio_urls[0] if audio_urls else None,
+        attachments=[*image_attachments, *audio_attachments] or None,
+        kind=request_kind,
+        required_capabilities={
+            capability.strip()
+            for capability in body.required_capabilities
+            if capability.strip()
+        },
+    )
     reply_text = _reply_content(result)
     completion_id = _new_resource_id("chatcmpl")
     created = int(time.time())
@@ -2675,7 +3828,14 @@ async def anthropic_messages(body: MessagesRequest) -> Any:
         images.extend(_extract_anthropic_images(m.content))
         images.extend(_extract_images(m.content))  # tolerate OpenAI-style blocks too
     prompt_text = "\n\n".join(parts)
-    result = await _relay_full(body.model, prompt_text, images=images or None, kind="vision" if images else "chat")
+    images, image_attachments = _prepare_inline_image_attachments(images)
+    result = await _relay_full(
+        body.model,
+        prompt_text,
+        images=images or None,
+        attachments=image_attachments or None,
+        kind="vision" if images else "chat",
+    )
     reply_text = _reply_content(result)
     message_id = _new_resource_id("msg")
     usage = {
@@ -3887,6 +5047,37 @@ def _record_relay_rejection(worker_id: str, request_id: str, reason: str, model:
     )
 
 
+def _record_relay_not_ready(
+    worker_id: str,
+    request_id: str,
+    reason: str,
+    retry_after: float,
+    model: str | None = None,
+) -> None:
+    data = {
+        "text": reason,
+        "reason": reason,
+        "retry_after": retry_after,
+        "retry_at": time.time() + retry_after,
+        "model": model,
+        "worker_id": worker_id,
+        "from": worker_id,
+        "to": _LLM_USER_ID,
+        "send_to": None,
+        "direction": "worker->LLM_USER",
+    }
+    for stream in (worker_id, _LLM_USER_MAILBOX):
+        _append_mailbox_event(
+            stream,
+            "LLM_NOT_READY",
+            data,
+            source_id=worker_id,
+            source_kind="worker",
+            correlation_id=request_id,
+            idempotency_key=f"not-ready:{request_id}",
+        )
+
+
 def _record_worker_connection(worker_id: str, model_masks: tuple[str, ...] | None) -> None:
     _append_mailbox_event(
         worker_id,
@@ -5015,10 +6206,21 @@ _MIME_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
 
 
 def _ext_for_mime(mime: str | None) -> str:
-    return _MIME_EXT.get((mime or "").split(";", 1)[0].strip(), ".bin")
+    normalized = (mime or "").split(";", 1)[0].strip().lower()
+    return _MIME_EXT.get(normalized) or mimetypes.guess_extension(normalized) or ".bin"
 
 
-def _store_cloud_bytes(data: bytes, filename: str, purpose: str = "output") -> dict[str, Any]:
+def _anonymous_attachment_name(index: int) -> str:
+    return f"attachment-{index}"
+
+
+def _store_cloud_bytes(
+    data: bytes,
+    filename: str,
+    purpose: str = "output",
+    *,
+    mime_type: str | None = None,
+) -> dict[str, Any]:
     """Persist bytes into the shared cloud files store; return the file record.
     The blob is then retrievable at :func:`_cloud_file_url` by relay or worker."""
     file_id = _new_resource_id("file")
@@ -5030,6 +6232,7 @@ def _store_cloud_bytes(data: bytes, filename: str, purpose: str = "output") -> d
         "bytes": len(data),
         "created_at": int(time.time()),
         "filename": _safe_filename(filename),
+        "mime_type": mime_type,
         "purpose": purpose,
         "status": "processed",
     }
@@ -5059,7 +6262,11 @@ def _serve_cloud_file(file_id: str) -> FileResponse:
     content_path = _files_store.content_path(file_id)
     if not content_path.is_file():
         raise HTTPException(status_code=404, detail=f"No content stored for file: {file_id}")
-    media_type = mimetypes.guess_type(str(record.get("filename", "")))[0] or "application/octet-stream"
+    media_type = (
+        str(record.get("mime_type") or "").strip()
+        or mimetypes.guess_type(str(record.get("filename", "")))[0]
+        or "application/octet-stream"
+    )
     return FileResponse(
         path=content_path,
         media_type=media_type,
@@ -5457,6 +6664,9 @@ def admin_state() -> dict[str, Any]:
         "runtime_dir": str(_RUNTIME_DIR),
         "connected_worker_ids": sorted(_connected_workers.keys()),
         "worker_models": {worker_id: sorted(models.keys()) for worker_id, models in _worker_models.items()},
+        "worker_kinds": dict(_worker_kinds),
+        "worker_runtime_models": dict(_worker_runtime_models),
+        "worker_descriptions": dict(_worker_descriptions),
         "worker_capabilities": dict(_worker_capabilities),
         "worker_model_masks": {
             worker_id: list(_worker_model_masks[worker_id]) if worker_id in _worker_model_masks else None
@@ -5475,6 +6685,11 @@ def admin_state() -> dict[str, Any]:
                 "last_used_at": usage.get("last_used_at"),
             }
             for worker_id, usage in _worker_usage.items()
+        },
+        "worker_not_ready": {
+            worker_id: {"retry_after": round(delay, 3)}
+            for worker_id in list(_worker_not_ready_until)
+            if (delay := _worker_retry_delay(worker_id)) > 0
         },
         "pending_request_ids": sorted(_pending.keys()),
         "active_test_request_ids": sorted(_admin_test_tasks.keys()),
@@ -5601,7 +6816,7 @@ function roleBadge(role) {
   return '<span class="role' + cls + '">' + role + '</span>';
 }
 function fmtTime(t) { return t ? new Date(t * 1000).toLocaleTimeString() : '--'; }
-function esc(x) { return String(x).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(x) { return String(x).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // Header/toggle reflect which view we're in.
 document.getElementById('view-tag').textContent = DETAIL ? '(detailed)' : '(overview)';
@@ -5881,6 +7096,12 @@ class ServicesConfig(BaseModel):
     models: list[str | dict[str, Any]] | None = None  # ids or nodes (with validation results)
 
 
+class ModelCatalogOverrideConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    hidden: bool = False
+    patch: dict[str, Any] = Field(default_factory=dict)
+
+
 class EmullmConfig(BaseModel):
     """The full config.json schema. Every field is optional (omit to fall
     back to the matching env var / default); unknown top-level keys are
@@ -5896,6 +7117,7 @@ class EmullmConfig(BaseModel):
     subagent_launch: str | list[str] | None = None
     subagent_model: str | None = None  # default AI model for spawned Copilot workers
     model_routes: dict[str, str | list[str]] | None = None  # model id -> worker or ordered targets
+    model_catalog_overrides: dict[str, ModelCatalogOverrideConfig] | None = None
     capability_fallback: Literal["stub", "wait", "error"] | None = None
     validation_interval_default: str | int | float | None = None  # inherited default cadence
     validation_interval_override: str | int | float | None = None  # forces cadence on ALL agents
@@ -5919,6 +7141,15 @@ class ConfigSectionRequest(BaseModel):
     delete: bool = False
 
 
+class AdminModelConfigRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=300)
+    hidden: bool = False
+    patch: dict[str, Any] = Field(default_factory=dict)
+    set_route: bool = False
+    route: str | list[str] | None = None
+    reset: bool = False
+
+
 class AgentEnabledRequest(BaseModel):
     enabled: bool
 
@@ -5931,6 +7162,35 @@ class AdminTestChatRequest(BaseModel):
     )
     model: str = Field(min_length=1, max_length=300)
     prompt: str = Field(min_length=1, max_length=100_000)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=32)
+    attachments: list["AdminTestAttachment"] = Field(default_factory=list, max_length=12)
+
+
+class AdminTestAttachment(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    mime_type: str = Field(default="application/octet-stream", max_length=255)
+    data_b64: str = Field(min_length=1, max_length=48_000_000)
+
+
+_MAX_ADMIN_TEST_ATTACHMENT_BYTES = max(
+    1,
+    int(
+        os.environ.get(
+            "EMULLM_ADMIN_TEST_ATTACHMENT_BYTES",
+            str(25 * 1024 * 1024),
+        )
+    ),
+)
+_MAX_ADMIN_TEST_ATTACHMENTS_TOTAL_BYTES = max(
+    _MAX_ADMIN_TEST_ATTACHMENT_BYTES,
+    int(
+        os.environ.get(
+            "EMULLM_ADMIN_TEST_ATTACHMENTS_TOTAL_BYTES",
+            str(50 * 1024 * 1024),
+        )
+    ),
+)
+AdminTestChatRequest.model_rebuild()
 
 
 def _read_config() -> dict[str, Any]:
@@ -5978,6 +7238,7 @@ _EDITABLE_CONFIG_SECTIONS = {
     "services",
     "agents",
     "model_routes",
+    "model_catalog_overrides",
     "workers",
     "mock_workers",
     "backends",
@@ -6023,6 +7284,150 @@ def admin_put_config_section(section: str, body: ConfigSectionRequest) -> dict[s
         "saved": True,
         "restart_required": True,
     }
+
+
+@router.get("/admin/emullm/model-config")
+@router.get("/emullm/admin/model-config")
+def admin_model_config() -> dict[str, Any]:
+    manager = _copilot_api.get_manager()
+    slots = []
+    if manager is not None:
+        slots = [
+            instance
+            for instance in manager.list()
+            if _is_on_demand_copilot(
+                str(instance.get("worker_id") or "")
+            )
+        ]
+    return {
+        "models": list_models()["data"],
+        "overrides": dict(_model_catalog_overrides),
+        "routes": dict(_model_routes),
+        "backends": _all_backends(),
+        "on_demand": {
+            "worker_prefix": _ON_DEMAND_COPILOT_PREFIX,
+            "worker_start": _ON_DEMAND_COPILOT_START,
+            "limit": _MAX_ON_DEMAND_COPILOTS,
+            "slots": slots,
+        },
+    }
+
+
+@router.put("/admin/emullm/model-config")
+@router.put("/emullm/admin/model-config")
+def admin_put_model_config(body: AdminModelConfigRequest) -> dict[str, Any]:
+    config = _read_config()
+    overrides = dict(config.get("model_catalog_overrides") or {})
+    if body.reset:
+        overrides.pop(body.model_id, None)
+    else:
+        patch = dict(body.patch)
+        for derived in (
+            "id",
+            "connected",
+            "active_workers",
+            "backing_models",
+            "route_targets",
+            "routing_mode",
+        ):
+            patch.pop(derived, None)
+        overrides[body.model_id] = {
+            "hidden": body.hidden,
+            "patch": patch,
+        }
+    if overrides:
+        config["model_catalog_overrides"] = overrides
+    else:
+        config.pop("model_catalog_overrides", None)
+
+    routes = dict(config.get("model_routes") or {})
+    if body.set_route:
+        normalized = _normalise_model_route(body.route)
+        if normalized:
+            routes[body.model_id] = normalized
+        else:
+            routes.pop(body.model_id, None)
+        if routes:
+            config["model_routes"] = routes
+        else:
+            config.pop("model_routes", None)
+
+    try:
+        EmullmConfig.model_validate(config)
+    except ValidationError as error:
+        raise HTTPException(status_code=422, detail=error.errors()) from error
+    _copilot_api.write_config_document(_CONFIG_PATH, config)
+    apply_agent_policies(config)
+    entry = None
+    try:
+        entry = get_model(body.model_id)
+    except HTTPException as error:
+        if error.status_code != 404:
+            raise
+    return {
+        "model_id": body.model_id,
+        "override": _model_catalog_overrides.get(body.model_id),
+        "route": _model_routes.get(body.model_id),
+        "model": entry,
+        "saved": True,
+    }
+
+
+@router.post("/admin/emullm/model-config/load/{model_id:path}")
+@router.post("/emullm/admin/model-config/load/{model_id:path}")
+async def admin_load_copilot_model(model_id: str) -> dict[str, Any]:
+    backing_model = _copilot_backing_model(model_id)
+    if backing_model is None:
+        raise HTTPException(
+            status_code=422,
+            detail="only exported copilot/<model-id> entries can be loaded on demand",
+        )
+    worker_id = await _ensure_on_demand_copilot(model_id, backing_model)
+    manager = _copilot_api.get_manager()
+    return {
+        "model_id": model_id,
+        "backing_model": backing_model,
+        "worker": manager.get(worker_id) if manager is not None else {"worker_id": worker_id},
+        "loaded": True,
+    }
+
+
+@router.get("/admin/emullm/test-samples")
+@router.get("/emullm/admin/test-samples")
+def admin_test_samples() -> dict[str, Any]:
+    return {
+        "samples": [
+            {
+                key: value
+                for key, value in sample.items()
+                if key != "data"
+            }
+            | {
+                "bytes": len(sample["data"]),
+                "url": f"/emullm/admin/test-samples/{sample_id}",
+            }
+            for sample_id, sample in test_media_samples().items()
+        ]
+    }
+
+
+@router.get("/admin/emullm/test-samples/{sample_id}")
+@router.get("/emullm/admin/test-samples/{sample_id}")
+def admin_test_sample(sample_id: str) -> Response:
+    sample = test_media_samples().get(sample_id)
+    if sample is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown test media sample '{sample_id}'",
+        )
+    return Response(
+        content=sample["data"],
+        media_type=sample["mime_type"],
+        headers={
+            "Content-Disposition": f'inline; filename="{sample["name"]}"',
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
 
 
 def _configured_agent_rows() -> list[dict[str, Any]]:
@@ -6111,20 +7516,124 @@ def admin_restart_server(request: Request) -> dict[str, Any]:
 @router.post("/admin/emullm/test-chat")
 @router.post("/emullm/admin/test-chat")
 async def admin_test_chat(body: AdminTestChatRequest) -> Any:
-    """Run one cancellable chat-completions request for the admin test client."""
+    """Run one cancellable multimodal request for the admin test client."""
     if body.request_id in _admin_test_tasks:
         raise HTTPException(
             status_code=409,
             detail=f"test request '{body.request_id}' is already active",
         )
-    task = asyncio.create_task(
-        chat_completions(
-            ChatRequest(
-                model=body.model,
-                messages=[ChatMessage(role="user", content=body.prompt)],
-            )
+    attachment_records: list[dict[str, Any]] = []
+    total_bytes = 0
+    for index, attachment in enumerate(body.attachments, start=1):
+        mime_type = (
+            attachment.mime_type.split(";", 1)[0].strip().lower()
+            or "application/octet-stream"
         )
-    )
+        anonymous_name = _anonymous_attachment_name(index)
+        try:
+            data = base64.b64decode(attachment.data_b64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=f"attachment '{anonymous_name}' is not valid base64",
+            ) from error
+        if not data:
+            raise HTTPException(
+                status_code=422,
+                detail=f"attachment '{anonymous_name}' is empty",
+            )
+        if len(data) > _MAX_ADMIN_TEST_ATTACHMENT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"attachment '{anonymous_name}' exceeds the "
+                    f"{_MAX_ADMIN_TEST_ATTACHMENT_BYTES}-byte limit"
+                ),
+            )
+        total_bytes += len(data)
+        if total_bytes > _MAX_ADMIN_TEST_ATTACHMENTS_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "attachments exceed the "
+                    f"{_MAX_ADMIN_TEST_ATTACHMENTS_TOTAL_BYTES}-byte total limit"
+                ),
+            )
+        record = _store_cloud_bytes(
+            data,
+            anonymous_name,
+            purpose="user_data",
+            mime_type=mime_type,
+        )
+        attachment_records.append(
+            {
+                "file_id": record["id"],
+                "name": record["filename"],
+                "mime_type": mime_type,
+                "bytes": len(data),
+                "url": _cloud_file_url(record["id"]),
+            }
+        )
+
+    images = [
+        attachment["url"]
+        for attachment in attachment_records
+        if attachment["mime_type"].startswith("image/")
+    ]
+    audio_files = [
+        attachment["url"]
+        for attachment in attachment_records
+        if attachment["mime_type"].startswith("audio/")
+    ]
+    if images:
+        kind = "vision"
+    elif audio_files:
+        kind = "audio_attachment"
+    elif attachment_records:
+        kind = "file_attachment"
+    else:
+        kind = "chat"
+
+    async def execute() -> dict[str, Any]:
+        prompt_text = f"[user] {body.prompt}"
+        result = await _relay_full(
+            body.model,
+            prompt_text,
+            images=images or None,
+            audio=audio_files[0] if audio_files else None,
+            files={"attachments": attachment_records} if attachment_records else None,
+            kind=kind,
+            attachments=attachment_records or None,
+            required_capabilities={
+                capability.strip()
+                for capability in body.required_capabilities
+                if capability.strip()
+            },
+        )
+        reply_text = _reply_content(result)
+        usage = {
+            "prompt_tokens": _token_count(prompt_text),
+            "completion_tokens": _token_count(reply_text),
+        }
+        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        return {
+            "id": _new_resource_id("chatcmpl"),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": body.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": reply_text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage,
+            "attachments": attachment_records,
+            "request_kind": kind,
+        }
+
+    task = asyncio.create_task(execute())
     _admin_test_tasks[body.request_id] = task
     try:
         return await task
@@ -6284,6 +7793,22 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   .checks label { display: inline-flex; align-items: center; gap: 6px; color: #8eacb5; font-size: .68rem; }
   #copilot-prompt { min-height: 90px; }
   #model-test-prompt { min-height: 84px; }
+  .attachment-drop { margin-top: 9px; padding: 12px; border: 1px dashed #2b6370; border-radius: 7px; background: #06141c; text-align: center; color: #83a6b0; transition: .15s ease; }
+  .attachment-drop.dragging { border-color: var(--accent); background: #0d3137; color: var(--accent); }
+  .attachment-drop input { width: auto; max-width: 100%; }
+  .attachment-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(205px, 1fr)); gap: 8px; margin-top: 9px; }
+  .attachment-card { min-width: 0; padding: 8px; border: 1px solid var(--line-soft); border-radius: 6px; background: #06141c; }
+  .attachment-card img, .attachment-card video { display: block; width: 100%; height: 110px; margin-bottom: 7px; border-radius: 4px; background: #02090d; object-fit: contain; }
+  .attachment-card audio { width: 100%; height: 34px; margin: 5px 0; }
+  .attachment-card .file-icon { display: grid; place-items: center; height: 58px; margin-bottom: 6px; border-radius: 4px; background: #0d2833; color: var(--accent); font: 800 1.1rem monospace; }
+  .attachment-name { overflow: hidden; color: #c5e0e5; font-size: .7rem; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+  .attachment-meta { color: var(--muted); font-size: .62rem; line-height: 1.45; overflow-wrap: anywhere; }
+  .attachment-result { margin-top: 10px; }
+  .capability-card { margin: 9px 0; padding: 10px 12px; border: 1px solid #1b4651; border-radius: 7px; background: linear-gradient(135deg, #071921, #0b2630); color: #91adb6; font-size: .68rem; line-height: 1.55; }
+  .capability-card:empty { display: none; }
+  .capability-card strong { color: #d5edf1; }
+  .capability-badges { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0; }
+  .capability-badge { padding: 2px 6px; border: 1px solid #27606d; border-radius: 999px; color: #86dcd5; background: #0b3038; font-size: .61rem; }
   .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line-soft); border-radius: 6px; }
   table { width: 100%; border-collapse: collapse; }
   th, td { padding: 8px 9px; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; font-size: .7rem; }
@@ -6305,6 +7830,17 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   .section-tab { width: 100%; display: flex; justify-content: space-between; text-align: left; }
   .section-tab.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
   #config-section-editor { min-height: 300px; }
+  .model-config-layout { display: grid; grid-template-columns: minmax(240px, .7fr) minmax(0, 1.8fr); gap: 12px; align-items: start; }
+  #model-config-list { min-height: 390px; font-family: "Cascadia Code", Consolas, monospace; }
+  #model-config-json { min-height: 320px; }
+  #model-config-route { min-height: 105px; }
+  .slot-grid { display: grid; gap: 5px; margin-top: 9px; }
+  .slot-card { padding: 7px 8px; border: 1px solid var(--line-soft); border-radius: 5px; background: #06141c; color: var(--muted); font-size: .64rem; overflow-wrap: anywhere; }
+  .slot-card b { color: #c7e2e7; }
+  .route-order { display: flex; flex-wrap: wrap; gap: 6px; margin: 7px 0 9px; }
+  .route-order-item { width: max-content; max-width: 100%; display: grid; grid-template-columns: auto max-content auto; gap: 5px; align-items: center; padding: 5px 6px; border: 1px solid var(--line-soft); border-radius: 5px; background: #06141c; }
+  .route-order-item code { max-width: 310px; overflow: hidden; color: #b9d8de; text-overflow: ellipsis; white-space: nowrap; }
+  .route-order-item button { min-width: 32px; padding: 3px 7px; }
   @media (max-width: 1050px) { .two-column { grid-template-columns: 1fr; } }
   @media (max-width: 760px) {
     .app-shell { grid-template-columns: 1fr; }
@@ -6315,6 +7851,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     .chips { justify-content: flex-start; }
     .content { padding: 12px; }
     .section-editor { grid-template-columns: 1fr; }
+    .model-config-layout { grid-template-columns: 1fr; }
     .section-tabs { grid-template-columns: repeat(2, 1fr); }
   }
 </style>
@@ -6332,6 +7869,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <a class="nav-link" href="#agents"><span>Agent controls</span><b>CFG</b></a>
     <a class="nav-link" href="#server-settings"><span>Server settings</span><b>CFG</b></a>
     <a class="nav-link" href="#managed"><span>Managed workers</span><b id="nav-managed-count">0</b></a>
+    <a class="nav-link" href="#model-configurator"><span>Models configurator</span><b id="nav-config-model-count">0</b></a>
     <a class="nav-link" href="#test-client"><span>Model test client</span><b id="nav-model-count">0</b></a>
     <a class="nav-link" href="#config-sections"><span>Config sections</span><b>EDIT</b></a>
     <a class="nav-link" href="#configuration"><span>Raw configuration</span><b>JSON</b></a>
@@ -6439,7 +7977,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       </label>
       <label>Handled model masks<input id="cp-modelmasks" placeholder="openai/*,gpt-*"></label>
       <label>Role<input id="cp-role" value="headless-copilot"></label>
-      <label>Capabilities<input id="cp-capabilities" placeholder="images,embeddings"></label>
+      <label>Capabilities (prefix ! to decline)<input id="cp-capabilities" placeholder="audio_input,vision_input,!file_input"></label>
       <label>Working directory<input id="cp-cwd" placeholder="runtime-managed workspace"></label>
       <label>Relay WebSocket base<input id="cp-host-ws-url" placeholder="ws://127.0.0.1:8801"></label>
       <label>Copilot executable<input id="cp-command" placeholder="auto-detect copilot.cmd / copilot"></label>
@@ -6461,7 +7999,9 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       <label>Maximum chunks<input id="cp-max-chunks" type="number" min="1" max="1000" value="64"></label>
       <label>Max prompt characters<input id="cp-max-prompt" type="number" min="1000" max="20000000" value="4000000"></label>
       <label>Max output characters<input id="cp-max-output" type="number" min="1000" max="2000000" value="200000"></label>
+      <label>Max attachment bytes<input id="cp-max-attachment" type="number" min="1024" max="104857600" value="26214400"></label>
     </div>
+    <div id="cp-model-capabilities" class="capability-card"></div>
     <label for="copilot-prompt" style="display:block;margin-top:0.7rem;color:#888;font-size:0.8rem">System prompt</label>
     <textarea id="copilot-prompt" spellcheck="false"></textarea>
     <div class="checks">
@@ -6482,8 +8022,61 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 </div>
 </section>
 
+<section class="panel" id="model-configurator">
+<h2>Models configurator <button id="model-config-refresh" type="button">Pull /v1/models</button></h2>
+<p class="sub">Edit any live <code>/v1/models</code> record, hide/export it, change media and
+  on-demand flags, or persist an ordered route to servants and real backends.</p>
+<div class="model-config-layout">
+  <div>
+    <label>Filter models<input id="model-config-search" placeholder="copilot/, audio, worker..."></label>
+    <label class="sr-only" for="model-config-list">Exported models (multiple selection allowed)</label>
+    <select id="model-config-list" size="18" multiple></select>
+    <div class="sub">Use Ctrl/Command or Shift to select multiple models for bulk edits.</div>
+    <h3>On-demand Copilot slots <span id="model-config-slot-count" class="muted"></span></h3>
+    <div id="model-config-slots" class="slot-grid"></div>
+  </div>
+  <div>
+    <h3 id="model-config-title">Select a model</h3>
+    <div id="model-config-selection-note" class="sub"></div>
+    <div class="checks">
+      <label><input id="model-config-export" type="checkbox" checked> export</label>
+      <label><input id="model-config-ondemand" type="checkbox"> on-demand worker</label>
+      <label><input id="model-config-simulated" type="checkbox"> simulated</label>
+      <label><input id="model-config-image" type="checkbox"> image input</label>
+      <label><input id="model-config-audio" type="checkbox"> audio input</label>
+      <label><input id="model-config-file" type="checkbox"> general files</label>
+      <label><input id="model-config-code" type="checkbox"> code</label>
+      <label><input id="model-config-summary" type="checkbox"> summarization</label>
+    </div>
+    <div class="checks">
+      <label><input id="model-route-worker-name" type="checkbox"> worker-in-name</label>
+      <label><input id="model-route-copilot" type="checkbox"> worker-copilot-*</label>
+      <label><input id="model-route-codex" type="checkbox"> worker-codex-*</label>
+      <label><input id="model-route-unknown" type="checkbox"> worker-unknown-*</label>
+      <label><input id="model-route-backends" type="checkbox"> backend-*</label>
+    </div>
+    <div class="sub">Ordered active targets (move left for higher priority, right for lower)</div>
+    <div id="model-route-order" class="route-order"></div>
+    <label><code>route_targets</code> editor (ordered, one target per line)
+      <textarea id="model-config-route" spellcheck="false" placeholder="worker-in-name&#10;worker-copilot-*&#10;worker-codex-*&#10;worker-unknown-*&#10;backend-*"></textarea>
+    </label>
+    <label>Effective exported model JSON
+      <textarea id="model-config-json" spellcheck="false"></textarea>
+    </label>
+    <div style="margin-top:8px">
+      <button id="model-config-save" type="button">Save model + route</button>
+      <button id="model-config-load" type="button">Load copilot worker</button>
+      <button id="model-config-reset" type="button">Reset model override</button>
+      <button id="model-config-clear-route" type="button">Clear route</button>
+      <span id="model-config-msg" class="msg"></span>
+    </div>
+  </div>
+</div>
+</section>
+
 <section class="panel" id="test-client">
-<h2>Model test client <button id="refresh-api-models" type="button">Refresh API models</button></h2>
+<h2>Model test client <button id="refresh-api-models" type="button">Refresh API models</button>
+  <button id="model-test-configure" type="button">Configure selected model</button></h2>
 <p class="sub">Send a chat-completions request through this EMULLM server. Pick an advertised
   model or type any model ID.</p>
 <form id="model-test-form">
@@ -6492,9 +8085,20 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <label>Choose advertised model <span id="api-model-count"></span>
       <select id="model-test-model-picker"><option value="">Select a model...</option></select>
     </label>
+    <label>Required capabilities<input id="model-test-capabilities" placeholder="code,summarization,audio_input"></label>
   </div>
+  <div id="api-model-capabilities" class="capability-card"></div>
   <label for="model-test-prompt" style="display:block;margin-top:0.7rem;color:#888;font-size:0.8rem">User prompt</label>
   <textarea id="model-test-prompt" required>Say hello in five words.</textarea>
+  <div class="attachment-drop" id="model-test-drop">
+    <label for="model-test-files"><b>Attach images, audio, video, documents, or any other files</b></label><br>
+    <input id="model-test-files" type="file" multiple>
+    <div class="sub">Choose files or drag and drop here. Up to 12 files, 25 MiB each, 50 MiB total.</div>
+    <div id="model-test-samples" style="margin-top:8px"></div>
+  </div>
+  <div id="model-test-attachment-summary" class="sub"></div>
+  <div id="model-test-attachments" class="attachment-grid"></div>
+  <button id="model-test-clear-attachments" type="button">Clear attachments</button>
   <div style="margin-top:0.5rem">
     <button id="model-test-send" type="submit">Send request</button>
     <button id="model-test-cancel" type="button" disabled>Cancel</button>
@@ -6504,6 +8108,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 </form>
 <h3>Assistant response</h3>
 <pre id="model-test-answer" class="muted">No request sent.</pre>
+<div id="model-test-uploaded" class="attachment-grid attachment-result"></div>
 <details>
   <summary>Raw response</summary>
   <pre id="model-test-raw"></pre>
@@ -6559,15 +8164,110 @@ function formatDuration(value) {
   const minutes = Math.floor(seconds / 60); seconds %= 60;
   return [days ? days + 'd' : '', hours ? hours + 'h' : '', minutes ? minutes + 'm' : '', seconds + 's'].filter(Boolean).join(' ');
 }
+function formatTokens(value) {
+  const tokens = Number(value) || 0;
+  if (!tokens) return 'unknown';
+  return tokens >= 1000000 ? (tokens / 1000000).toFixed(2).replace(/0+$/, '').replace(/\\.$/, '') + 'M' :
+    (tokens >= 1000 ? Math.round(tokens / 1000) + 'K' : String(tokens));
+}
+function capabilityCard(model, options = {}) {
+  if (!model) return '<span class="muted">No capability metadata for this model.</span>';
+  const capabilities = model.capabilities || {};
+  const limits = capabilities.limits || {};
+  const vision = limits.vision || {};
+  const mediaTypes = Array.isArray(vision.supported_media_types)
+    ? vision.supported_media_types : [];
+  const audioTypes = mediaTypes.filter(value => value.startsWith('audio/'));
+  const inputModalities = model.input_modalities || {};
+  const audioModality = inputModalities.audio || {};
+  const fileModality = inputModalities.general_file || {};
+  const taskCapabilities = model.task_capabilities || {};
+  const taskBadges = Object.entries(taskCapabilities)
+    .filter(([, value]) => value && value.enabled === true)
+    .map(([name]) => 'task ' + name.replaceAll('_', ' '));
+  const supports = capabilities.supports || {};
+  const reasoning = Array.isArray(supports.reasoning_effort) ? supports.reasoning_effort : [];
+  const supported = Object.entries(supports)
+    .filter(([key, value]) => value === true && !['reasoningEffort'].includes(key))
+    .map(([key]) => key.replaceAll('_', ' '));
+  const badges = [
+    model.quality_rank ? ('quality #' + model.quality_rank) : null,
+    model.quality_tier,
+    ...supported,
+    ...taskBadges,
+    ...reasoning.map(level => 'effort ' + level),
+  ].filter(Boolean);
+  const prices = model.billing && model.billing.tokenPrices ? model.billing.tokenPrices : {};
+  const route = options.routeTargets && options.routeTargets.length
+    ? '<div><strong>Route:</strong> ' + esc(options.routeTargets.join(' → ')) + '</div>' : '';
+  const active = options.activeWorkers && options.activeWorkers.length
+    ? '<div><strong>Active workers:</strong> ' + esc(options.activeWorkers.join(', ')) + '</div>' : '';
+  const backing = options.backingModel
+    ? '<div><strong>Backing model:</strong> ' + esc(options.backingModel) + '</div>' : '';
+  return '<div><strong>' + esc(model.name || model.display_name || model.id) + '</strong> <code>' + esc(model.id) + '</code></div>' +
+    '<div class="capability-badges">' + badges.map(value => '<span class="capability-badge">' + esc(value) + '</span>').join('') + '</div>' +
+    '<div><strong>Context:</strong> ' + formatTokens(limits.max_context_window_tokens || model.context_length) +
+    ' · <strong>prompt:</strong> ' + formatTokens(limits.max_prompt_tokens || model.context_length) +
+    ' · <strong>output:</strong> ' + formatTokens(limits.max_output_tokens) + '</div>' +
+    (limits.vision ? '<div><strong>Vision:</strong> ' + (vision.max_prompt_images || '?') +
+      ' image(s), max ' + formatBytes(vision.max_prompt_image_size || 0) + ' each</div>' : '') +
+    (mediaTypes.length ? '<div><strong>Advertised media:</strong> ' + esc(mediaTypes.join(', ')) + '</div>' : '') +
+    '<div><strong>Native audio:</strong> ' +
+      esc(audioModality.status || (audioTypes.length ? audioTypes.join(', ') : 'not advertised')) +
+      (audioModality.source ? ' · ' + esc(audioModality.source) : '') + '</div>' +
+    '<div><strong>General files:</strong> ' +
+      esc(fileModality.status || 'transport supported') +
+      '; comprehension ' + esc(fileModality.model_comprehension || 'model-dependent') + '.</div>' +
+    (prices.inputPrice != null ? '<div><strong>Credits / 1M:</strong> input ' + prices.inputPrice +
+      ' · cached ' + (prices.cacheReadPrice ?? prices.cachePrice ?? '?') + ' · output ' + (prices.outputPrice ?? '?') + '</div>' : '') +
+    route + active + backing +
+    (options.description ? '<div>' + esc(options.description) + '</div>' : '');
+}
+function renderCopilotCapabilities() {
+  const id = field('cp-model').value.trim() || field('cp-model-picker').value;
+  const model = copilotModelCatalog.find(item => item.id === id);
+  field('cp-model-capabilities').innerHTML = id ? capabilityCard(model) :
+    '<span class="muted">Model is selected at servant startup by the configured strategy and pool.</span>';
+}
+function renderApiModelCapabilities() {
+  const id = field('model-test-model').value.trim();
+  const entry = apiModelCatalog.find(item => item.id === id);
+  if (!entry) {
+    field('api-model-capabilities').innerHTML = id
+      ? '<strong>' + esc(id) + '</strong><div class="muted">Free-form model ID; EMULLM will apply generic routing.</div>'
+      : '';
+    return;
+  }
+  const backingIds = [
+    entry.backing_model,
+    ...Object.values(entry.backing_models || {}),
+  ].filter(Boolean);
+  const backing = copilotModelCatalog.find(item => backingIds.includes(item.id));
+  field('api-model-capabilities').innerHTML = capabilityCard(
+    backing || entry,
+    {
+      backingModel: backing ? backing.id : entry.backing_model,
+      routeTargets: entry.route_targets || [],
+      activeWorkers: entry.active_workers || (entry.worker_id ? [entry.worker_id] : []),
+      description: entry.description || '',
+    },
+  );
+}
 const DEFAULT_COPILOT_PROMPT = 'Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.';
 let copilotInstances = [];
 let copilotModelCatalog = [];
+let apiModelCatalog = [];
+let modelConfigCatalog = [];
+let modelConfigMeta = { overrides: {}, routes: {}, backends: [], on_demand: { slots: [], limit: 4 } };
+let selectedModelConfigId = '';
+let selectedModelConfigIds = [];
 let editingCopilot = null;
-let suggestedCopilotId = 'copilot-headless-1';
+let suggestedCopilotId = 'worker-copilot-1';
 let modelTestController = null;
 let modelTestTimer = null;
 let modelTestStartedAt = 0;
 let modelTestRequestId = null;
+let modelTestAttachments = [];
 let serverPid = null;
 let currentConfig = {};
 let activeConfigSection = 'services';
@@ -6722,6 +8422,7 @@ function resetCopilotForm() {
   field('cp-max-chunks').value = '64';
   field('cp-max-prompt').value = '4000000';
   field('cp-max-output').value = '200000';
+  field('cp-max-attachment').value = '26214400';
   field('copilot-prompt').value = DEFAULT_COPILOT_PROMPT;
   field('cp-autostart').checked = true;
   field('cp-warmup').checked = true;
@@ -6730,6 +8431,7 @@ function resetCopilotForm() {
   field('cp-custom-instructions').checked = false;
   field('cp-builtin-mcps').checked = false;
   updateReasoningOptions();
+  renderCopilotCapabilities();
   setCopilotMsg('', '');
 }
 function editCopilot(config) {
@@ -6758,6 +8460,7 @@ function editCopilot(config) {
   field('cp-max-chunks').value = config.max_chunks ?? 64;
   field('cp-max-prompt').value = config.max_prompt_chars ?? 4000000;
   field('cp-max-output').value = config.max_output_chars ?? 200000;
+  field('cp-max-attachment').value = config.max_attachment_bytes ?? 26214400;
   field('copilot-prompt').value = config.system_prompt || DEFAULT_COPILOT_PROMPT;
   field('cp-autostart').checked = config.autostart !== false;
   field('cp-warmup').checked = config.warmup !== false;
@@ -6766,6 +8469,7 @@ function editCopilot(config) {
   field('cp-custom-instructions').checked = !!config.load_custom_instructions;
   field('cp-builtin-mcps').checked = !!config.enable_builtin_mcps;
   updateReasoningOptions(config.reasoning_effort || '');
+  renderCopilotCapabilities();
   setCopilotMsg('', '');
 }
 function copilotConfigFromForm() {
@@ -6790,6 +8494,7 @@ function copilotConfigFromForm() {
     enable_builtin_mcps: field('cp-builtin-mcps').checked,
     max_prompt_chars: Number(field('cp-max-prompt').value),
     max_output_chars: Number(field('cp-max-output').value),
+    max_attachment_bytes: Number(field('cp-max-attachment').value),
   };
   for (const [key, id] of [
     ['session_id','cp-session-id'], ['model','cp-model'], ['cwd','cp-cwd'],
@@ -6811,7 +8516,7 @@ async function refreshCopilots() {
   copilotInstances = (r.body && r.body.instances) || [];
   field('nav-servant-count').textContent = copilotInstances.length;
   field('top-servant-count').textContent = copilotInstances.length;
-  suggestedCopilotId = (r.body && r.body.next_worker_id) || 'copilot-headless-1';
+  suggestedCopilotId = (r.body && r.body.next_worker_id) || 'worker-copilot-1';
   if (!editingCopilot) field('cp-worker-id').value = suggestedCopilotId;
   note.textContent = !r.body.manager_active ? '(manager unavailable)' :
     (r.body.copilot_available ? ('CLI: ' + (r.body.copilot_command || 'available')) : '(Copilot CLI not found)');
@@ -6864,14 +8569,20 @@ async function refreshCopilotModels(force) {
     ? ('Available Copilot models: ' + models.length + ' (' + (r.body.source || 'unknown') + ')' + suffix)
     : 'No Copilot models discovered';
   updateReasoningOptions();
+  renderCopilotCapabilities();
+  renderApiModelCapabilities();
 }
 field('refresh-copilots').addEventListener('click', refreshCopilots);
 field('refresh-copilot-models').addEventListener('click', () => refreshCopilotModels(true));
 field('cp-model-picker').addEventListener('change', () => {
   if (field('cp-model-picker').value) field('cp-model').value = field('cp-model-picker').value;
   updateReasoningOptions();
+  renderCopilotCapabilities();
 });
-field('cp-model').addEventListener('input', () => updateReasoningOptions());
+field('cp-model').addEventListener('input', () => {
+  updateReasoningOptions();
+  renderCopilotCapabilities();
+});
 field('cp-model-pool').addEventListener('input', () => updateReasoningOptions());
 function updateReasoningOptions(preferred) {
   const order = ['none','minimal','low','medium','high','xhigh','max'];
@@ -7000,6 +8711,426 @@ field('config-section-delete').addEventListener('click', async () => {
   }
 });
 
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KiB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+}
+function attachmentPreview(entry, index) {
+  const type = entry.file.type || 'application/octet-stream';
+  const anonymousName = 'attachment-' + (index + 1);
+  if (type.startsWith('image/')) return '<img src="' + esc(entry.url) + '" alt="Preview of ' + anonymousName + '">';
+  if (type.startsWith('audio/')) return '<audio controls src="' + esc(entry.url) + '"></audio>';
+  if (type.startsWith('video/')) return '<video controls src="' + esc(entry.url) + '"></video>';
+  return '<div class="file-icon">FILE</div>';
+}
+function renderModelTestAttachments() {
+  const total = modelTestAttachments.reduce((sum, entry) => sum + entry.file.size, 0);
+  field('model-test-attachment-summary').textContent = modelTestAttachments.length
+    ? modelTestAttachments.length + ' attachment(s) · ' + formatBytes(total)
+    : 'No attachments selected.';
+  field('model-test-attachments').innerHTML = modelTestAttachments.map((entry, index) =>
+    '<div class="attachment-card">' + attachmentPreview(entry, index) +
+    '<div class="attachment-name">attachment-' + (index + 1) + '</div>' +
+    '<div class="attachment-meta">' + esc(entry.file.type || 'application/octet-stream') + ' · ' +
+    formatBytes(entry.file.size) + '</div>' +
+    '<button type="button" data-remove-attachment="' + index + '">Remove</button></div>'
+  ).join('');
+}
+function clearModelTestAttachments() {
+  for (const entry of modelTestAttachments) URL.revokeObjectURL(entry.url);
+  modelTestAttachments = [];
+  field('model-test-files').value = '';
+  renderModelTestAttachments();
+}
+function addModelTestFiles(files) {
+  const incoming = [...files];
+  const existingKeys = new Set(modelTestAttachments.map(entry =>
+    entry.file.name + ':' + entry.file.size + ':' + entry.file.lastModified
+  ));
+  for (const file of incoming) {
+    const key = file.name + ':' + file.size + ':' + file.lastModified;
+    if (existingKeys.has(key)) continue;
+    if (modelTestAttachments.length >= 12) {
+      field('model-test-status').textContent = 'maximum 12 attachments';
+      break;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      field('model-test-status').textContent = file.name + ' exceeds 25 MiB';
+      continue;
+    }
+    const total = modelTestAttachments.reduce((sum, entry) => sum + entry.file.size, 0);
+    if (total + file.size > 50 * 1024 * 1024) {
+      field('model-test-status').textContent = 'attachments exceed 50 MiB total';
+      break;
+    }
+    modelTestAttachments.push({ file, url: URL.createObjectURL(file) });
+    existingKeys.add(key);
+  }
+  field('model-test-files').value = '';
+  renderModelTestAttachments();
+}
+async function refreshModelTestSamples() {
+  const response = await getJSON(ADMIN + '/test-samples', { cache: 'no-store' });
+  const samples = (response.body && response.body.samples) || [];
+  field('model-test-samples').innerHTML = samples.map(sample =>
+    '<button type="button" data-test-sample="' + esc(sample.id) + '" data-url="' +
+    esc(sample.url) + '" data-name="' + esc(sample.name) + '" data-mime="' +
+    esc(sample.mime_type) + '" title="' + esc(sample.description) + '">+ ' +
+    esc(sample.description) + '</button>'
+  ).join(' ');
+}
+field('model-test-samples').addEventListener('click', async event => {
+  const button = event.target.closest('button[data-test-sample]'); if (!button) return;
+  button.disabled = true;
+  try {
+    const response = await fetch(button.dataset.url, { cache: 'no-store' });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const blob = await response.blob();
+    const file = new File([blob], button.dataset.name, {
+      type: button.dataset.mime || blob.type || 'application/octet-stream',
+      lastModified: 0,
+    });
+    addModelTestFiles([file]);
+    field('model-test-status').textContent = 'sample attached as attachment-' +
+      modelTestAttachments.length;
+  } catch (error) {
+    field('model-test-status').textContent = 'sample failed: ' + error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+field('model-test-files').addEventListener('change', event => addModelTestFiles(event.target.files || []));
+field('model-test-attachments').addEventListener('click', event => {
+  const button = event.target.closest('button[data-remove-attachment]'); if (!button) return;
+  const index = Number(button.dataset.removeAttachment);
+  const [removed] = modelTestAttachments.splice(index, 1);
+  if (removed) URL.revokeObjectURL(removed.url);
+  renderModelTestAttachments();
+});
+field('model-test-clear-attachments').addEventListener('click', clearModelTestAttachments);
+for (const eventName of ['dragenter', 'dragover']) {
+  field('model-test-drop').addEventListener(eventName, event => {
+    event.preventDefault(); field('model-test-drop').classList.add('dragging');
+  });
+}
+for (const eventName of ['dragleave', 'drop']) {
+  field('model-test-drop').addEventListener(eventName, event => {
+    event.preventDefault(); field('model-test-drop').classList.remove('dragging');
+  });
+}
+field('model-test-drop').addEventListener('drop', event => addModelTestFiles(event.dataTransfer.files || []));
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('file read failed'));
+    reader.onload = () => resolve(String(reader.result).split(',', 2)[1] || '');
+    reader.readAsDataURL(file);
+  });
+}
+async function encodedModelTestAttachments() {
+  return Promise.all(modelTestAttachments.map(async (entry, index) => ({
+    name: 'attachment-' + (index + 1),
+    mime_type: entry.file.type || 'application/octet-stream',
+    data_b64: await fileToBase64(entry.file),
+  })));
+}
+function renderUploadedAttachments(attachments) {
+  field('model-test-uploaded').innerHTML = (attachments || []).map(attachment => {
+    const url = attachment.url || '';
+    const type = attachment.mime_type || 'application/octet-stream';
+    let preview = '<div class="file-icon">FILE</div>';
+    if (type.startsWith('image/')) preview = '<img src="' + esc(url) + '" alt="Uploaded ' + esc(attachment.name) + '">';
+    else if (type.startsWith('audio/')) preview = '<audio controls src="' + esc(url) + '"></audio>';
+    else if (type.startsWith('video/')) preview = '<video controls src="' + esc(url) + '"></video>';
+    return '<div class="attachment-card">' + preview +
+      '<div class="attachment-name">' + esc(attachment.name) + '</div>' +
+      '<div class="attachment-meta">' + esc(type) + ' · ' + formatBytes(attachment.bytes) + '</div>' +
+      '<a class="action-link" href="' + esc(url) + '" target="_blank" download>open</a></div>';
+  }).join('');
+}
+
+function modelConfigRouteTargets() {
+  return field('model-config-route').value.split(/\\r?\\n/)
+    .map(value => value.trim()).filter(Boolean);
+}
+function syncModelRouteShortcuts() {
+  const targets = modelConfigRouteTargets();
+  field('model-route-worker-name').checked = targets.includes('worker-in-name');
+  field('model-route-copilot').checked = targets.includes('worker-copilot-*');
+  field('model-route-codex').checked = targets.includes('worker-codex-*');
+  field('model-route-unknown').checked = targets.includes('worker-unknown-*');
+  field('model-route-backends').checked = targets.includes('backend-*');
+  renderModelRouteOrder();
+}
+function renderModelRouteOrder() {
+  const targets = modelConfigRouteTargets();
+  field('model-route-order').innerHTML = targets.length ? targets.map((target, index) =>
+    '<div class="route-order-item"><button type="button" data-route-move="-1" data-index="' + index + '"' +
+    (index === 0 ? ' disabled' : '') + ' aria-label="Move ' + esc(target) + ' earlier">←</button>' +
+    '<code title="' + esc(target) + '">' + esc(target) + '</code>' +
+    '<button type="button" data-route-move="1" data-index="' + index + '"' +
+    (index === targets.length - 1 ? ' disabled' : '') + ' aria-label="Move ' + esc(target) + ' later">→</button></div>'
+  ).join('') : '<div class="muted">No explicit route; model default behavior applies.</div>';
+}
+function setModelRouteShortcut(kind, checked) {
+  let targets = modelConfigRouteTargets();
+  const values = [kind];
+  if (checked) {
+    for (const value of values) if (!targets.includes(value)) targets.push(value);
+  } else {
+    targets = targets.filter(value => !values.includes(value));
+  }
+  field('model-config-route').value = targets.join('\\n');
+  syncModelRouteShortcuts();
+}
+function modelConfigEntry() {
+  return modelConfigCatalog.find(model => model.id === selectedModelConfigId);
+}
+function modelConfigEntries() {
+  return selectedModelConfigIds
+    .map(modelId => modelConfigCatalog.find(model => model.id === modelId))
+    .filter(Boolean);
+}
+function modelConfigJson() {
+  try { return JSON.parse(field('model-config-json').value || '{}'); }
+  catch (error) {
+    field('model-config-msg').textContent = 'invalid model JSON: ' + error.message;
+    field('model-config-msg').className = 'msg err';
+    return null;
+  }
+}
+function modelConfigModality(model, name) {
+  return !!(model && model.input_modalities && model.input_modalities[name] &&
+    model.input_modalities[name].enabled);
+}
+function modelConfigTask(model, name) {
+  return !!(model && model.task_capabilities && model.task_capabilities[name] &&
+    model.task_capabilities[name].enabled);
+}
+function syncModelConfigCheckboxes(model) {
+  const override = (modelConfigMeta.overrides || {})[selectedModelConfigId] || {};
+  field('model-config-export').checked = override.hidden !== true;
+  field('model-config-ondemand').checked = !!model.on_demand;
+  field('model-config-simulated').checked = !!model.simulated;
+  field('model-config-image').checked = modelConfigModality(model, 'image');
+  field('model-config-audio').checked = modelConfigModality(model, 'audio');
+  field('model-config-file').checked = modelConfigModality(model, 'general_file');
+  field('model-config-code').checked = modelConfigTask(model, 'code');
+  field('model-config-summary').checked = modelConfigTask(model, 'summarization');
+  field('model-config-load').disabled = !model.id.startsWith('copilot/') || !model.on_demand;
+}
+function applyModelConfigCheckboxes() {
+  const model = modelConfigJson(); if (!model) return;
+  if (selectedModelConfigIds.length === 1) model.id = selectedModelConfigId;
+  else delete model.id;
+  model.on_demand = field('model-config-ondemand').checked;
+  model.simulated = field('model-config-simulated').checked;
+  model.input_modalities = model.input_modalities || {};
+  for (const [name, id] of [
+    ['image', 'model-config-image'],
+    ['audio', 'model-config-audio'],
+    ['general_file', 'model-config-file'],
+  ]) {
+    model.input_modalities[name] = model.input_modalities[name] || {};
+    model.input_modalities[name].enabled = field(id).checked;
+  }
+  model.task_capabilities = model.task_capabilities || {};
+  for (const [name, id] of [
+    ['code', 'model-config-code'],
+    ['summarization', 'model-config-summary'],
+  ]) {
+    model.task_capabilities[name] = model.task_capabilities[name] || {};
+    model.task_capabilities[name].enabled = field(id).checked;
+  }
+  field('model-config-json').value = JSON.stringify(model, null, 2);
+  field('model-config-load').disabled = !selectedModelConfigIds.length ||
+    !selectedModelConfigIds.every(modelId => modelId.startsWith('copilot/')) ||
+    !model.on_demand;
+}
+function renderModelConfigSlots() {
+  const onDemand = modelConfigMeta.on_demand || {};
+  const slots = onDemand.slots || [];
+  const limit = Number(onDemand.limit) || 4;
+  field('model-config-slot-count').textContent = slots.length + '/' + limit;
+  field('model-config-slots').innerHTML = Array.from({ length: limit }, (_, index) => {
+    const workerId = (onDemand.worker_prefix || 'worker-copilot-') +
+      ((Number(onDemand.worker_start) || 5) + index);
+    const slot = slots.find(item => item.worker_id === workerId);
+    if (!slot) return '<div class="slot-card"><b>' + esc(workerId) + '</b> · empty</div>';
+    const state = slot.connected ? 'connected' : (slot.running ? 'starting' : 'stopped');
+    return '<div class="slot-card"><b>' + esc(workerId) + '</b> · ' + esc(state) +
+      '<br>' + esc(slot.selected_model || slot.model || ((slot.config || {}).model) || 'unassigned') + '</div>';
+  }).join('');
+}
+function renderModelConfigList() {
+  const search = field('model-config-search').value.trim().toLowerCase();
+  const models = modelConfigCatalog.filter(model =>
+    !search || JSON.stringify(model).toLowerCase().includes(search));
+  field('model-config-list').innerHTML = models.map(model => {
+    const hidden = ((modelConfigMeta.overrides || {})[model.id] || {}).hidden === true;
+    return '<option value="' + esc(model.id) + '">' + (hidden ? '[hidden] ' : '') +
+      esc(model.id) + '</option>';
+  }).join('');
+  const visibleIds = new Set(models.map(model => model.id));
+  selectedModelConfigIds = selectedModelConfigIds.filter(modelId => visibleIds.has(modelId));
+  if (!selectedModelConfigIds.length && models.length) {
+    selectedModelConfigIds = [models[0].id];
+  }
+  selectedModelConfigId = selectedModelConfigIds[0] || '';
+  for (const option of field('model-config-list').options) {
+    option.selected = selectedModelConfigIds.includes(option.value);
+  }
+  renderSelectedModelConfig();
+}
+function renderSelectedModelConfig() {
+  const model = modelConfigEntry();
+  const selected = modelConfigEntries();
+  const controls = [
+    'model-config-export','model-config-ondemand','model-config-simulated',
+    'model-config-image','model-config-audio','model-config-file',
+    'model-config-code','model-config-summary',
+    'model-config-save','model-config-reset','model-config-clear-route',
+  ];
+  for (const id of controls) field(id).disabled = !model;
+  if (!model) {
+    field('model-config-title').textContent = 'No model selected';
+    field('model-config-selection-note').textContent = '';
+    field('model-config-json').value = '';
+    field('model-config-route').value = '';
+    field('model-config-load').disabled = true;
+    return;
+  }
+  const bulk = selected.length > 1;
+  field('model-config-title').textContent = bulk
+    ? selected.length + ' models selected'
+    : model.id;
+  field('model-config-selection-note').textContent = bulk
+    ? ('Bulk save applies this shared merge patch, checkbox state, and route order to: ' +
+      selectedModelConfigIds.join(', '))
+    : 'Editing the effective exported record for this model.';
+  field('model-config-json').value = JSON.stringify(bulk ? {} : model, null, 2);
+  const route = (modelConfigMeta.routes || {})[model.id];
+  field('model-config-route').value = Array.isArray(route) ? route.join('\\n') : (route || '');
+  syncModelConfigCheckboxes(model);
+  field('model-config-load').disabled = !selectedModelConfigIds.every(
+    modelId => modelId.startsWith('copilot/')
+  ) || !field('model-config-ondemand').checked;
+  syncModelRouteShortcuts();
+}
+async function refreshModelConfigurator() {
+  const [catalog, metadata] = await Promise.all([
+    getJSON('/v1/models', { cache: 'no-store' }),
+    getJSON(ADMIN + '/model-config', { cache: 'no-store' }),
+  ]);
+  modelConfigMeta = metadata.body || modelConfigMeta;
+  const byId = new Map(((catalog.body && catalog.body.data) || []).map(model => [model.id, model]));
+  for (const [modelId, override] of Object.entries(modelConfigMeta.overrides || {})) {
+    if (!byId.has(modelId)) {
+      byId.set(modelId, { id: modelId, object: 'model', ...(override.patch || {}) });
+    }
+  }
+  modelConfigCatalog = [...byId.values()];
+  field('nav-config-model-count').textContent = modelConfigCatalog.length;
+  renderModelConfigSlots();
+  renderModelConfigList();
+}
+async function saveSelectedModelConfig(reset = false) {
+  const model = modelConfigJson(); if (!model || !selectedModelConfigIds.length) return;
+  applyModelConfigCheckboxes();
+  const edited = modelConfigJson(); if (!edited) return;
+  const patch = { ...edited }; delete patch.id;
+  const route = modelConfigRouteTargets();
+  field('model-config-msg').textContent = reset ? 'resetting...' : 'saving...';
+  field('model-config-msg').className = 'msg';
+  const responses = [];
+  for (const modelId of selectedModelConfigIds) {
+    responses.push(await getJSON(ADMIN + '/model-config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model_id: modelId,
+        hidden: !field('model-config-export').checked,
+        patch,
+        set_route: !reset,
+        route: route.length ? route : null,
+        reset,
+      }),
+    }));
+  }
+  const failed = responses.find(response => !response.ok);
+  field('model-config-msg').textContent = failed
+    ? ('save failed: ' + JSON.stringify((failed.body && failed.body.detail) || failed.status))
+    : ((reset ? 'reset ' : 'saved ') + responses.length + ' model(s)');
+  field('model-config-msg').className = 'msg ' + (failed ? 'err' : 'ok');
+  if (!failed) {
+    await Promise.all([refreshApiModels(), refreshModelConfigurator(), loadConfig()]);
+  }
+}
+field('model-config-refresh').addEventListener('click', refreshModelConfigurator);
+field('model-config-search').addEventListener('input', renderModelConfigList);
+field('model-config-list').addEventListener('change', () => {
+  selectedModelConfigIds = [...field('model-config-list').selectedOptions]
+    .map(option => option.value);
+  selectedModelConfigId = selectedModelConfigIds[0] || '';
+  renderSelectedModelConfig();
+});
+for (const id of [
+  'model-config-ondemand','model-config-simulated','model-config-image',
+  'model-config-audio','model-config-file','model-config-code','model-config-summary',
+]) field(id).addEventListener('change', applyModelConfigCheckboxes);
+field('model-config-json').addEventListener('change', () => {
+  const model = modelConfigJson(); if (model) syncModelConfigCheckboxes(model);
+});
+field('model-config-route').addEventListener('input', syncModelRouteShortcuts);
+field('model-route-order').addEventListener('click', event => {
+  const button = event.target.closest('button[data-route-move]'); if (!button) return;
+  const targets = modelConfigRouteTargets();
+  const index = Number(button.dataset.index);
+  const next = index + Number(button.dataset.routeMove);
+  if (index < 0 || next < 0 || index >= targets.length || next >= targets.length) return;
+  [targets[index], targets[next]] = [targets[next], targets[index]];
+  field('model-config-route').value = targets.join('\\n');
+  syncModelRouteShortcuts();
+});
+field('model-route-worker-name').addEventListener('change', event =>
+  setModelRouteShortcut('worker-in-name', event.target.checked));
+field('model-route-copilot').addEventListener('change', event =>
+  setModelRouteShortcut('worker-copilot-*', event.target.checked));
+field('model-route-codex').addEventListener('change', event =>
+  setModelRouteShortcut('worker-codex-*', event.target.checked));
+field('model-route-unknown').addEventListener('change', event =>
+  setModelRouteShortcut('worker-unknown-*', event.target.checked));
+field('model-route-backends').addEventListener('change', event =>
+  setModelRouteShortcut('backend-*', event.target.checked));
+field('model-config-save').addEventListener('click', () => saveSelectedModelConfig(false));
+field('model-config-reset').addEventListener('click', () => saveSelectedModelConfig(true));
+field('model-config-clear-route').addEventListener('click', () => {
+  field('model-config-route').value = '';
+  syncModelRouteShortcuts();
+  field('model-config-msg').textContent = 'route cleared locally; save to apply';
+  field('model-config-msg').className = 'msg';
+});
+field('model-config-load').addEventListener('click', async () => {
+  const modelIds = selectedModelConfigIds.filter(modelId => modelId.startsWith('copilot/'));
+  if (!modelIds.length || modelIds.length !== selectedModelConfigIds.length) return;
+  field('model-config-load').disabled = true;
+  field('model-config-msg').textContent = 'loading ' + modelIds.length + ' on-demand worker(s)...';
+  field('model-config-msg').className = 'msg';
+  const responses = [];
+  for (const modelId of modelIds) {
+    const encoded = modelId.split('/').map(encodeURIComponent).join('/');
+    responses.push(await getJSON(ADMIN + '/model-config/load/' + encoded, { method: 'POST' }));
+  }
+  const failed = responses.find(response => !response.ok);
+  field('model-config-msg').textContent = failed
+    ? ('load failed: ' + JSON.stringify((failed.body && failed.body.detail) || failed.status))
+    : ('loaded ' + responses.map(response => response.body.worker.worker_id).join(', '));
+  field('model-config-msg').className = 'msg ' + (failed ? 'err' : 'ok');
+  await Promise.all([refreshCopilots(), refreshModelConfigurator(), refreshApiModels()]);
+});
+
 async function refreshApiModels() {
   const [r, state] = await Promise.all([
     getJSON('/v1/models', { cache: 'no-store' }),
@@ -7014,11 +9145,14 @@ async function refreshApiModels() {
     if (!byId.has(id)) byId.set(id, { id, name: id });
   }
   const models = [...byId.values()];
+  apiModelCatalog = models;
   field('nav-model-count').textContent = models.length;
   field('top-model-count').textContent = models.length;
-  field('model-test-model-picker').innerHTML = '<option value="">Select a model...</option>' + models.map(model =>
-    '<option value="' + esc(model.id) + '">' + esc(model.name || model.id) + ' · ' + esc(model.id) + '</option>'
-  ).join('');
+  field('model-test-model-picker').innerHTML = '<option value="">Select a model...</option>' + models.map(model => {
+    const label = model.display_name || model.name || model.id;
+    const suffix = label === model.id ? '' : ' · ' + model.id;
+    return '<option value="' + esc(model.id) + '">' + esc(label + suffix) + '</option>';
+  }).join('');
   field('model-test-model-picker').disabled = models.length === 0;
   field('api-model-count').textContent = '(' + models.length + ')';
   if (!field('model-test-model').value && models.length) field('model-test-model').value = models[0].id;
@@ -7026,17 +9160,31 @@ async function refreshApiModels() {
     option => option.value === field('model-test-model').value
   ) ? field('model-test-model').value : '';
   field('model-test-status').textContent = models.length + ' advertised model(s)';
+  renderApiModelCapabilities();
 }
 field('refresh-api-models').addEventListener('click', refreshApiModels);
 field('model-test-model-picker').addEventListener('change', () => {
   if (field('model-test-model-picker').value) {
     field('model-test-model').value = field('model-test-model-picker').value;
   }
+  renderApiModelCapabilities();
+});
+field('model-test-model').addEventListener('input', renderApiModelCapabilities);
+field('model-test-configure').addEventListener('click', () => {
+  const modelId = field('model-test-model').value.trim();
+  if (modelId && modelConfigCatalog.some(model => model.id === modelId)) {
+    selectedModelConfigId = modelId;
+    selectedModelConfigIds = [modelId];
+    field('model-config-search').value = '';
+    renderModelConfigList();
+  }
+  document.getElementById('model-configurator').scrollIntoView({ behavior: 'smooth' });
 });
 field('model-test-clear').addEventListener('click', () => {
   field('model-test-answer').textContent = 'No request sent.';
   field('model-test-answer').className = 'muted';
   field('model-test-raw').textContent = '';
+  field('model-test-uploaded').innerHTML = '';
   field('model-test-status').textContent = '';
 });
 field('model-test-cancel').addEventListener('click', async () => {
@@ -7057,6 +9205,14 @@ field('model-test-form').addEventListener('submit', async (event) => {
   const prompt = field('model-test-prompt').value;
   if (!model || !prompt.trim()) return;
   const button = field('model-test-send');
+  let attachments;
+  try {
+    attachments = await encodedModelTestAttachments();
+  } catch (error) {
+    field('model-test-answer').textContent = 'Could not read attachment: ' + error;
+    field('model-test-answer').className = 'err';
+    return;
+  }
   modelTestController = new AbortController();
   modelTestRequestId = (crypto.randomUUID && crypto.randomUUID()) ||
     ('test-' + Date.now() + '-' + Math.random().toString(16).slice(2));
@@ -7071,7 +9227,13 @@ field('model-test-form').addEventListener('submit', async (event) => {
     const r = await getJSON(ADMIN + '/test-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: modelTestRequestId, model, prompt }),
+      body: JSON.stringify({
+        request_id: modelTestRequestId,
+        model,
+        prompt,
+        attachments,
+        required_capabilities: csv(field('model-test-capabilities').value),
+      }),
       signal: modelTestController.signal,
     });
     const elapsed = ((performance.now() - modelTestStartedAt) / 1000).toFixed(1);
@@ -7082,6 +9244,7 @@ field('model-test-form').addEventListener('submit', async (event) => {
       (answer || (r.ok ? '(empty response)' : (r.body.detail || 'request failed')));
     field('model-test-answer').className = cancelled ? 'muted' : (r.ok ? '' : 'err');
     field('model-test-raw').textContent = JSON.stringify(r.body, null, 2);
+    renderUploadedAttachments(r.body.attachments || []);
     field('model-test-status').textContent = cancelled ? ('cancelled · ' + elapsed + 's') :
       ('HTTP ' + r.status + ' · ' + elapsed + 's');
   } catch (error) {
@@ -7178,8 +9341,11 @@ async function tick() {
 }
 loadConfig();
 resetCopilotForm();
+renderModelTestAttachments();
+refreshModelTestSamples();
 refreshCopilotModels(false);
 refreshApiModels();
+refreshModelConfigurator();
 tick();
 setInterval(tick, 3000);
 </script>
@@ -7191,9 +9357,12 @@ setInterval(tick, 3000);
 @router.get("/emullm/admin", response_class=HTMLResponse)
 @router.get("/emullm/", response_class=HTMLResponse)
 @router.get("/emullm", response_class=HTMLResponse)
-def admin_page() -> str:
+def admin_page() -> HTMLResponse:
     """Operator control page: configure EMULLM and manage model workers."""
-    return _ADMIN_PAGE_HTML
+    return HTMLResponse(
+        _ADMIN_PAGE_HTML,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @router.post("/admin/emullm/runtime_dir")
@@ -7298,6 +9467,15 @@ def _apply_worker_registration(worker_id: str, registration: dict[str, Any]) -> 
     role = registration.get("role")
     if isinstance(role, str) and role.strip():
         _worker_roles[worker_id] = role.strip()
+    worker_kind = registration.get("worker_kind")
+    if isinstance(worker_kind, str) and worker_kind.strip():
+        _worker_kinds[worker_id] = worker_kind.strip()
+    runtime_model = registration.get("runtime_model")
+    if isinstance(runtime_model, str) and runtime_model.strip():
+        _worker_runtime_models[worker_id] = runtime_model.strip()
+    description = registration.get("description")
+    if isinstance(description, str) and description.strip():
+        _worker_descriptions[worker_id] = description.strip()
     if "modelmasks" in registration:
         _set_worker_model_masks(worker_id, _normalise_model_masks(registration["modelmasks"]))
 
@@ -7376,7 +9554,34 @@ async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
     if data.get("type") == "accept":
         request_id = str(data.get("id") or "")
         if request_id and request_id in _pending:
+            _worker_not_ready_until.pop(worker_id, None)
             _record_relay_accept(worker_id, request_id, _pending_models.get(request_id))
+        return
+    if data.get("type") in ("not_ready", "retry_later", "defer"):
+        request_id = str(data.get("id") or "")
+        reason = str(
+            data.get("reason")
+            or data.get("content")
+            or "worker temporarily unavailable"
+        )
+        try:
+            retry_after = float(data.get("retry_after") or 15)
+        except (TypeError, ValueError):
+            retry_after = 15.0
+        retry_after = min(3600.0, max(0.1, retry_after))
+        future = _pending.get(request_id)
+        if future and not future.done():
+            _worker_not_ready_until[worker_id] = time.monotonic() + retry_after
+            _record_relay_not_ready(
+                worker_id,
+                request_id,
+                reason,
+                retry_after,
+                _pending_models.get(request_id),
+            )
+            future.set_exception(
+                _WorkerNotReady(worker_id, reason, retry_after)
+            )
         return
     if data.get("type") == "reject":
         request_id = str(data.get("id") or "")
@@ -7388,6 +9593,7 @@ async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
         return
     if data.get("type") == "reply":
         request_id = str(data.get("id") or "")
+        _worker_not_ready_until.pop(worker_id, None)
         # A two-way worker may return real media alongside (or instead of)
         # text: image_b64 / image_url / mime. Keep the reply structured so
         # image-gen and vision can hand back actual bytes.
