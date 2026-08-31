@@ -21,9 +21,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from emullm import api as emullm_api
@@ -81,9 +82,13 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(emullm_api, "_worker_usage", {})
     monkeypatch.setattr(emullm_api, "_pending", {})
     monkeypatch.setattr(emullm_api, "_pending_models", {})
+    monkeypatch.setattr(emullm_api, "_admin_test_tasks", {})
+    monkeypatch.setattr(emullm_api, "_active_websockets", {})
+    monkeypatch.setattr(emullm_api, "_worker_connection_ids", {})
     monkeypatch.setattr(emullm_api, "_DOC_ALIASES", {})
     # No managed-worker supervisor by default (auto mode sets one).
     emullm_api._sup.set_supervisor(None)  # noqa: SLF001
+    emullm_api._copilot_api.set_manager(None)  # noqa: SLF001
     # Reset config-derived per-agent/service policy so tests don't leak.
     emullm_api.clear_agent_policies()
     emullm_api._model_fetch_cache.clear()
@@ -294,6 +299,32 @@ def test_worker_websocket_without_model_masks_accepts_all_models(client: TestCli
     with client.websocket_connect("/emullm/ws?worker_id=all-model-servant") as websocket:
         assert websocket.receive_json() == {"type": "hello", "worker_id": "all-model-servant"}
         assert "all-model-servant" not in emullm_api._worker_model_masks  # noqa: SLF001
+
+
+def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> None:
+    with client.websocket_connect("/emullm/ws?worker_id=tracked-servant") as websocket:
+        assert websocket.receive_json()["type"] == "hello"
+        websocket.send_json({"type": "register", "role": "test"})
+        rows = []
+        for _ in range(20):
+            inventory = client.get("/emullm/admin/websockets").json()
+            rows = [
+                row
+                for row in inventory["connections"]
+                if row.get("worker_id") == "tracked-servant"
+            ]
+            if rows and rows[0]["messages_in"] >= 1:
+                break
+            time.sleep(0.01)
+        assert inventory["count"] == 1
+        row = rows[0]
+        assert row["kind"] == "worker"
+        assert row["endpoint"] == "/emullm/ws"
+        assert row["messages_out"] >= 1
+        assert row["messages_in"] >= 1
+        assert row["connected_seconds"] >= 0
+
+    assert client.get("/emullm/admin/websockets").json()["connections"] == []
 
 
 def test_mailbox_chat_websocket_subscribes_and_publishes_events(client: TestClient) -> None:
@@ -1551,6 +1582,14 @@ def test_model_routes_admin_get_set_remove(client: TestClient) -> None:
     assert client.get("/admin/emullm/state").json()["model_routes"]["a/b"] == "w1"
     client.post("/admin/emullm/model_routes", json={"routes": {"a/b": ""}})  # empty removes
     assert "a/b" not in client.get("/admin/emullm/model_routes").json()["model_routes"]
+    chain = ["copilot-headless-*", "codex-headless-*", "https://llm.example/v1"]
+    saved = client.post("/admin/emullm/model_routes", json={"routes": {"a/b": chain}})
+    assert saved.json()["model_routes"]["a/b"] == chain
+    comma = client.post(
+        "/admin/emullm/model_routes",
+        json={"routes": {"c/d": "copilot-headless-*, codex-headless-*"}},
+    )
+    assert comma.json()["model_routes"]["c/d"] == ["copilot-headless-*", "codex-headless-*"]
 
 
 def test_model_route_relays_catalog_id_to_worker(client: TestClient) -> None:
@@ -1566,6 +1605,123 @@ def test_model_route_relays_catalog_id_to_worker(client: TestClient) -> None:
     assert r.json()["choices"][0]["message"]["content"] == "served as gemma"
     sent = emullm_api._connected_workers["srv"].sent[0]  # noqa: SLF001
     assert "google/gemma-4-31b-it" in sent.get("persona_instruction", "")
+
+
+def test_model_route_chain_prefers_first_matching_worker_glob(client: TestClient) -> None:
+    first = FakeWorker(reply="copilot answer")
+    second = FakeWorker(reply="codex answer")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {"copilot-headless-2": first, "codex-headless-1": second}
+    )
+    emullm_api._model_routes["vendor/model"] = [  # noqa: SLF001
+        "copilot-headless-*",
+        "codex-headless-*",
+        "https://llm.example/v1",
+    ]
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "vendor/model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "copilot answer"
+    assert first.sent
+    assert second.sent == []
+
+
+def test_model_route_chain_retries_next_worker_group_after_rejection(client: TestClient) -> None:
+    class RejectingWorker:
+        async def send_json(self, payload: dict) -> None:
+            future = emullm_api._pending[payload["id"]]  # noqa: SLF001
+            future.set_exception(emullm_api._WorkerRejected("copilot-headless-1", "declined"))  # noqa: SLF001
+
+    fallback = FakeWorker(reply="codex fallback")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {"copilot-headless-1": RejectingWorker(), "codex-headless-1": fallback}
+    )
+    emullm_api._model_routes["vendor/model"] = [  # noqa: SLF001
+        "copilot-headless-*",
+        "codex-headless-*",
+    ]
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "vendor/model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "codex fallback"
+
+
+def test_model_route_chain_falls_back_to_its_backend_url(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = {}
+    backend_url = "https://llm.a.singularitycompute.com/v1"
+    monkeypatch.setattr(
+        emullm_api,
+        "_all_backends",
+        lambda: [{"name": "fallback", "base_url": backend_url, "api_key": "secret"}],
+    )
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        captured.update({"url": url, "headers": headers, "payload": payload})
+        return {"choices": [{"message": {"content": "backend fallback"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+    emullm_api._model_routes["vendor/model"] = [  # noqa: SLF001
+        "copilot-headless-*",
+        "codex-headless-*",
+        backend_url,
+    ]
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "vendor/model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "backend fallback"
+    assert captured["url"] == f"{backend_url}/chat/completions"
+    assert captured["payload"]["model"] == "vendor/model"
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_admin_test_client_cancellation_clears_pending_and_notifies_worker(
+    client: TestClient,
+) -> None:
+    class SlowWorker:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    worker = SlowWorker()
+    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+
+    async def scenario() -> None:
+        request = emullm_api.AdminTestChatRequest(  # noqa: SLF001
+            request_id="browser-request",
+            model="yourself/same",
+            prompt="take your time",
+        )
+        post_task = asyncio.create_task(emullm_api.admin_test_chat(request))
+        for _ in range(100):
+            if emullm_api._pending:  # noqa: SLF001
+                break
+            await asyncio.sleep(0.01)
+        cancelled = await emullm_api.admin_cancel_test_chat("browser-request")
+        assert cancelled == {"request_id": "browser-request", "cancelled": True}
+        with pytest.raises(HTTPException) as exc:
+            await post_task
+        assert exc.value.status_code == 499
+
+    asyncio.run(scenario())
+    assert emullm_api._pending == {}  # noqa: SLF001
+    assert emullm_api._admin_test_tasks == {}  # noqa: SLF001
+    assert [message["type"] for message in worker.sent] == ["request", "cancel"]
 
 
 @pytest.mark.parametrize("path", ["/v1/files", "/v1/assistants", "/v1/threads"])
@@ -1977,8 +2133,115 @@ def test_config_schema_endpoint(client: TestClient) -> None:
     schema = client.get("/admin/emullm/config/schema").json()
     props = schema["properties"]
     assert "agents" in props and "services" in props and "capability_fallback" in props
+    assert "headless_copilots" in props
     # alias serves the same schema
     assert client.get("/emullm/admin/config/schema").json() == schema
+
+
+def test_config_section_editor_preserves_unrelated_config_and_validates(
+    client: TestClient,
+) -> None:
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "mode": "recruit,mock",
+                "services": {"model": "old"},
+                "backends": [{"name": "legacy", "base_url": "http://example/v1"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    saved = client.put(
+        "/emullm/admin/config/section/services",
+        json={"value": {"model": "new", "embeddings": {"fallback": "stub"}}},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["config"]["mode"] == "recruit,mock"
+    assert saved.json()["value"]["model"] == "new"
+
+    invalid = client.put(
+        "/emullm/admin/config/section/agents",
+        json={"value": {"not": "a list"}},
+    )
+    assert invalid.status_code == 422
+    assert client.get("/emullm/admin/config").json()["config"]["services"]["model"] == "new"
+
+    deleted = client.put(
+        "/admin/emullm/config/section/backends",
+        json={"delete": True},
+    )
+    assert deleted.status_code == 200
+    assert "backends" not in deleted.json()["config"]
+    assert client.put("/emullm/admin/config/section/nope", json={"value": {}}).status_code == 404
+
+
+def test_standalone_process_control_endpoints(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api._process_control, "schedule_shutdown", lambda: True)  # noqa: SLF001
+    monkeypatch.setattr(  # noqa: SLF001
+        emullm_api._process_control,
+        "schedule_restart",
+        lambda host, port: 4242,
+    )
+    shutdown = client.post("/emullm/admin/shutdown")
+    assert shutdown.status_code == 202
+    assert shutdown.json()["status"] == "shutting_down"
+
+    restart = client.post("/admin/emullm/restart")
+    assert restart.status_code == 202
+    assert restart.json()["status"] == "restarting"
+    assert restart.json()["helper_pid"] == 4242
+
+
+def test_process_controls_reject_embedded_mode(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api._process_control, "schedule_shutdown", lambda: False)  # noqa: SLF001
+    monkeypatch.setattr(  # noqa: SLF001
+        emullm_api._process_control,
+        "schedule_restart",
+        lambda host, port: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    )
+    assert client.post("/emullm/admin/shutdown").status_code == 409
+    assert client.post("/emullm/admin/restart").status_code == 409
+
+
+def test_carol_enabled_checkbox_api_persists_and_toggles_mock_live(
+    client: TestClient,
+) -> None:
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "mode": "mock",
+                "agents": [
+                    {
+                        "kind": "agent",
+                        "id": "carol",
+                        "enabled": False,
+                        "launch": "mock",
+                        "reply": "hello from carol",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    initial = client.get("/emullm/admin/agents").json()["agents"][0]
+    assert initial["enabled"] is False
+    assert initial["mock_registered"] is False
+
+    enabled = client.put(
+        "/emullm/admin/agents/carol/enabled", json={"enabled": True}
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["applied"] is True
+    assert enabled.json()["agents"][0]["mock_registered"] is True
+    assert "carol" in emullm_api._connected_workers  # noqa: SLF001
+    assert json.loads(emullm_api._CONFIG_PATH.read_text(encoding="utf-8"))["agents"][0]["enabled"] is True  # noqa: SLF001
+
+    disabled = client.put(
+        "/admin/emullm/agents/carol/enabled", json={"enabled": False}
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["agents"][0]["mock_registered"] is False
+    assert "carol" not in emullm_api._connected_workers  # noqa: SLF001
 
 
 def test_backends_probe_reports_models(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2451,13 +2714,55 @@ def test_model_list_lives_on_service_node(client: TestClient) -> None:
 
 
 def test_admin_page_renders_html(client: TestClient) -> None:
-    for url in ("/emullm/admin", "/admin/emullm"):
+    for url in ("/emullm", "/emullm/", "/emullm/admin", "/admin/emullm"):
         response = client.get(url)
         assert response.status_code == 200, url
         assert "text/html" in response.headers["content-type"]
-        assert "emullm admin" in response.text
+        assert "EMULLM // CONTROL PLANE" in response.text
     # The page resolves its REST calls relative to wherever it's served.
-    assert "location.pathname" in client.get("/emullm/admin").text
+    html = client.get("/emullm/admin").text
+    assert "location.pathname" in html
+    assert "PAGE_PATH === '/emullm'" in html
+    assert "Headless Copilot servants" in html
+    assert 'id="copilot-form"' in html
+    assert 'id="cp-allow-all"' in html
+    assert 'id="refresh-copilot-models"' in html
+    assert 'id="cp-model-pool"' in html
+    assert 'id="cp-model-picker"' in html
+    assert "field('cp-model').value = field('cp-model-picker').value" in html
+    assert 'id="cp-model-selector"' in html
+    assert "updateReasoningOptions" in html
+    assert "most-1" in html and "least-1" in html
+    assert 'id="cp-warmup"' in html
+    assert 'id="cp-warmup-prompt"' in html
+    assert 'id="cp-chunk-prompts"' in html
+    assert 'id="cp-chunk-tokens"' in html
+    assert 'id="copilot-add-another"' in html
+    assert "beginNewCopilot" in html
+    assert "Model test client" in html
+    assert 'id="model-test-form"' in html
+    assert 'id="model-test-model"' in html
+    assert 'id="model-test-model-picker"' in html
+    assert 'id="api-model-count"' in html
+    assert "field('model-test-model').value = field('model-test-model-picker').value" in html
+    assert 'id="model-test-cancel"' in html
+    assert "new AbortController()" in html
+    assert "r.status === 499" in html
+    assert "toFixed(1) + 's'" in html
+    assert "'/test-chat'" in html
+    assert 'id="refresh-websockets"' in html
+    assert 'id="websocket-connections"' in html
+    assert 'id="carol-enabled"' in html
+    assert 'id="server-settings"' in html
+    assert 'id="server-settings-save"' in html
+    assert 'id="server-proxy-url"' in html
+    assert 'id="top-uptime"' in html
+    assert "formatDuration" in html
+    assert 'id="config-section-tabs"' in html
+    assert 'id="config-section-editor"' in html
+    assert "'/config/section/'" in html
+    assert 'id="server-restart"' in html
+    assert 'id="server-shutdown"' in html
 
 
 def test_admin_rest_works_under_both_prefixes(client: TestClient) -> None:

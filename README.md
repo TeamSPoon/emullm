@@ -88,10 +88,10 @@ python -m emullm.worker --host-ws-url ws://127.0.0.1:8801
 
 Every native servant uses the one endpoint:
 `ws://127.0.0.1:8801/emullm/ws`. Supply an optional identity as
-`?worker_id=codex-ide-1`; if omitted, the server assigns a
+`?worker_id=copilot-headless-1`; if omitted, the server assigns a
 `servant-<random>` identity and returns it in the first `hello` frame. Supply
 an optional comma-separated glob list as
-`?worker_id=codex-ide-1&modelmasks=openai/*,gpt-*`; omitting `modelmasks`
+`?worker_id=copilot-headless-1&modelmasks=openai/*,gpt-*`; omitting `modelmasks`
 makes the servant eligible for every model. Unlisted model IDs are always
 forwarded unchanged in the request frame. A servant may explicitly send
 `accept` then `reply`, or send `reject` for a particular request so the relay
@@ -121,6 +121,151 @@ complete design and route map.
 To have an agent (rather than a human) act as the worker, install the
 GitHub Copilot CLI or OpenAI Codex CLI -- see
 [Agent worker CLIs](#optional-agent-worker-clis).
+
+## Headless Copilot servants
+
+Open `http://127.0.0.1:8801/emullm/admin` and use **Headless Copilot
+servants** to create and manage unattended Copilot-backed answerers. Each
+servant:
+
+- connects to the shared `WS /emullm/ws` worker endpoint;
+- accepts only its configured `modelmasks` (or every model when empty);
+- starts one resident Copilot SDK/CLI runtime and reuses it for every request;
+- reuses one stable session, preserving that servant's conversation across
+  OpenAI-compatible API calls;
+- persists its configuration under `headless_copilots` in `config.json`;
+- writes adapter output to `runtime/headless_copilots/<worker_id>/servant.log`.
+
+The same complete operations console is also served at `GET /emullm` and
+`GET /emullm/`; `/emullm/admin` remains the explicit administration path.
+This follows the plugin convention: `GET /<prefix>` is the primary admin UI,
+while `GET /<prefix>/admin` is the unambiguous explicit alias used by plugin
+API metadata.
+
+Standalone process controls are loopback-only:
+
+- `POST /emullm/admin/restart` gracefully replaces the server and warms all
+  configured servants before they reconnect.
+- `POST /emullm/admin/shutdown` gracefully stops servants and the server.
+
+Embedded mode returns `409` because a plugin must not terminate its host
+Workbench process.
+
+The resident runtime starts before its worker WebSocket is advertised. With
+`warmup: true` (the default), it sends `warmup_prompt` once and waits for the
+answer before connecting, so client traffic does not pay the first-inference
+cost. The admin table shows adapter, SDK bridge, and owned CLI PIDs plus warmup
+and last model-call durations.
+
+The GUI's **Refresh models** button queries the authenticated account through
+Copilot's bundled SDK `models.list` API. When `model` is blank, each servant
+uses `model_selector` over its optional `model_pool`, or over the complete
+discovered catalog when that pool is empty:
+
+- `random` chooses from all eligible models.
+- `best-N` chooses randomly among the highest-ranked N (`best-1` is
+  deterministic).
+- `worst-N` chooses among the lowest-ranked N; `worse-N` is accepted as an
+  alias.
+
+The rank is an explicit best-to-worst quality heuristic shown in the model
+dropdown/API as `quality_rank` and `quality_tier`; an explicit `model` always
+wins. A configured `reasoning_effort` filters selector candidates to models
+whose SDK metadata supports that level. It may also be `random`, `most-N`, or
+`least-N`; these resolve after model selection using that model's supported
+effort ordering (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+For example, `most-1` chooses the highest supported effort and `least-1` the
+lowest. If live discovery is unavailable, EMULLM falls back to the initial
+model list shown in the Copilot desktop picker.
+
+When a caller sends more input than the selected servant model can accept,
+`chunk_long_prompts: true` ingests the request sequentially and asks for one
+final answer after all chunks. The default chunk budget comes from the
+selected model's SDK context metadata and the servant's `default` versus
+`long_context` setting; `chunk_tokens` overrides it, `max_chunks` bounds the
+work, and `max_prompt_chars` remains the absolute request safety limit.
+
+The default **answer-only** security profile gives Copilot an empty tool set,
+disables built-in MCPs, ignores repository instructions, and disables remote
+session access. The GUI's **allow all tools, paths, and URLs** option is
+deliberately marked unsafe because `/v1/*` callers can supply arbitrary
+prompts.
+
+The same controls are available through REST:
+
+```text
+GET    /emullm/admin/copilots
+POST   /emullm/admin/copilots
+GET    /emullm/admin/copilots/{worker_id}
+PUT    /emullm/admin/copilots/{worker_id}
+DELETE /emullm/admin/copilots/{worker_id}
+POST   /emullm/admin/copilots/{worker_id}/start
+POST   /emullm/admin/copilots/{worker_id}/stop
+POST   /emullm/admin/copilots/{worker_id}/restart
+POST   /emullm/admin/copilots/{worker_id}/reset-session
+GET    /emullm/admin/copilots/{worker_id}/log
+GET    /emullm/admin/copilots/schema
+GET    /emullm/admin/copilots/models
+POST   /emullm/admin/test-chat
+DELETE /emullm/admin/test-chat/{request_id}
+```
+
+For example:
+
+```json
+{
+  "worker_id": "copilot-openai",
+  "model": "gpt-5-mini",
+  "model_pool": [],
+  "model_selector": "random",
+  "modelmasks": ["openai/*", "gpt-*"],
+  "autostart": true,
+  "system_prompt": "Answer as the requested OpenAI-compatible model.",
+  "context": "default",
+  "timeout_seconds": 900,
+  "allow_all": false
+}
+```
+
+Send that object to `POST /emullm/admin/copilots?start=true`. A session UUID
+is generated and persisted automatically. Use `reset-session` when you
+intentionally want to discard the servant's accumulated Copilot context.
+
+The default identity is `copilot-headless-1`; additional servants created in
+the GUI are persisted and autostart according to their own settings. Their
+models are intentionally unspecified by default, so each start chooses a
+random available Copilot model. Every configured model route uses this ordered
+failover convention:
+
+```json
+[
+  "copilot-headless-*",
+  "codex-headless-*",
+  "https://llm.a.singularitycompute.com/v1"
+]
+```
+
+Worker targets are globbed against currently connected worker IDs. The first
+group that answers wins; rejected or unavailable workers fall through to the
+next group, and the final URL is called as an OpenAI-compatible backend.
+
+The same admin page also provides:
+
+- a **Model test client** that combines live, advertised, and explicitly
+  routed model IDs while still accepting any free-form model ID; its separate
+  dropdown overwrites the text field when selected, it displays live elapsed
+  seconds, and Cancel aborts the active SDK message while keeping the resident
+  Copilot runtime ready for the next request;
+- an **Enable Carol mock worker** checkbox, persisted immediately to
+  `agents[].enabled`;
+- **Connected WebSockets → List / refresh**, covering worker, mailbox, and
+  aggregate interaction sockets with endpoint, identity/subscriptions, client
+  address, age, and successful JSON messages in/out.
+- a validated **Configuration sections** editor for `services`, `agents`,
+  `model_routes`, `workers`, `mock_workers`, `backends`, and `mock`. Each
+  section saves independently through
+  `PUT /emullm/admin/config/section/{section}` so unrelated settings are
+  preserved; the full raw JSON editor remains available for advanced changes.
 
 ## Worker mailboxes
 
@@ -488,8 +633,10 @@ types and per-service fallbacks offline.
 | `mode` | string / list | The run-mode chain -- the order we **find an agent** for a request (see run modes above). |
 | `capability_fallback` | `stub` / `wait` / `error` | Default for **what we do when we can't** find an agent for a non-text service. |
 | `services` | object | Server-level catalog: `model` (default) + `models` (advertised list) + per-service `{ fallback, description }` entries overriding `capability_fallback`. |
-| `agents` | list | The unified answerer list (below). |
+| `agents` | list | The unified answerer list (below); set `enabled: false` to retain but disable an entry. |
+| `headless_copilots` | list | Persistent-session Copilot CLI servants managed live through the admin GUI/API. |
 | `subagent_launch` | string / argv | Worker type for discovered subagents (`copilot`/`worker`/`recruit`/argv). |
+| `model_routes` | object | Model ID to one worker ID or an ordered list of worker-ID globs and OpenAI-compatible backend URLs. |
 
 **Agents.** Each entry is one answerer -- `kind: "agent"` with a `launch`
 type. It carries a user-facing `description`, an optional `observe` (what

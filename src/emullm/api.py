@@ -142,6 +142,7 @@ import base64
 import binascii
 from fnmatch import fnmatchcase
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
@@ -160,6 +161,8 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile
 
+from . import copilot_api as _copilot_api
+from . import process_control as _process_control
 from . import supervisor as _sup
 
 router = APIRouter()
@@ -209,10 +212,21 @@ def _websocket_catalog_parameters(path: str) -> list[dict[str, Any]]:
 @router.get("/emullm/endpoints")
 def service_catalog() -> dict[str, Any]:
     """Advertise EMULLM services with comments, parameters, and schemas."""
-    openapi = get_openapi(title="EMULLM", version="1.0.0", routes=router.routes)
+    def walk_routes(routes: list[Any]) -> list[Any]:
+        flattened: list[Any] = []
+        for route in routes:
+            included = getattr(route, "original_router", None)
+            if included is not None:
+                flattened.extend(walk_routes(list(getattr(included, "routes", []))))
+            else:
+                flattened.append(route)
+        return flattened
+
+    catalog_routes = walk_routes(list(router.routes))
+    openapi = get_openapi(title="EMULLM", version="1.0.0", routes=catalog_routes)
     openapi_paths = openapi.get("paths", {})
     endpoints: list[dict[str, Any]] = []
-    for route in router.routes:
+    for route in catalog_routes:
         path = getattr(route, "path", None)
         if not isinstance(path, str):
             continue
@@ -544,6 +558,7 @@ async def _observe(worker_id: str, model: str, prompt_text: str, reply_text: str
         await worker.send_json(
             {"type": "observe", "model": model, "prompt": prompt_text, "reply": reply_text}
         )
+        _increment_active_websocket(_worker_connection_ids.get(worker_id), "messages_out")
     except Exception:  # noqa: BLE001
         pass
 
@@ -670,6 +685,79 @@ _native_worker_ids: set[str] = set()
 _worker_lock = asyncio.Lock()
 _pending: dict[str, "asyncio.Future[Any]"] = {}
 _pending_models: dict[str, str] = {}
+_admin_test_tasks: dict[str, "asyncio.Task[Any]"] = {}
+_active_websockets: dict[str, dict[str, Any]] = {}
+_active_websockets_lock = threading.RLock()
+_worker_connection_ids: dict[str, str] = {}
+
+
+def _register_active_websocket(
+    websocket: WebSocket, kind: str, **metadata: Any
+) -> str:
+    connection_id = f"ws-{uuid.uuid4().hex[:16]}"
+    client = websocket.client
+    with _active_websockets_lock:
+        _active_websockets[connection_id] = {
+            "connection_id": connection_id,
+            "kind": kind,
+            "endpoint": str(websocket.scope.get("path") or ""),
+            "client": (
+                f"{client.host}:{client.port}"
+                if client is not None
+                else None
+            ),
+            "connected_at": _now_iso(),
+            "connected_at_epoch": time.time(),
+            "messages_in": 0,
+            "messages_out": 0,
+            **metadata,
+        }
+    return connection_id
+
+
+def _update_active_websocket(connection_id: str, **metadata: Any) -> None:
+    with _active_websockets_lock:
+        if connection_id in _active_websockets:
+            _active_websockets[connection_id].update(metadata)
+
+
+def _remove_active_websocket(connection_id: str) -> None:
+    with _active_websockets_lock:
+        _active_websockets.pop(connection_id, None)
+
+
+def _increment_active_websocket(connection_id: str | None, field: str) -> None:
+    if connection_id is None:
+        return
+    with _active_websockets_lock:
+        if connection_id in _active_websockets:
+            _active_websockets[connection_id][field] += 1
+
+
+async def _tracked_ws_send_json(
+    websocket: WebSocket, connection_id: str, payload: Any
+) -> None:
+    await websocket.send_json(payload)
+    _increment_active_websocket(connection_id, "messages_out")
+
+
+async def _tracked_ws_receive_json(
+    websocket: WebSocket, connection_id: str
+) -> Any:
+    payload = await websocket.receive_json()
+    _increment_active_websocket(connection_id, "messages_in")
+    return payload
+
+
+def _active_websocket_rows() -> list[dict[str, Any]]:
+    now = time.time()
+    with _active_websockets_lock:
+        rows = []
+        for value in _active_websockets.values():
+            row = {key: item for key, item in value.items() if key != "connected_at_epoch"}
+            row["connected_seconds"] = round(now - float(value["connected_at_epoch"]), 1)
+            rows.append(row)
+    return sorted(rows, key=lambda row: (row["kind"], row["endpoint"], row["connection_id"]))
 
 # Each worker declares its OWN model list on connect (see the websocket
 # handshake below): a dict of suffix -> {"display_name", "instruction"}.
@@ -786,7 +874,7 @@ def _new_automatic_worker_id() -> str:
 
 def _worker_candidates_for_model(model: str, resolved_worker_id: str) -> list[str]:
     """Return live workers eligible to accept a model offer, in try order."""
-    if _model_routes.get(model):
+    if isinstance(_model_routes.get(model), str):
         return [resolved_worker_id]  # Explicit operator route always wins.
 
     requested_worker_id, _ = _split_model_id(model)
@@ -822,7 +910,11 @@ def _is_known_worker_id(worker_id: str) -> bool:
         or worker_id in _worker_roles
         or worker_id in _agent_descriptions
         or worker_id in _worker_service_behavior
-        or worker_id in _model_routes.values()
+        or any(
+            target == worker_id
+            for route in _model_routes.values()
+            for target in ([route] if isinstance(route, str) else route)
+        )
     )
 
 
@@ -884,7 +976,7 @@ _service_fallback: dict[str, list[str]] = {}             # service -> fallback c
 _observers: dict[str, Any] = {}                           # worker_id -> True | set[str] (services)
 _agent_descriptions: dict[str, str] = {}                  # worker_id -> user-facing description
 _service_descriptions: dict[str, str] = {}                # service -> user-facing description
-_model_routes: dict[str, str] = {}                        # full model id -> worker_id that serves it
+_model_routes: dict[str, str | list[str]] = {}            # full model id -> worker or ordered target chain
 _server_description: str | None = None                    # user-facing server description
 _advertised_base: list[str] = []                          # services.models (manual base)
 _advertised_default: str | None = None                    # services.model (default advertised)
@@ -929,6 +1021,19 @@ def _service_entry(value: Any) -> tuple[str | None, str | None]:
         description = value.get("description")
         return behavior, (str(description) if description else None)
     return None, None
+
+
+def _normalise_model_route(value: Any) -> str | list[str] | None:
+    """Normalize an exact worker target or ordered worker-glob/backend chain."""
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else parts
+    if isinstance(value, (list, tuple)):
+        targets = list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+        return targets or None
+    return None
 
 
 def _model_id(entry: Any) -> str | None:
@@ -1013,6 +1118,8 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
         for agent in agents:
             if not isinstance(agent, dict):
                 continue
+            if agent.get("enabled") is False:
+                continue
             worker_id = str(agent.get("id") or agent.get("worker_id") or "").strip()
             if not worker_id:
                 continue
@@ -1053,9 +1160,15 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
                 _worker_service_behavior[worker_id] = behaviors
         # Second pass: an agent can `replaces: "<other_id>"` to take over that
         # agent's whole advertised catalog (map each of its ids to this worker).
-        by_id = {str(a.get("id") or a.get("worker_id") or ""): a for a in agents if isinstance(a, dict)}
+        by_id = {
+            str(a.get("id") or a.get("worker_id") or ""): a
+            for a in agents
+            if isinstance(a, dict) and a.get("enabled") is not False
+        }
         for agent in agents:
             if not isinstance(agent, dict):
+                continue
+            if agent.get("enabled") is False:
                 continue
             target = agent.get("replaces")
             worker_id = str(agent.get("id") or agent.get("worker_id") or "").strip()
@@ -1067,9 +1180,10 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
     # Top-level explicit routes win (operator override).
     routes = config.get("model_routes")
     if isinstance(routes, dict):
-        for mid, wid in routes.items():
-            if isinstance(mid, str) and isinstance(wid, str) and mid and wid:
-                _model_routes[mid] = wid
+        for mid, route in routes.items():
+            normalized = _normalise_model_route(route)
+            if isinstance(mid, str) and mid and normalized:
+                _model_routes[mid] = normalized
 
 
 _INTERVAL_UNITS = {
@@ -1878,8 +1992,26 @@ def _require_model(model: str) -> tuple[str, str, dict[str, Any]]:
     # A configured/runtime route sends this exact catalog id to a serving worker,
     # forwarding the original id so the worker knows which model to emulate.
     route = _model_routes.get(model)
-    if route:
+    if isinstance(route, str):
         return route, "", {
+            "instruction": f"You are serving model id '{model}'. Emulate that model faithfully.",
+            "passthrough": True,
+            "served_model": model,
+        }
+    if isinstance(route, list):
+        for target in route:
+            if target.startswith(("http://", "https://")):
+                continue
+            matches = sorted(
+                worker_id for worker_id in _connected_workers if fnmatchcase(worker_id, target)
+            )
+            if matches:
+                return matches[0], "", {
+                    "instruction": f"You are serving model id '{model}'. Emulate that model faithfully.",
+                    "passthrough": True,
+                    "served_model": model,
+                }
+        return _DEFAULT_WORKER_ID, "", {
             "instruction": f"You are serving model id '{model}'. Emulate that model faithfully.",
             "passthrough": True,
             "served_model": model,
@@ -1909,6 +2041,83 @@ def _backend_model_for(model: str, backend: dict[str, Any]) -> str:
     if model == _DEFAULT_MODEL_ID or _models_for(worker_id).get(suffix) is not None:
         return str(backend.get("model") or model)
     return model
+
+
+def _route_backend(target: str) -> dict[str, Any]:
+    normalized = target.rstrip("/")
+    for backend in _all_backends():
+        if str(backend.get("base_url") or "").rstrip("/") == normalized:
+            return backend
+    return {
+        "name": normalized,
+        "base_url": normalized,
+        "api_key_env": os.environ.get("EMULLM_PROXY_API_KEY_ENV"),
+    }
+
+
+def _route_worker_candidates(model: str, target: str) -> list[str]:
+    matches = sorted(
+        worker_id for worker_id in _connected_workers if fnmatchcase(worker_id, target)
+    )
+    if not matches:
+        return []
+    _, rotated = select_from_catalog(
+        matches, "round-robin", key=f"model-route:{model}:{target}"
+    )
+    return rotated
+
+
+async def _relay_model_route_chain(
+    model: str,
+    targets: list[str],
+    prompt_text: str,
+    extra: dict[str, Any] | None,
+) -> Any:
+    """Try worker-ID globs and OpenAI-compatible backend URLs in order."""
+    instruction = f"You are serving model id '{model}'. Emulate that model faithfully."
+    failures: list[str] = []
+    for target in targets:
+        if target.startswith(("http://", "https://")):
+            try:
+                reply = await _proxy_chat(_route_backend(target), model, prompt_text, instruction)
+            except HTTPException as error:
+                failures.append(f"{target}: {error.detail}")
+                continue
+            await _mirror_to_observers(target, model, prompt_text, reply)
+            return reply
+
+        candidates = _route_worker_candidates(model, target)
+        if not candidates:
+            failures.append(f"{target}: no connected worker matched")
+            continue
+        for worker_id in candidates:
+            try:
+                _check_and_record_usage(worker_id)
+                result = await _relay_to_worker(
+                    worker_id,
+                    model,
+                    prompt_text,
+                    instruction,
+                    wait=False,
+                    extra=extra,
+                )
+            except _WorkerRejected as error:
+                failures.append(f"{worker_id}: {error.reason}")
+                continue
+            except HTTPException as error:
+                failures.append(f"{worker_id}: {error.detail}")
+                continue
+            if result is _PASS:
+                failures.append(f"{worker_id}: disconnected before accepting")
+                continue
+            await _mirror_to_observers(worker_id, model, prompt_text, _reply_content(result))
+            return result
+
+    detail = "; ".join(failures) if failures else "the route chain is empty"
+    raise HTTPException(
+        status_code=503,
+        detail=f"all configured routes failed for model '{model}' ({detail})",
+    )
 
 
 def _token_count(value: Any) -> int:
@@ -1946,10 +2155,6 @@ async def _relay_full(
     this fails FAST with 429 (and a Retry-After telling the caller when to
     come back -- possibly minutes away), rather than queuing yet more work
     onto an already-busy worker."""
-    resolved_worker_id, _, persona = _require_model(model)
-    worker_ids = _worker_candidates_for_model(model, resolved_worker_id)
-    instruction = persona.get("instruction")
-
     extra: dict[str, Any] = {}
     if images:
         extra["images"] = images
@@ -1959,6 +2164,14 @@ async def _relay_full(
         extra["files"] = files
     if kind:
         extra["kind"] = kind
+
+    configured_route = _model_routes.get(model)
+    if isinstance(configured_route, list):
+        return await _relay_model_route_chain(model, configured_route, prompt_text, extra or None)
+
+    resolved_worker_id, _, persona = _require_model(model)
+    worker_ids = _worker_candidates_for_model(model, resolved_worker_id)
+    instruction = persona.get("instruction")
 
     modes = _current_modes()
     rejections: list[_WorkerRejected] = []
@@ -2090,6 +2303,7 @@ async def _relay_to_worker(
                 payload[key] = value
 
     deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
+    sent_peer: Any = None
     try:
         while True:
             peer = peer_override if peer_override is not None else _connected_workers.get(worker_id)
@@ -2105,6 +2319,11 @@ async def _relay_to_worker(
                 continue
             try:
                 await peer.send_json(payload)
+                if peer_override is None:
+                    _increment_active_websocket(
+                        _worker_connection_ids.get(worker_id), "messages_out"
+                    )
+                sent_peer = peer
             except Exception:
                 if not wait:
                     return _PASS
@@ -2124,6 +2343,18 @@ async def _relay_to_worker(
             return result
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="emullm worker did not reply in time")
+    except asyncio.CancelledError:
+        if sent_peer is not None and peer_override is None:
+            try:
+                await asyncio.shield(
+                    sent_peer.send_json({"type": "cancel", "id": request_id})
+                )
+                _increment_active_websocket(
+                    _worker_connection_ids.get(worker_id), "messages_out"
+                )
+            except Exception:
+                pass
+        raise
     finally:
         _pending.pop(request_id, None)
         _pending_models.pop(request_id, None)
@@ -4231,17 +4462,27 @@ def _mailbox_ws_cursor(value: Any) -> str | None:
     return str(value) if value else None
 
 
-async def _mailbox_ws_flush(websocket: WebSocket, subscriptions: dict[str, str | None]) -> None:
+async def _mailbox_ws_flush(
+    websocket: WebSocket,
+    connection_id: str,
+    subscriptions: dict[str, str | None],
+) -> None:
     """Push available events for each subscribed mailbox, preserving cursors."""
     for stream, after in tuple(subscriptions.items()):
         try:
             events, next_cursor, _ = _mailbox_event_page(stream, after=after, limit=1000)
         except HTTPException as exc:
             subscriptions.pop(stream, None)
-            await websocket.send_json({"type": "error", "stream": stream, "detail": exc.detail})
+            await _tracked_ws_send_json(
+                websocket,
+                connection_id,
+                {"type": "error", "stream": stream, "detail": exc.detail},
+            )
             continue
         for event in events:
-            await websocket.send_json({"type": "event", "event": event})
+            await _tracked_ws_send_json(
+                websocket, connection_id, {"type": "event", "event": event}
+            )
         if events:
             subscriptions[stream] = next_cursor
 
@@ -4261,21 +4502,34 @@ async def mailbox_service_socket(websocket: WebSocket) -> None:
     """
     await websocket.accept()
     subscriptions: dict[str, str | None] = {}
+    connection_id = _register_active_websocket(
+        websocket, "mailbox", subscriptions=[]
+    )
     try:
         while True:
             try:
-                frame = await asyncio.wait_for(websocket.receive_json(), timeout=0.1)
+                frame = await asyncio.wait_for(
+                    _tracked_ws_receive_json(websocket, connection_id), timeout=0.1
+                )
             except asyncio.TimeoutError:
-                await _mailbox_ws_flush(websocket, subscriptions)
+                await _mailbox_ws_flush(websocket, connection_id, subscriptions)
                 continue
             if not isinstance(frame, dict):
-                await websocket.send_json({"type": "error", "detail": "WebSocket frame must be an object"})
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
+                    {"type": "error", "detail": "WebSocket frame must be an object"},
+                )
                 continue
             frame_type = str(frame.get("type") or "")
             if frame_type == "subscribe":
                 streams = frame.get("streams")
                 if not isinstance(streams, list) or not streams:
-                    await websocket.send_json({"type": "error", "detail": "subscribe requires a non-empty streams list"})
+                    await _tracked_ws_send_json(
+                        websocket,
+                        connection_id,
+                        {"type": "error", "detail": "subscribe requires a non-empty streams list"},
+                    )
                     continue
                 cursors = frame.get("cursors")
                 cursors = cursors if isinstance(cursors, dict) else {}
@@ -4284,24 +4538,48 @@ async def mailbox_service_socket(websocket: WebSocket) -> None:
                         stream = _require_mailbox(str(raw_stream))
                         subscriptions[stream] = _mailbox_ws_cursor(cursors.get(stream))
                 except HTTPException as exc:
-                    await websocket.send_json({"type": "error", "detail": exc.detail})
+                    await _tracked_ws_send_json(
+                        websocket, connection_id, {"type": "error", "detail": exc.detail}
+                    )
                     continue
-                await websocket.send_json({"type": "subscribed", "streams": sorted(subscriptions)})
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
+                    {"type": "subscribed", "streams": sorted(subscriptions)},
+                )
+                _update_active_websocket(
+                    connection_id, subscriptions=sorted(subscriptions)
+                )
             elif frame_type == "unsubscribe":
                 streams = frame.get("streams")
                 if not isinstance(streams, list):
-                    await websocket.send_json({"type": "error", "detail": "unsubscribe requires a streams list"})
+                    await _tracked_ws_send_json(
+                        websocket,
+                        connection_id,
+                        {"type": "error", "detail": "unsubscribe requires a streams list"},
+                    )
                     continue
                 for raw_stream in streams:
                     subscriptions.pop(str(raw_stream), None)
-                await websocket.send_json({"type": "unsubscribed", "streams": sorted(subscriptions)})
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
+                    {"type": "unsubscribed", "streams": sorted(subscriptions)},
+                )
+                _update_active_websocket(
+                    connection_id, subscriptions=sorted(subscriptions)
+                )
             elif frame_type in {"publish", "event"}:
                 raw_event = frame.get("event") if isinstance(frame.get("event"), dict) else frame
                 stream = raw_event.get("stream")
                 event_type = raw_event.get("event_type") or raw_event.get("type")
                 data = raw_event.get("data")
                 if not isinstance(data, dict):
-                    await websocket.send_json({"type": "error", "detail": "published event data must be an object"})
+                    await _tracked_ws_send_json(
+                        websocket,
+                        connection_id,
+                        {"type": "error", "detail": "published event data must be an object"},
+                    )
                     continue
                 try:
                     source_id = str(raw_event.get("source_id") or "external")
@@ -4318,9 +4596,13 @@ async def mailbox_service_socket(websocket: WebSocket) -> None:
                     )
                 except (HTTPException, ValueError) as exc:
                     detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-                    await websocket.send_json({"type": "error", "detail": detail})
+                    await _tracked_ws_send_json(
+                        websocket, connection_id, {"type": "error", "detail": detail}
+                    )
                     continue
-                await websocket.send_json(
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
                     {
                         "type": "published",
                         "id": event["id"],
@@ -4330,16 +4612,26 @@ async def mailbox_service_socket(websocket: WebSocket) -> None:
                     }
                 )
             elif frame_type == "ping":
-                await websocket.send_json({"type": "pong", "server_time": _now_iso()})
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
+                    {"type": "pong", "server_time": _now_iso()},
+                )
             else:
-                await websocket.send_json({"type": "error", "detail": f"unsupported frame type '{frame_type}'"})
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
+                    {"type": "error", "detail": f"unsupported frame type '{frame_type}'"},
+                )
                 continue
-            await _mailbox_ws_flush(websocket, subscriptions)
+            await _mailbox_ws_flush(websocket, connection_id, subscriptions)
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
         if "disconnect message" not in str(exc):
             raise
+    finally:
+        _remove_active_websocket(connection_id)
 
 
 @router.websocket("/emullm/websock_to_llm_user/ws")
@@ -4366,7 +4658,14 @@ async def websock_to_llm_user_socket(websocket: WebSocket) -> None:
         "modelmask": modelmask,
         "types": sorted(event_types) if event_types else None,
     }
-    await websocket.send_json({"type": "subscribed", "stream": _LLM_USER_MAILBOX, "filters": filters, "cursor": after})
+    connection_id = _register_active_websocket(
+        websocket, "interaction-log", filters=filters
+    )
+    await _tracked_ws_send_json(
+        websocket,
+        connection_id,
+        {"type": "subscribed", "stream": _LLM_USER_MAILBOX, "filters": filters, "cursor": after},
+    )
     try:
         while True:
             events, next_cursor, has_more = _llm_user_event_page(
@@ -4378,24 +4677,38 @@ async def websock_to_llm_user_socket(websocket: WebSocket) -> None:
                 event_types=event_types,
             )
             for event in events:
-                await websocket.send_json({"type": "event", "event": event})
+                await _tracked_ws_send_json(
+                    websocket, connection_id, {"type": "event", "event": event}
+                )
             after = next_cursor
             if has_more:
                 await asyncio.sleep(0)
                 continue
             try:
-                frame = await asyncio.wait_for(websocket.receive_json(), timeout=0.25)
+                frame = await asyncio.wait_for(
+                    _tracked_ws_receive_json(websocket, connection_id), timeout=0.25
+                )
             except asyncio.TimeoutError:
                 continue
             if isinstance(frame, dict) and frame.get("type") == "ping":
-                await websocket.send_json({"type": "pong", "server_time": _now_iso()})
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
+                    {"type": "pong", "server_time": _now_iso()},
+                )
             else:
-                await websocket.send_json({"type": "error", "detail": "only ping is supported on this read-only stream"})
+                await _tracked_ws_send_json(
+                    websocket,
+                    connection_id,
+                    {"type": "error", "detail": "only ping is supported on this read-only stream"},
+                )
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
         if "disconnect message" not in str(exc):
             raise
+    finally:
+        _remove_active_websocket(connection_id)
 
 
 # ---------------------------------------------------------------------------
@@ -5164,6 +5477,13 @@ def admin_state() -> dict[str, Any]:
             for worker_id, usage in _worker_usage.items()
         },
         "pending_request_ids": sorted(_pending.keys()),
+        "active_test_request_ids": sorted(_admin_test_tasks.keys()),
+        "process": {
+            "pid": os.getpid(),
+            "host": os.environ.get("EMULLM_HOST", "127.0.0.1"),
+            "port": int(os.environ.get("EMULLM_HTTP_PORT", "8801")),
+            "shutdown_available": _process_control.shutdown_available(),
+        },
         "record_counts": {kind: len(store.list()) for kind, store in _KIND_STORES.items()},
         "mailboxes": {
             "config_path": str(_mailbox_config_path()),
@@ -5172,6 +5492,8 @@ def admin_state() -> dict[str, Any]:
             "event_count": _mailbox_event_count(),
         },
         "managed_workers": _sup.get_supervisor().status() if _sup.get_supervisor() else [],
+        "headless_copilots": _copilot_api.manager_status(),
+        "active_websockets": _active_websocket_rows(),
         "backend": (
             {"name": _b.get("name"), "base_url": _b.get("base_url"), "model": _b.get("model")}
             if (_b := _select_backend())
@@ -5207,6 +5529,7 @@ _STATUS_PAGE_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="EMULLM live status dashboard for model workers, routing, usage, and persistent stores.">
 <title>emullm -- status</title>
 <style>
   :root { color-scheme: light dark; }
@@ -5505,6 +5828,7 @@ class AgentConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
     kind: Literal["agent"] = "agent"
+    enabled: bool = True
     id: str | None = None
     worker_id: str | None = None
     launch: Literal["recruit", "subagent", "proxy", "mock"] | None = None
@@ -5571,7 +5895,7 @@ class EmullmConfig(BaseModel):
     mode: str | list[str] | None = None
     subagent_launch: str | list[str] | None = None
     subagent_model: str | None = None  # default AI model for spawned Copilot workers
-    model_routes: dict[str, str] | None = None  # catalog model id -> serving worker_id
+    model_routes: dict[str, str | list[str]] | None = None  # model id -> worker or ordered targets
     capability_fallback: Literal["stub", "wait", "error"] | None = None
     validation_interval_default: str | int | float | None = None  # inherited default cadence
     validation_interval_override: str | int | float | None = None  # forces cadence on ALL agents
@@ -5580,6 +5904,7 @@ class EmullmConfig(BaseModel):
     agents: list[AgentConfig] | None = None
     # legacy flat forms (still honored by the runtime today):
     workers: list[WorkerConfig] | None = None
+    headless_copilots: list[_copilot_api.HeadlessCopilotConfig] | None = None
     mock_workers: list[MockWorkerConfig] | None = None
     backends: list[BackendConfig] | None = None
     mock: MockConfig | None = None
@@ -5587,6 +5912,25 @@ class EmullmConfig(BaseModel):
 
 class SaveConfigRequest(BaseModel):
     config: dict[str, Any]
+
+
+class ConfigSectionRequest(BaseModel):
+    value: Any = None
+    delete: bool = False
+
+
+class AgentEnabledRequest(BaseModel):
+    enabled: bool
+
+
+class AdminTestChatRequest(BaseModel):
+    request_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+    model: str = Field(min_length=1, max_length=300)
+    prompt: str = Field(min_length=1, max_length=100_000)
 
 
 def _read_config() -> dict[str, Any]:
@@ -5626,9 +5970,234 @@ def admin_put_config(body: SaveConfigRequest) -> dict[str, Any]:
                 for err in exc.errors()
             ],
         )
-    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _CONFIG_PATH.write_text(json.dumps(body.config, indent=2) + "\n", encoding="utf-8")
+    _copilot_api.write_config_document(_CONFIG_PATH, body.config)
     return {"path": str(_CONFIG_PATH), "config": body.config, "saved": True}
+
+
+_EDITABLE_CONFIG_SECTIONS = {
+    "services",
+    "agents",
+    "model_routes",
+    "workers",
+    "mock_workers",
+    "backends",
+    "mock",
+}
+
+
+@router.put("/admin/emullm/config/section/{section}")
+@router.put("/emullm/admin/config/section/{section}")
+def admin_put_config_section(section: str, body: ConfigSectionRequest) -> dict[str, Any]:
+    """Validate and atomically replace or delete one configuration section."""
+    if section not in _EDITABLE_CONFIG_SECTIONS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown editable config section '{section}'",
+        )
+    config = _read_config()
+    if body.delete:
+        config.pop(section, None)
+    else:
+        config[section] = body.value
+    try:
+        EmullmConfig.model_validate(config)
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "loc": list(item.get("loc", ())),
+                    "msg": item.get("msg"),
+                    "type": item.get("type"),
+                }
+                for item in error.errors()
+            ],
+        ) from error
+    _copilot_api.write_config_document(_CONFIG_PATH, config)
+    return {
+        "path": str(_CONFIG_PATH),
+        "section": section,
+        "deleted": body.delete,
+        "value": config.get(section),
+        "config": config,
+        "saved": True,
+        "restart_required": True,
+    }
+
+
+def _configured_agent_rows() -> list[dict[str, Any]]:
+    config = _read_config()
+    agents = config.get("agents") if isinstance(config.get("agents"), list) else []
+    return [
+        {
+            "id": str(agent.get("id") or agent.get("worker_id") or ""),
+            "launch": str(agent.get("launch") or ""),
+            "description": str(agent.get("description") or ""),
+            "enabled": agent.get("enabled") is not False,
+            "connected": str(agent.get("id") or agent.get("worker_id") or "") in _connected_workers,
+            "mock_registered": isinstance(
+                _connected_workers.get(str(agent.get("id") or agent.get("worker_id") or "")),
+                _MockWorker,
+            ),
+        }
+        for agent in agents
+        if isinstance(agent, dict) and (agent.get("id") or agent.get("worker_id"))
+    ]
+
+
+@router.get("/admin/emullm/agents")
+@router.get("/emullm/admin/agents")
+def admin_list_agents() -> dict[str, Any]:
+    """List configured agents and whether each is enabled and connected."""
+    return {"agents": _configured_agent_rows()}
+
+
+@router.get("/admin/emullm/websockets")
+@router.get("/emullm/admin/websockets")
+def admin_list_websockets() -> dict[str, Any]:
+    """List every active EMULLM WebSocket and its inbound/outbound frame counts."""
+    connections = _active_websocket_rows()
+    return {"count": len(connections), "connections": connections}
+
+
+def _require_local_process_control(request: Request) -> None:
+    host = request.client.host if request.client is not None else ""
+    if host == "testclient":
+        return
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host.lower() == "localhost"
+    if not is_loopback:
+        raise HTTPException(
+            status_code=403,
+            detail="server process controls are restricted to loopback clients",
+        )
+
+
+@router.post("/admin/emullm/shutdown", status_code=202)
+@router.post("/emullm/admin/shutdown", status_code=202)
+def admin_shutdown_server(request: Request) -> dict[str, Any]:
+    """Gracefully stop the standalone EMULLM process after returning."""
+    _require_local_process_control(request)
+    if not _process_control.schedule_shutdown():
+        raise HTTPException(
+            status_code=409,
+            detail="shutdown is unavailable in embedded mode",
+        )
+    return {"status": "shutting_down", "pid": os.getpid()}
+
+
+@router.post("/admin/emullm/restart", status_code=202)
+@router.post("/emullm/admin/restart", status_code=202)
+def admin_restart_server(request: Request) -> dict[str, Any]:
+    """Gracefully replace the standalone EMULLM process after returning."""
+    _require_local_process_control(request)
+    host = os.environ.get("EMULLM_HOST", "127.0.0.1")
+    port = int(os.environ.get("EMULLM_HTTP_PORT", "8801"))
+    try:
+        helper_pid = _process_control.schedule_restart(host, port)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "status": "restarting",
+        "pid": os.getpid(),
+        "helper_pid": helper_pid,
+        "host": host,
+        "port": port,
+    }
+
+
+@router.post("/admin/emullm/test-chat")
+@router.post("/emullm/admin/test-chat")
+async def admin_test_chat(body: AdminTestChatRequest) -> Any:
+    """Run one cancellable chat-completions request for the admin test client."""
+    if body.request_id in _admin_test_tasks:
+        raise HTTPException(
+            status_code=409,
+            detail=f"test request '{body.request_id}' is already active",
+        )
+    task = asyncio.create_task(
+        chat_completions(
+            ChatRequest(
+                model=body.model,
+                messages=[ChatMessage(role="user", content=body.prompt)],
+            )
+        )
+    )
+    _admin_test_tasks[body.request_id] = task
+    try:
+        return await task
+    except asyncio.CancelledError as error:
+        raise HTTPException(status_code=499, detail="test request cancelled") from error
+    finally:
+        if _admin_test_tasks.get(body.request_id) is task:
+            _admin_test_tasks.pop(body.request_id, None)
+
+
+@router.delete("/admin/emullm/test-chat/{request_id}")
+@router.delete("/emullm/admin/test-chat/{request_id}")
+async def admin_cancel_test_chat(request_id: str) -> dict[str, Any]:
+    """Cancel an active admin test request and notify its worker."""
+    task = _admin_test_tasks.get(request_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"no active test request '{request_id}'")
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return {"request_id": request_id, "cancelled": True}
+
+
+@router.put("/admin/emullm/agents/{worker_id}/enabled")
+@router.put("/emullm/admin/agents/{worker_id}/enabled")
+def admin_set_agent_enabled(worker_id: str, body: AgentEnabledRequest) -> dict[str, Any]:
+    """Persist an agent's enabled flag; mock agents are toggled immediately."""
+    config = _read_config()
+    agents = config.get("agents") if isinstance(config.get("agents"), list) else []
+    agent = next(
+        (
+            candidate
+            for candidate in agents
+            if isinstance(candidate, dict)
+            and str(candidate.get("id") or candidate.get("worker_id") or "") == worker_id
+        ),
+        None,
+    )
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"no configured agent '{worker_id}'")
+    agent["enabled"] = body.enabled
+    try:
+        EmullmConfig.model_validate(config)
+    except ValidationError as error:
+        raise HTTPException(status_code=422, detail=error.errors()) from error
+    _copilot_api.write_config_document(_CONFIG_PATH, config)
+
+    launch = str(agent.get("launch") or "").lower()
+    if launch == "mock" and not body.enabled:
+        unregister_mock_workers([worker_id])
+    expanded = _sup.expand_agents(config)
+    apply_agent_policies(expanded)
+    if launch == "mock" and body.enabled:
+        spec = next(
+            (
+                item
+                for item in expanded.get("mock_workers", [])
+                if isinstance(item, dict)
+                and str(item.get("id") or item.get("worker_id") or "") == worker_id
+            ),
+            None,
+        )
+        if spec is not None:
+            register_mock_workers([spec])
+    return {
+        "worker_id": worker_id,
+        "enabled": body.enabled,
+        "applied": launch == "mock",
+        "restart_required": launch != "mock",
+        "agents": _configured_agent_rows(),
+    }
 
 
 @router.get("/admin/emullm/backends/probe")
@@ -5654,59 +6223,454 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="EMULLM operations console for resident model servants, routing, WebSockets, and configuration.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23071720'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-size='38' font-family='monospace' font-weight='700' fill='%2325d5c8'%3EE%3C/text%3E%3C/svg%3E">
 <title>emullm -- admin</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
-  h1 { margin-bottom: 0.25rem; }
-  .sub { color: #888; font-size: 0.9rem; margin-top: 0; }
-  .warn { background: #f39c1222; border: 1px solid #f39c1288; padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
-  table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
-  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #8882; font-size: 0.9rem; }
-  th { color: #888; }
-  button { font-size: 0.85rem; padding: 0.25rem 0.7rem; cursor: pointer; margin-right: 0.3rem; }
-  textarea { width: 100%; min-height: 16rem; font-family: monospace; font-size: 0.85rem; padding: 0.5rem; box-sizing: border-box; }
-  .dot { height: 0.6rem; width: 0.6rem; border-radius: 50%; display: inline-block; margin-right: 0.35rem; }
-  .on { background: #2ecc71; } .off { background: #bbb; }
-  .muted { color: #888; }
-  .msg { font-size: 0.85rem; margin-left: 0.5rem; }
-  .ok { color: #2ecc71; } .err { color: #e74c3c; }
+  :root {
+    color-scheme: dark;
+    --bg: #050d13; --sidebar: #071720; --panel: #0a1b25; --panel-2: #0d2430;
+    --line: #173844; --line-soft: #102b35; --text: #d9edf1; --muted: #7895a0;
+    --accent: #25d5c8; --accent-soft: #123d42; --green: #35d48a;
+    --amber: #f3b95f; --red: #ff6b72; --shadow: 0 14px 38px #0008;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 75% -20%, #123341 0, transparent 38%), var(--bg); color: var(--text); font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+  .app-shell { min-height: 100vh; display: grid; grid-template-columns: 220px minmax(0, 1fr); }
+  .sidebar { position: sticky; top: 0; height: 100vh; padding: 18px 14px; background: linear-gradient(180deg, #081b25, #06131b); border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 18px; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 14px; border-bottom: 1px solid var(--line-soft); }
+  .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid #25d5c899; border-radius: 7px; background: #25d5c81c; color: var(--accent); font: 800 14px/1 monospace; box-shadow: 0 0 24px #25d5c822; }
+  .brand strong { color: var(--accent); letter-spacing: .16em; font-size: .83rem; }
+  .brand small { display: block; margin-top: 2px; color: var(--muted); font-size: .65rem; letter-spacing: .04em; }
+  .nav-group { display: grid; gap: 5px; }
+  .nav-label { padding: 7px 9px 3px; color: #4f717d; font-size: .61rem; font-weight: 800; letter-spacing: .15em; text-transform: uppercase; }
+  .nav-link { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 9px; border: 1px solid transparent; border-radius: 6px; color: #92b2bc; text-decoration: none; font-size: .78rem; transition: .15s ease; }
+  .nav-link:hover { color: var(--text); border-color: var(--line); background: #0d2631; transform: translateX(2px); }
+  .nav-link b { min-width: 22px; padding: 1px 6px; border-radius: 999px; background: #102d38; color: var(--accent); text-align: center; font-size: .65rem; }
+  .sidebar-foot { margin-top: auto; padding: 10px 9px; border-top: 1px solid var(--line-soft); color: var(--muted); font-size: .68rem; line-height: 1.5; }
+  .workspace { min-width: 0; }
+  .topbar { position: sticky; top: 0; z-index: 10; display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 13px 22px; border-bottom: 1px solid var(--line); background: #07141de8; backdrop-filter: blur(14px); }
+  .topbar h1 { margin: 0; color: var(--accent); font: 800 .95rem/1.1 monospace; letter-spacing: .1em; }
+  .topbar .sub { margin: 3px 0 0; }
+  .chips { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+  .chip { padding: 5px 9px; border: 1px solid var(--line); border-radius: 999px; background: #0b222c; color: #9bb8c1; font-size: .68rem; }
+  .chip b { color: var(--accent); }
+  .content { width: min(1500px, 100%); margin: 0 auto; padding: 18px 22px 50px; display: grid; gap: 15px; }
+  .warn { margin: 0; padding: 9px 12px; border: 1px solid #f3b95f55; border-radius: 7px; background: #5a3b101f; color: #d7b77f; font-size: .73rem; }
+  .panel { min-width: 0; padding: 15px 16px 16px; border: 1px solid var(--line); border-radius: 9px; background: linear-gradient(145deg, #0a1d27f2, #071720f2); box-shadow: var(--shadow); }
+  .panel:target { border-color: #25d5c888; box-shadow: 0 0 0 1px #25d5c822, var(--shadow); }
+  .panel h2 { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 0 0 9px; color: #c7e1e6; font-size: .9rem; letter-spacing: .02em; }
+  .panel h3 { margin: 14px 0 6px; color: #92b7c0; font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
+  .sub { color: var(--muted); font-size: .74rem; line-height: 1.55; }
+  .muted { color: var(--muted); }
+  .msg { margin-left: 5px; font-size: .7rem; }
+  .ok { color: var(--green); } .err { color: var(--red); }
+  a { color: #5be2d7; }
+  button { min-height: 29px; margin: 0 3px 3px 0; padding: 5px 10px; border: 1px solid #24505d; border-radius: 5px; background: linear-gradient(#113440, #0c2832); color: #cce5e9; font: 650 .69rem/1 "Segoe UI", sans-serif; cursor: pointer; transition: .15s ease; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: white; background: #15505a; box-shadow: 0 0 14px #25d5c822; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { cursor: not-allowed; opacity: .38; }
+  button[type="submit"] { border-color: #25d5c899; color: #06171b; background: var(--accent); }
+  button.danger { border-color: #ff6b7266; color: #ff9da2; background: #401b22; }
+  input, select, textarea { width: 100%; border: 1px solid #1a414d; border-radius: 5px; outline: none; background: #06151d; color: #d8eef1; font: 400 .74rem/1.35 "Segoe UI", sans-serif; transition: border-color .15s, box-shadow .15s; }
+  input, select { min-height: 32px; padding: 5px 8px; }
+  textarea { min-height: 16rem; padding: 9px; resize: vertical; font-family: "Cascadia Code", Consolas, monospace; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px #25d5c81f; }
+  input[type="checkbox"] { width: 14px; min-height: 14px; accent-color: var(--accent); }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 9px 12px; }
+  .form-grid label { display: flex; flex-direction: column; gap: 4px; color: #71949f; font-size: .67rem; font-weight: 650; }
+  .checks { display: flex; flex-wrap: wrap; gap: 8px 15px; margin: 10px 0; padding: 9px; border: 1px solid var(--line-soft); border-radius: 6px; background: #06141c; }
+  .checks label { display: inline-flex; align-items: center; gap: 6px; color: #8eacb5; font-size: .68rem; }
+  #copilot-prompt { min-height: 90px; }
+  #model-test-prompt { min-height: 84px; }
+  .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line-soft); border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 8px 9px; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; font-size: .7rem; }
+  th { position: sticky; top: 0; background: #0b222c; color: #7fa5b0; font-size: .62rem; letter-spacing: .08em; text-transform: uppercase; }
+  tbody tr:hover { background: #0e2a354f; }
+  tbody tr:last-child td { border-bottom: 0; }
+  pre { min-height: 42px; margin: 6px 0; padding: 10px; border: 1px solid var(--line-soft); border-radius: 6px; background: #041117; color: #b9d7dd; white-space: pre-wrap; overflow-wrap: anywhere; font: .72rem/1.5 "Cascadia Code", Consolas, monospace; }
+  details { margin-top: 9px; padding: 9px 11px; border: 1px solid var(--line-soft); border-radius: 6px; background: #071821; }
+  summary { cursor: pointer; color: #9cc0c7; font-size: .72rem; font-weight: 700; }
+  details[open] summary { margin-bottom: 10px; color: var(--accent); }
+  code { padding: 1px 4px; border-radius: 3px; background: #102b35; color: #8be9e0; font: .66rem "Cascadia Code", Consolas, monospace; }
+  .action-link { display: inline-flex; min-width: 28px; min-height: 28px; align-items: center; justify-content: center; margin-left: 3px; border: 1px solid var(--line); border-radius: 5px; text-decoration: none; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .dot { display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
+  .on { color: var(--green); background: var(--green); } .off { color: #607780; background: #607780; }
+  .two-column { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .72fr); gap: 15px; align-items: start; }
+  .section-editor { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 12px; align-items: start; }
+  .section-tabs { display: grid; gap: 5px; }
+  .section-tab { width: 100%; display: flex; justify-content: space-between; text-align: left; }
+  .section-tab.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  #config-section-editor { min-height: 300px; }
+  @media (max-width: 1050px) { .two-column { grid-template-columns: 1fr; } }
+  @media (max-width: 760px) {
+    .app-shell { grid-template-columns: 1fr; }
+    .sidebar { position: static; width: auto; height: auto; }
+    .nav-group { grid-template-columns: repeat(2, 1fr); }
+    .nav-label, .sidebar-foot { display: none; }
+    .topbar { position: static; align-items: flex-start; flex-direction: column; }
+    .chips { justify-content: flex-start; }
+    .content { padding: 12px; }
+    .section-editor { grid-template-columns: 1fr; }
+    .section-tabs { grid-template-columns: repeat(2, 1fr); }
+  }
 </style>
 </head>
 <body>
-<h1>emullm admin</h1>
-<p class="sub">mode <b id="mode">-</b> &middot; <a href="/emullm/status">status dashboard</a> &middot;
-  <span id="updated" class="muted">-</span></p>
-<p class="warn">This page can edit config and start/stop worker processes. Keep it bound to localhost.</p>
+<div class="app-shell">
+<aside class="sidebar">
+  <div class="brand"><div class="brand-mark">E</div><div><strong>EMULLM</strong><small>operations console</small></div></div>
+  <nav class="nav-group">
+    <div class="nav-label">Live</div>
+    <a class="nav-link" href="#overview"><span>Overview</span><b>LIVE</b></a>
+    <a class="nav-link" href="#connections"><span>WebSockets</span><b id="nav-socket-count">0</b></a>
+    <a class="nav-link" href="#servants"><span>Headless servants</span><b id="nav-servant-count">0</b></a>
+    <div class="nav-label">Control</div>
+    <a class="nav-link" href="#agents"><span>Agent controls</span><b>CFG</b></a>
+    <a class="nav-link" href="#server-settings"><span>Server settings</span><b>CFG</b></a>
+    <a class="nav-link" href="#managed"><span>Managed workers</span><b id="nav-managed-count">0</b></a>
+    <a class="nav-link" href="#test-client"><span>Model test client</span><b id="nav-model-count">0</b></a>
+    <a class="nav-link" href="#config-sections"><span>Config sections</span><b>EDIT</b></a>
+    <a class="nav-link" href="#configuration"><span>Raw configuration</span><b>JSON</b></a>
+  </nav>
+  <div class="sidebar-foot">OpenAI-compatible relay<br><code>/v1</code> &middot; <code>/emullm/ws</code></div>
+</aside>
+<main class="workspace">
+<header class="topbar" id="overview">
+  <div><h1>EMULLM // CONTROL PLANE</h1><p class="sub">resident model servants and relay operations</p></div>
+  <div class="chips">
+    <span class="chip">MODE <b id="mode">-</b></span>
+    <span class="chip">SOCKETS <b id="top-socket-count">0</b></span>
+    <span class="chip">SERVANTS <b id="top-servant-count">0</b></span>
+    <span class="chip">MODELS <b id="top-model-count">0</b></span>
+    <span class="chip">UPTIME <b id="top-uptime">0s</b></span>
+    <span class="chip"><a href="/emullm/status">STATUS</a></span>
+    <span class="chip" id="updated">-</span>
+    <button id="server-restart" type="button">Restart</button>
+    <button id="server-shutdown" class="danger" type="button">Shutdown</button>
+  </div>
+</header>
+<div class="content">
+<p class="warn">LOCAL CONTROL SURFACE &mdash; edits configuration, launches processes, and controls active model requests. Keep it bound to localhost.</p>
 
+<section class="panel" id="agents">
+<h2>Configured agents</h2>
+<label><input id="carol-enabled" type="checkbox" style="width:auto"> Enable Carol mock worker</label>
+<span id="carol-note" class="msg muted"></span>
+</section>
+
+<section class="panel" id="server-settings">
+<h2>Server configuration</h2>
+<p class="sub">Common deployment settings. Save persists them to config.json; restart EMULLM to apply startup-level changes.</p>
+<div class="form-grid">
+  <label>Description<input id="server-description"></label>
+  <label>Mode chain<input id="server-mode" placeholder="recruit,mock"></label>
+  <label>Capability fallback
+    <select id="server-capability-fallback"><option value="stub">stub</option><option value="wait">wait</option><option value="error">error</option></select>
+  </label>
+  <label>Default subagent model<input id="server-subagent-model"></label>
+  <label>Validation interval default<input id="server-validation-default" placeholder="never, 1day, 12h"></label>
+  <label>Validation override<input id="server-validation-override" placeholder="blank = none"></label>
+  <label>Proxy backend URL<input id="server-proxy-url" placeholder="https://.../v1"></label>
+  <label>Proxy model<input id="server-proxy-model"></label>
+</div>
+<div style="margin-top:10px">
+  <button id="server-settings-save" type="button">Save server settings</button>
+  <button id="server-settings-reload" type="button">Reload</button>
+  <span id="server-settings-msg" class="msg"></span>
+</div>
+</section>
+
+<section class="panel" id="connections">
+<h2>Connected WebSockets <button id="refresh-websockets" type="button">List / refresh</button>
+  <span id="websocket-note" class="muted"></span></h2>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Connection</th><th>Kind / endpoint</th><th>Identity / subscription</th><th>Client</th><th>Messages</th><th>Age</th></tr></thead>
+  <tbody id="websocket-connections"><tr><td colspan="6" class="muted">Click List / refresh.</td></tr></tbody>
+</table>
+</div>
+</section>
+
+<section class="panel" id="managed">
 <h2>Managed workers <button id="refresh-services" type="button">Refresh services</button>
   <span id="sup-note" class="muted"></span></h2>
+<div class="table-wrap">
 <table>
   <thead><tr><th>Worker</th><th>Role</th><th>PID</th><th>State</th><th>Actions</th></tr></thead>
   <tbody id="workers"><tr><td colspan="5" class="muted">loading...</td></tr></tbody>
 </table>
+</div>
+</section>
 
+<section class="panel" id="servants">
+<h2>Headless Copilot servants <button id="refresh-copilots" type="button">Refresh</button>
+  <button id="refresh-copilot-models" type="button">Refresh Copilot LLMs</button>
+  <span id="copilot-note" class="muted"></span></h2>
+<p class="sub">Each servant connects to <code>/emullm/ws</code> and reuses one Copilot
+  SDK/CLI process and session across requests. Tool access is disabled unless explicitly enabled.
+  <span id="copilot-model-note"></span></p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Servant</th><th>Copilot / session</th><th>Models</th><th>State</th><th>Actions</th></tr></thead>
+  <tbody id="copilots"><tr><td colspan="5" class="muted">loading...</td></tr></tbody>
+</table>
+</div>
+
+<details id="copilot-editor">
+  <summary id="copilot-editor-title">Add headless Copilot servant</summary>
+  <form id="copilot-form">
+    <div class="form-grid">
+      <label>Worker ID<input id="cp-worker-id" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" maxlength="128"></label>
+      <label>Copilot model ID<input id="cp-model" placeholder="blank = random"></label>
+      <label>Choose Copilot model
+        <select id="cp-model-picker"><option value="">Select a Copilot model...</option></select>
+      </label>
+      <label>Selection model pool<input id="cp-model-pool" placeholder="blank = all discovered models"></label>
+      <label>Model selector
+        <select id="cp-model-selector">
+          <option value="random">random</option>
+          <option value="best-1">best-1</option><option value="best-3">best-3</option><option value="best-5">best-5</option>
+          <option value="worst-1">worst-1</option><option value="worst-3">worst-3</option><option value="worst-5">worst-5</option>
+        </select>
+      </label>
+      <label>Handled model masks<input id="cp-modelmasks" placeholder="openai/*,gpt-*"></label>
+      <label>Role<input id="cp-role" value="headless-copilot"></label>
+      <label>Capabilities<input id="cp-capabilities" placeholder="images,embeddings"></label>
+      <label>Working directory<input id="cp-cwd" placeholder="runtime-managed workspace"></label>
+      <label>Relay WebSocket base<input id="cp-host-ws-url" placeholder="ws://127.0.0.1:8801"></label>
+      <label>Copilot executable<input id="cp-command" placeholder="auto-detect copilot.cmd / copilot"></label>
+      <label>Session UUID<input id="cp-session-id" placeholder="generated automatically"></label>
+      <label>Context
+        <select id="cp-context"><option value="default">default</option><option value="long_context">long_context</option></select>
+      </label>
+      <label>Reasoning effort / selector
+        <select id="cp-effort">
+          <option value="">model default</option><option>none</option><option>minimal</option><option>low</option>
+          <option>medium</option><option>high</option><option>xhigh</option><option>max</option>
+        </select>
+      </label>
+      <label>Max AI credits<input id="cp-credits" type="number" min="0.01" step="0.01" placeholder="unlimited"></label>
+      <label>Request timeout (seconds)<input id="cp-timeout" type="number" min="1" max="86400" value="900"></label>
+      <label>Reconnect delay (seconds)<input id="cp-reconnect" type="number" min="0.1" max="300" step="0.1" value="2"></label>
+      <label>Startup warmup prompt<input id="cp-warmup-prompt" value="Startup warmup: reply only READY."></label>
+      <label>Chunk token override<input id="cp-chunk-tokens" type="number" min="1000" max="1000000" placeholder="derive from selected model"></label>
+      <label>Maximum chunks<input id="cp-max-chunks" type="number" min="1" max="1000" value="64"></label>
+      <label>Max prompt characters<input id="cp-max-prompt" type="number" min="1000" max="20000000" value="4000000"></label>
+      <label>Max output characters<input id="cp-max-output" type="number" min="1000" max="2000000" value="200000"></label>
+    </div>
+    <label for="copilot-prompt" style="display:block;margin-top:0.7rem;color:#888;font-size:0.8rem">System prompt</label>
+    <textarea id="copilot-prompt" spellcheck="false"></textarea>
+    <div class="checks">
+      <label><input id="cp-autostart" type="checkbox" checked> autostart with EMULLM</label>
+      <label><input id="cp-warmup" type="checkbox" checked> call once at startup before connecting</label>
+      <label><input id="cp-chunk-prompts" type="checkbox" checked> chunk prompts larger than the servant model</label>
+      <label><input id="cp-allow-all" type="checkbox"> allow all tools, paths, and URLs (unsafe)</label>
+      <label><input id="cp-custom-instructions" type="checkbox"> load repository instructions</label>
+      <label><input id="cp-builtin-mcps" type="checkbox"> enable built-in MCPs</label>
+    </div>
+    <button type="submit">Save configuration</button>
+    <button id="copilot-new" type="button">Create new servant</button>
+    <span id="copilot-msg" class="msg"></span>
+  </form>
+</details>
+<div style="margin-top:10px">
+  <button id="copilot-add-another" type="button">+ Create another servant</button>
+</div>
+</section>
+
+<section class="panel" id="test-client">
+<h2>Model test client <button id="refresh-api-models" type="button">Refresh API models</button></h2>
+<p class="sub">Send a chat-completions request through this EMULLM server. Pick an advertised
+  model or type any model ID.</p>
+<form id="model-test-form">
+  <div class="form-grid">
+    <label>API model ID<input id="model-test-model" required placeholder="Type any model/id"></label>
+    <label>Choose advertised model <span id="api-model-count"></span>
+      <select id="model-test-model-picker"><option value="">Select a model...</option></select>
+    </label>
+  </div>
+  <label for="model-test-prompt" style="display:block;margin-top:0.7rem;color:#888;font-size:0.8rem">User prompt</label>
+  <textarea id="model-test-prompt" required>Say hello in five words.</textarea>
+  <div style="margin-top:0.5rem">
+    <button id="model-test-send" type="submit">Send request</button>
+    <button id="model-test-cancel" type="button" disabled>Cancel</button>
+    <button id="model-test-clear" type="button">Clear result</button>
+    <span id="model-test-status" class="msg"></span>
+  </div>
+</form>
+<h3>Assistant response</h3>
+<pre id="model-test-answer" class="muted">No request sent.</pre>
+<details>
+  <summary>Raw response</summary>
+  <pre id="model-test-raw"></pre>
+</details>
+</section>
+
+<section class="panel" id="config-sections">
+<h2>Configuration sections</h2>
+<p class="sub">Edit one validated section without replacing unrelated settings. Startup-owned changes report that an EMULLM restart is required.</p>
+<div class="section-editor">
+  <div class="section-tabs" id="config-section-tabs"></div>
+  <div>
+    <h3 id="config-section-title">Select a section</h3>
+    <p class="sub" id="config-section-help"></p>
+    <label class="sr-only" for="config-section-editor">Selected configuration section JSON</label>
+    <textarea id="config-section-editor" spellcheck="false"></textarea>
+    <div style="margin-top:8px">
+      <button id="config-section-save" type="button">Save section</button>
+      <button id="config-section-reload" type="button">Reload section</button>
+      <button id="config-section-delete" type="button">Delete section</button>
+      <span id="config-section-msg" class="msg"></span>
+    </div>
+  </div>
+</div>
+</section>
+
+<section class="panel" id="configuration">
 <h2>config.json <span id="cfg-path" class="muted"></span></h2>
+<label class="sr-only" for="config">Raw EMULLM JSON configuration</label>
 <textarea id="config" spellcheck="false"></textarea>
 <div style="margin-top:0.5rem">
   <button id="reload">Reload</button>
   <button id="save">Save</button>
   <span id="cfg-msg" class="msg"></span>
 </div>
+</section>
+</div>
+</main>
+</div>
 
 <script>
 // Resolve REST calls relative to wherever this page is served, so it works
 // under either admin prefix (/emullm/admin or /admin/emullm) -- and would
 // survive being mounted under a sub-path. Both alias trees exist server-side.
-const ADMIN = location.pathname.replace(/\\/+$/, '') || '/emullm/admin';
+const PAGE_PATH = location.pathname.replace(/\\/+$/, '');
+const ADMIN = PAGE_PATH === '/emullm' ? '/emullm/admin' : (PAGE_PATH || '/emullm/admin');
 async function getJSON(u, opts) { const r = await fetch(u, opts); return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) }; }
 function esc(x) { return String(x).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function formatDuration(value) {
+  let seconds = Math.max(0, Math.floor(Number(value) || 0));
+  const days = Math.floor(seconds / 86400); seconds %= 86400;
+  const hours = Math.floor(seconds / 3600); seconds %= 3600;
+  const minutes = Math.floor(seconds / 60); seconds %= 60;
+  return [days ? days + 'd' : '', hours ? hours + 'h' : '', minutes ? minutes + 'm' : '', seconds + 's'].filter(Boolean).join(' ');
+}
+const DEFAULT_COPILOT_PROMPT = 'Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.';
+let copilotInstances = [];
+let copilotModelCatalog = [];
+let editingCopilot = null;
+let suggestedCopilotId = 'copilot-headless-1';
+let modelTestController = null;
+let modelTestTimer = null;
+let modelTestStartedAt = 0;
+let modelTestRequestId = null;
+let serverPid = null;
+let currentConfig = {};
+let activeConfigSection = 'services';
+const CONFIG_SECTIONS = {
+  services: ['Service catalog and per-service fallback policies.', 'object'],
+  agents: ['Unified recruit, subagent, mock, and proxy agent definitions.', 'array'],
+  model_routes: ['Model IDs mapped to one worker or an ordered worker-glob/backend chain.', 'object'],
+  workers: ['Legacy managed worker definitions used by auto mode.', 'array'],
+  mock_workers: ['Legacy in-process mock worker definitions.', 'array'],
+  backends: ['Legacy OpenAI-compatible proxy backend definitions.', 'array'],
+  mock: ['Global mock reply and template used by mock mode.', 'object'],
+};
+
+async function waitForServerRestart(previousPid) {
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    try {
+      const state = await getJSON(ADMIN + '/state', { cache: 'no-store' });
+      if (state.ok && state.body.process && state.body.process.pid !== previousPid) {
+        location.reload();
+        return;
+      }
+    } catch (_) {
+      // Expected while the old process releases the port.
+    }
+  }
+  field('updated').textContent = 'restart timed out';
+}
+field('server-restart').addEventListener('click', async () => {
+  if (!confirm('Gracefully restart EMULLM and all resident servants?')) return;
+  const previousPid = serverPid;
+  field('server-restart').disabled = true;
+  field('updated').textContent = 'restarting...';
+  const response = await getJSON(ADMIN + '/restart', { method: 'POST' });
+  if (!response.ok) {
+    field('updated').textContent = response.body.detail || 'restart failed';
+    field('server-restart').disabled = false;
+    return;
+  }
+  void waitForServerRestart(previousPid);
+});
+field('server-shutdown').addEventListener('click', async () => {
+  if (!confirm('Gracefully shut down EMULLM and all resident servants?')) return;
+  field('server-shutdown').disabled = true;
+  field('updated').textContent = 'shutting down...';
+  const response = await getJSON(ADMIN + '/shutdown', { method: 'POST' });
+  if (!response.ok) {
+    field('updated').textContent = response.body.detail || 'shutdown failed';
+    field('server-shutdown').disabled = false;
+  }
+});
+
+async function refreshConfiguredAgents() {
+  const r = await getJSON(ADMIN + '/agents', { cache: 'no-store' });
+  const carol = ((r.body && r.body.agents) || []).find(agent => agent.id === 'carol');
+  field('carol-enabled').disabled = !carol;
+  field('carol-enabled').checked = !!(carol && carol.enabled);
+  field('carol-note').textContent = !carol ? 'Carol is not present in config.json' :
+    (carol.mock_registered ? 'enabled and registered' : (carol.enabled ? 'enabled; waiting' : 'disabled'));
+}
+field('carol-enabled').addEventListener('change', async () => {
+  const enabled = field('carol-enabled').checked;
+  field('carol-enabled').disabled = true;
+  const r = await getJSON(ADMIN + '/agents/carol/enabled', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  field('carol-note').textContent = r.ok ? (enabled ? 'enabled and registered' : 'disabled') :
+    ('update failed (' + r.status + ')');
+  await Promise.all([refreshConfiguredAgents(), refreshWorkers(), refreshCopilots(), loadConfig()]);
+});
+
+async function refreshWebsockets() {
+  const r = await getJSON(ADMIN + '/websockets', { cache: 'no-store' });
+  const connections = (r.body && r.body.connections) || [];
+  field('websocket-note').textContent = connections.length + ' active';
+  field('nav-socket-count').textContent = connections.length;
+  field('top-socket-count').textContent = connections.length;
+  const tbody = field('websocket-connections');
+  if (!connections.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">none</td></tr>';
+    return;
+  }
+  tbody.innerHTML = connections.map(connection => {
+    const identity = connection.worker_id || ((connection.subscriptions || []).join(', ')) ||
+      (connection.filters ? JSON.stringify(connection.filters) : '--');
+    return '<tr><td><code>' + esc(connection.connection_id) + '</code></td>' +
+      '<td><b>' + esc(connection.kind) + '</b><br><code>' + esc(connection.endpoint) + '</code></td>' +
+      '<td>' + esc(identity) + '</td><td>' + esc(connection.client || '--') + '</td>' +
+      '<td>in ' + (connection.messages_in || 0) + ' / out ' + (connection.messages_out || 0) + '</td>' +
+      '<td>' + (connection.connected_seconds || 0) + 's</td></tr>';
+  }).join('');
+}
+field('refresh-websockets').addEventListener('click', refreshWebsockets);
 
 async function refreshWorkers() {
   const r = await getJSON(ADMIN + '/workers', { cache: 'no-store' });
   const note = document.getElementById('sup-note');
   const tbody = document.getElementById('workers');
   const workers = (r.body && r.body.workers) || [];
+  field('nav-managed-count').textContent = workers.length;
   note.textContent = r.body.supervisor_active ? '' : '(no supervisor -- server not in auto mode)';
   if (!workers.length) {
     tbody.innerHTML = '<tr><td colspan="5" class="muted">none</td></tr>';
@@ -5728,14 +6692,470 @@ document.getElementById('workers').addEventListener('click', async (e) => {
 });
 document.getElementById('refresh-services').addEventListener('click', tick);
 
+function csv(value) { return value.split(',').map(v => v.trim()).filter(Boolean); }
+function field(id) { return document.getElementById(id); }
+function setCopilotMsg(text, cls) {
+  const node = field('copilot-msg'); node.textContent = text; node.className = 'msg ' + cls;
+}
+function resetCopilotForm() {
+  editingCopilot = null;
+  field('copilot-editor-title').textContent = 'Add headless Copilot servant';
+  field('cp-worker-id').readOnly = false;
+  field('cp-worker-id').value = suggestedCopilotId;
+  field('cp-model').value = '';
+  field('cp-model-pool').value = '';
+  field('cp-model-selector').value = 'random';
+  field('cp-modelmasks').value = '';
+  field('cp-role').value = 'headless-copilot';
+  field('cp-capabilities').value = '';
+  field('cp-cwd').value = '';
+  field('cp-host-ws-url').value = '';
+  field('cp-command').value = '';
+  field('cp-session-id').value = '';
+  field('cp-context').value = 'default';
+  field('cp-effort').value = '';
+  field('cp-credits').value = '';
+  field('cp-timeout').value = '900';
+  field('cp-reconnect').value = '2';
+  field('cp-warmup-prompt').value = 'Startup warmup: reply only READY.';
+  field('cp-chunk-tokens').value = '';
+  field('cp-max-chunks').value = '64';
+  field('cp-max-prompt').value = '4000000';
+  field('cp-max-output').value = '200000';
+  field('copilot-prompt').value = DEFAULT_COPILOT_PROMPT;
+  field('cp-autostart').checked = true;
+  field('cp-warmup').checked = true;
+  field('cp-chunk-prompts').checked = true;
+  field('cp-allow-all').checked = false;
+  field('cp-custom-instructions').checked = false;
+  field('cp-builtin-mcps').checked = false;
+  updateReasoningOptions();
+  setCopilotMsg('', '');
+}
+function editCopilot(config) {
+  editingCopilot = config.worker_id;
+  field('copilot-editor').open = true;
+  field('copilot-editor-title').textContent = 'Edit ' + config.worker_id;
+  field('cp-worker-id').value = config.worker_id || '';
+  field('cp-worker-id').readOnly = true;
+  field('cp-model').value = config.model || '';
+  field('cp-model-pool').value = (config.model_pool || []).join(',');
+  field('cp-model-selector').value = config.model_selector || 'random';
+  field('cp-modelmasks').value = (config.modelmasks || []).join(',');
+  field('cp-role').value = config.role || 'headless-copilot';
+  field('cp-capabilities').value = (config.capabilities || []).join(',');
+  field('cp-cwd').value = config.cwd || '';
+  field('cp-host-ws-url').value = config.host_ws_url || '';
+  field('cp-command').value = config.copilot_command || '';
+  field('cp-session-id').value = config.session_id || '';
+  field('cp-context').value = config.context || 'default';
+  field('cp-effort').value = config.reasoning_effort || '';
+  field('cp-credits').value = config.max_ai_credits ?? '';
+  field('cp-timeout').value = config.timeout_seconds ?? 900;
+  field('cp-reconnect').value = config.reconnect_seconds ?? 2;
+  field('cp-warmup-prompt').value = config.warmup_prompt || 'Startup warmup: reply only READY.';
+  field('cp-chunk-tokens').value = config.chunk_tokens ?? '';
+  field('cp-max-chunks').value = config.max_chunks ?? 64;
+  field('cp-max-prompt').value = config.max_prompt_chars ?? 4000000;
+  field('cp-max-output').value = config.max_output_chars ?? 200000;
+  field('copilot-prompt').value = config.system_prompt || DEFAULT_COPILOT_PROMPT;
+  field('cp-autostart').checked = config.autostart !== false;
+  field('cp-warmup').checked = config.warmup !== false;
+  field('cp-chunk-prompts').checked = config.chunk_long_prompts !== false;
+  field('cp-allow-all').checked = !!config.allow_all;
+  field('cp-custom-instructions').checked = !!config.load_custom_instructions;
+  field('cp-builtin-mcps').checked = !!config.enable_builtin_mcps;
+  updateReasoningOptions(config.reasoning_effort || '');
+  setCopilotMsg('', '');
+}
+function copilotConfigFromForm() {
+  const config = {
+    worker_id: field('cp-worker-id').value.trim(),
+    model_pool: csv(field('cp-model-pool').value),
+    model_selector: field('cp-model-selector').value,
+    modelmasks: csv(field('cp-modelmasks').value),
+    role: field('cp-role').value.trim() || 'headless-copilot',
+    capabilities: csv(field('cp-capabilities').value),
+    system_prompt: field('copilot-prompt').value,
+    autostart: field('cp-autostart').checked,
+    warmup: field('cp-warmup').checked,
+    warmup_prompt: field('cp-warmup-prompt').value,
+    chunk_long_prompts: field('cp-chunk-prompts').checked,
+    max_chunks: Number(field('cp-max-chunks').value),
+    timeout_seconds: Number(field('cp-timeout').value),
+    reconnect_seconds: Number(field('cp-reconnect').value),
+    context: field('cp-context').value,
+    allow_all: field('cp-allow-all').checked,
+    load_custom_instructions: field('cp-custom-instructions').checked,
+    enable_builtin_mcps: field('cp-builtin-mcps').checked,
+    max_prompt_chars: Number(field('cp-max-prompt').value),
+    max_output_chars: Number(field('cp-max-output').value),
+  };
+  for (const [key, id] of [
+    ['session_id','cp-session-id'], ['model','cp-model'], ['cwd','cp-cwd'],
+    ['host_ws_url','cp-host-ws-url'], ['copilot_command','cp-command'],
+    ['reasoning_effort','cp-effort'],
+  ]) {
+    const value = field(id).value.trim(); if (value) config[key] = value;
+  }
+  const credits = field('cp-credits').value;
+  if (credits !== '') config.max_ai_credits = Number(credits);
+  const chunkTokens = field('cp-chunk-tokens').value;
+  if (chunkTokens !== '') config.chunk_tokens = Number(chunkTokens);
+  return config;
+}
+async function refreshCopilots() {
+  const r = await getJSON(ADMIN + '/copilots', { cache: 'no-store' });
+  const tbody = field('copilots');
+  const note = field('copilot-note');
+  copilotInstances = (r.body && r.body.instances) || [];
+  field('nav-servant-count').textContent = copilotInstances.length;
+  field('top-servant-count').textContent = copilotInstances.length;
+  suggestedCopilotId = (r.body && r.body.next_worker_id) || 'copilot-headless-1';
+  if (!editingCopilot) field('cp-worker-id').value = suggestedCopilotId;
+  note.textContent = !r.body.manager_active ? '(manager unavailable)' :
+    (r.body.copilot_available ? ('CLI: ' + (r.body.copilot_command || 'available')) : '(Copilot CLI not found)');
+  if (!copilotInstances.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">none configured</td></tr>';
+    return;
+  }
+  tbody.innerHTML = copilotInstances.map(item => {
+    const cfg = item.config || {};
+    const runtime = item.runtime || {};
+    const state = item.connected ? 'connected' : (item.running ? 'starting / reconnecting' : 'stopped');
+    const masks = (item.modelmasks || []).length ? item.modelmasks.join(', ') : 'all API models';
+    return '<tr><td><span class="dot ' + (item.running ? 'on' : 'off') + '"></span><b>' + esc(item.worker_id) + '</b></td>' +
+      '<td>' + esc(item.selected_model || item.model || 'not started') +
+      (item.model ? '' : ' <span class="muted">(' + esc(item.model_selector || 'random') + ')</span>') +
+      (item.selected_reasoning_effort ? ('<br>effort ' + esc(item.selected_reasoning_effort)) :
+        (item.reasoning_effort ? ('<br>effort ' + esc(item.reasoning_effort)) : '')) +
+      '<br><code title="' + esc(item.session_id) + '">' + esc(item.session_id.slice(0, 12)) + '...</code></td>' +
+      '<td>' + esc(masks) + '</td><td>' + esc(state) + (item.pid ? (' · adapter ' + item.pid) : '') +
+      (runtime.runtime_pid ? (' · CLI ' + runtime.runtime_pid) : '') +
+      (runtime.bridge_pid ? (' · bridge ' + runtime.bridge_pid) : '') +
+      (runtime.warmup_duration_ms != null ? ('<br>warmup ' + (runtime.warmup_duration_ms / 1000).toFixed(1) + 's') : '') +
+      (runtime.last_chunk_count > 1 ? (' · ' + runtime.last_chunk_count + ' chunks') : '') +
+      (runtime.last_duration_ms != null ? ('<br>last ' + (runtime.last_duration_ms / 1000).toFixed(1) + 's') : '') + '</td>' +
+      '<td><button data-cp-act="edit" data-id="' + esc(item.worker_id) + '">Edit</button>' +
+      '<button data-cp-act="start" data-id="' + esc(item.worker_id) + '">Start</button>' +
+      '<button data-cp-act="stop" data-id="' + esc(item.worker_id) + '">Stop</button>' +
+      '<button data-cp-act="restart" data-id="' + esc(item.worker_id) + '">Restart</button>' +
+      '<button data-cp-act="reset-session" data-id="' + esc(item.worker_id) + '">New session</button>' +
+      '<button data-cp-act="delete" data-id="' + esc(item.worker_id) + '">Delete</button>' +
+      '<a class="action-link" href="' + ADMIN + '/copilots/' + encodeURIComponent(item.worker_id) + '/log" target="_blank">log</a></td></tr>';
+  }).join('');
+}
+async function refreshCopilotModels(force) {
+  const r = await getJSON(ADMIN + '/copilots/models?refresh=' + (force ? 'true' : 'false'), { cache: 'no-store' });
+  const models = (r.body && r.body.models) || [];
+  copilotModelCatalog = models;
+  field('cp-model-picker').innerHTML = '<option value="">Select a Copilot model...</option>' +
+    models.filter(model => model.id !== 'auto').map(model =>
+      '<option value="' + esc(model.id) + '">' +
+      (model.quality_rank ? ('#' + model.quality_rank + ' ') : '') +
+      esc(model.name || model.id) + ' · ' + esc(model.quality_tier || 'unranked') + '</option>'
+    ).join('');
+  field('cp-model-picker').disabled = models.length === 0;
+  field('cp-model-picker').value = [...field('cp-model-picker').options].some(
+    option => option.value === field('cp-model').value
+  ) ? field('cp-model').value : '';
+  const suffix = r.body.error ? ('; fallback: ' + r.body.error) : '';
+  field('copilot-model-note').textContent = models.length
+    ? ('Available Copilot models: ' + models.length + ' (' + (r.body.source || 'unknown') + ')' + suffix)
+    : 'No Copilot models discovered';
+  updateReasoningOptions();
+}
+field('refresh-copilots').addEventListener('click', refreshCopilots);
+field('refresh-copilot-models').addEventListener('click', () => refreshCopilotModels(true));
+field('cp-model-picker').addEventListener('change', () => {
+  if (field('cp-model-picker').value) field('cp-model').value = field('cp-model-picker').value;
+  updateReasoningOptions();
+});
+field('cp-model').addEventListener('input', () => updateReasoningOptions());
+field('cp-model-pool').addEventListener('input', () => updateReasoningOptions());
+function updateReasoningOptions(preferred) {
+  const order = ['none','minimal','low','medium','high','xhigh','max'];
+  const selectors = ['random','most-1','most-2','most-3','least-1','least-2','least-3'];
+  const explicit = field('cp-model').value.trim();
+  const pool = csv(field('cp-model-pool').value);
+  const candidates = explicit ? copilotModelCatalog.filter(model => model.id === explicit) :
+    (pool.length ? copilotModelCatalog.filter(model => pool.includes(model.id)) :
+      copilotModelCatalog.filter(model => model.id !== 'auto'));
+  const supported = new Set();
+  for (const model of candidates) {
+    const levels = model.capabilities && model.capabilities.supports
+      ? model.capabilities.supports.reasoning_effort : [];
+    for (const level of (Array.isArray(levels) ? levels : [])) supported.add(level);
+  }
+  const current = preferred || field('cp-effort').value;
+  const levels = order.filter(level => supported.size === 0 || supported.has(level));
+  field('cp-effort').innerHTML = '<option value="">model default</option>' +
+    selectors.map(value => '<option value="' + value + '">' + value + '</option>').join('') +
+    levels.map(level => '<option value="' + level + '">' + level + '</option>').join('');
+  field('cp-effort').value = [...selectors, ...levels].includes(current) ? current : '';
+}
+function beginNewCopilot() {
+  resetCopilotForm();
+  field('copilot-editor').open = true;
+  field('copilot-editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  field('cp-worker-id').focus();
+}
+field('copilot-new').addEventListener('click', beginNewCopilot);
+field('copilot-add-another').addEventListener('click', beginNewCopilot);
+field('copilots').addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-cp-act]'); if (!button) return;
+  const action = button.dataset.cpAct;
+  const id = button.dataset.id;
+  const item = copilotInstances.find(candidate => candidate.worker_id === id);
+  if (action === 'edit') { editCopilot((item && item.config) || {}); return; }
+  if (action === 'delete') {
+    if (!confirm('Delete headless Copilot servant ' + id + '? Logs are retained.')) return;
+    await getJSON(ADMIN + '/copilots/' + encodeURIComponent(id), { method: 'DELETE' });
+  } else {
+    await getJSON(ADMIN + '/copilots/' + encodeURIComponent(id) + '/' + action, { method: 'POST' });
+  }
+  await refreshCopilots(); await loadConfig();
+});
+field('copilot-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const config = copilotConfigFromForm();
+  if (!config.worker_id) { setCopilotMsg('worker ID is required', 'err'); return; }
+  const path = editingCopilot
+    ? ADMIN + '/copilots/' + encodeURIComponent(editingCopilot) + '?restart=true'
+    : ADMIN + '/copilots?start=true';
+  const r = await getJSON(path, {
+    method: editingCopilot ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  const detail = r.body && r.body.detail;
+  setCopilotMsg(r.ok ? 'saved and active' : ('save failed: ' + (typeof detail === 'string' ? detail : JSON.stringify(detail || r.status))), r.ok ? 'ok' : 'err');
+  if (r.ok) {
+    editCopilot(r.body.config);
+    await refreshCopilots(); await loadConfig();
+  }
+});
+
+function configSectionDefault(section) {
+  return CONFIG_SECTIONS[section][1] === 'array' ? [] : {};
+}
+function configSectionSummary(value) {
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === 'object') return Object.keys(value).length;
+  return value == null ? 0 : 1;
+}
+function renderConfigSection() {
+  field('config-section-tabs').innerHTML = Object.keys(CONFIG_SECTIONS).map(section =>
+    '<button type="button" class="section-tab ' + (section === activeConfigSection ? 'active' : '') +
+    '" data-section="' + section + '"><span>' + esc(section) + '</span><b>' +
+    configSectionSummary(currentConfig[section]) + '</b></button>'
+  ).join('');
+  field('config-section-title').textContent = activeConfigSection;
+  field('config-section-help').textContent = CONFIG_SECTIONS[activeConfigSection][0];
+  const value = currentConfig[activeConfigSection] ?? configSectionDefault(activeConfigSection);
+  field('config-section-editor').value = JSON.stringify(value, null, 2);
+}
+field('config-section-tabs').addEventListener('click', event => {
+  const button = event.target.closest('button[data-section]'); if (!button) return;
+  activeConfigSection = button.dataset.section;
+  renderConfigSection();
+});
+field('config-section-reload').addEventListener('click', renderConfigSection);
+field('config-section-save').addEventListener('click', async () => {
+  let value;
+  try { value = JSON.parse(field('config-section-editor').value); }
+  catch (error) {
+    field('config-section-msg').textContent = 'invalid JSON: ' + error.message;
+    field('config-section-msg').className = 'msg err';
+    return;
+  }
+  const r = await getJSON(ADMIN + '/config/section/' + activeConfigSection, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value }),
+  });
+  const detail = r.body && r.body.detail;
+  field('config-section-msg').textContent = r.ok ? 'saved; restart required' :
+    ('save failed: ' + (typeof detail === 'string' ? detail : JSON.stringify(detail || r.status)));
+  field('config-section-msg').className = 'msg ' + (r.ok ? 'ok' : 'err');
+  if (r.ok) {
+    currentConfig = r.body.config;
+    field('config').value = JSON.stringify(currentConfig, null, 2);
+    renderConfigSection();
+  }
+});
+field('config-section-delete').addEventListener('click', async () => {
+  if (!confirm('Delete the ' + activeConfigSection + ' section from config.json?')) return;
+  const r = await getJSON(ADMIN + '/config/section/' + activeConfigSection, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ delete: true }),
+  });
+  field('config-section-msg').textContent = r.ok ? 'deleted; restart required' : ('delete failed (' + r.status + ')');
+  field('config-section-msg').className = 'msg ' + (r.ok ? 'ok' : 'err');
+  if (r.ok) {
+    currentConfig = r.body.config;
+    field('config').value = JSON.stringify(currentConfig, null, 2);
+    renderConfigSection();
+  }
+});
+
+async function refreshApiModels() {
+  const [r, state] = await Promise.all([
+    getJSON('/v1/models', { cache: 'no-store' }),
+    getJSON(ADMIN + '/state', { cache: 'no-store' }),
+  ]);
+  const byId = new Map();
+  for (const model of ((r.body && r.body.data) || [])) byId.set(model.id, model);
+  for (const id of ((state.body && state.body.advertised_models) || [])) {
+    if (!byId.has(id)) byId.set(id, { id, name: id });
+  }
+  for (const id of Object.keys((state.body && state.body.model_routes) || {})) {
+    if (!byId.has(id)) byId.set(id, { id, name: id });
+  }
+  const models = [...byId.values()];
+  field('nav-model-count').textContent = models.length;
+  field('top-model-count').textContent = models.length;
+  field('model-test-model-picker').innerHTML = '<option value="">Select a model...</option>' + models.map(model =>
+    '<option value="' + esc(model.id) + '">' + esc(model.name || model.id) + ' · ' + esc(model.id) + '</option>'
+  ).join('');
+  field('model-test-model-picker').disabled = models.length === 0;
+  field('api-model-count').textContent = '(' + models.length + ')';
+  if (!field('model-test-model').value && models.length) field('model-test-model').value = models[0].id;
+  field('model-test-model-picker').value = [...field('model-test-model-picker').options].some(
+    option => option.value === field('model-test-model').value
+  ) ? field('model-test-model').value : '';
+  field('model-test-status').textContent = models.length + ' advertised model(s)';
+}
+field('refresh-api-models').addEventListener('click', refreshApiModels);
+field('model-test-model-picker').addEventListener('change', () => {
+  if (field('model-test-model-picker').value) {
+    field('model-test-model').value = field('model-test-model-picker').value;
+  }
+});
+field('model-test-clear').addEventListener('click', () => {
+  field('model-test-answer').textContent = 'No request sent.';
+  field('model-test-answer').className = 'muted';
+  field('model-test-raw').textContent = '';
+  field('model-test-status').textContent = '';
+});
+field('model-test-cancel').addEventListener('click', async () => {
+  if (modelTestController && modelTestRequestId) {
+    const controller = modelTestController;
+    const requestId = modelTestRequestId;
+    field('model-test-status').textContent = 'cancelling... ' +
+      ((performance.now() - modelTestStartedAt) / 1000).toFixed(1) + 's';
+    await getJSON(ADMIN + '/test-chat/' + encodeURIComponent(requestId), {
+      method: 'DELETE',
+    }).catch(() => ({}));
+    controller.abort();
+  }
+});
+field('model-test-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const model = field('model-test-model').value.trim();
+  const prompt = field('model-test-prompt').value;
+  if (!model || !prompt.trim()) return;
+  const button = field('model-test-send');
+  modelTestController = new AbortController();
+  modelTestRequestId = (crypto.randomUUID && crypto.randomUUID()) ||
+    ('test-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+  modelTestStartedAt = performance.now();
+  button.disabled = true;
+  field('model-test-cancel').disabled = false;
+  modelTestTimer = window.setInterval(() => {
+    field('model-test-status').textContent = 'waiting... ' +
+      ((performance.now() - modelTestStartedAt) / 1000).toFixed(1) + 's';
+  }, 100);
+  try {
+    const r = await getJSON(ADMIN + '/test-chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: modelTestRequestId, model, prompt }),
+      signal: modelTestController.signal,
+    });
+    const elapsed = ((performance.now() - modelTestStartedAt) / 1000).toFixed(1);
+    const answer = r.body && r.body.choices && r.body.choices[0] && r.body.choices[0].message
+      ? r.body.choices[0].message.content : '';
+    const cancelled = r.status === 499;
+    field('model-test-answer').textContent = cancelled ? 'Request cancelled.' :
+      (answer || (r.ok ? '(empty response)' : (r.body.detail || 'request failed')));
+    field('model-test-answer').className = cancelled ? 'muted' : (r.ok ? '' : 'err');
+    field('model-test-raw').textContent = JSON.stringify(r.body, null, 2);
+    field('model-test-status').textContent = cancelled ? ('cancelled · ' + elapsed + 's') :
+      ('HTTP ' + r.status + ' · ' + elapsed + 's');
+  } catch (error) {
+    const elapsed = ((performance.now() - modelTestStartedAt) / 1000).toFixed(1);
+    if (error && error.name === 'AbortError') {
+      field('model-test-answer').textContent = 'Request cancelled.';
+      field('model-test-answer').className = 'muted';
+      field('model-test-status').textContent = 'cancelled · ' + elapsed + 's';
+    } else {
+      field('model-test-answer').textContent = String(error);
+      field('model-test-answer').className = 'err';
+      field('model-test-status').textContent = 'request failed · ' + elapsed + 's';
+    }
+  } finally {
+    window.clearInterval(modelTestTimer);
+    modelTestTimer = null;
+    modelTestController = null;
+    modelTestRequestId = null;
+    button.disabled = false;
+    field('model-test-cancel').disabled = true;
+  }
+});
+
 async function loadConfig() {
   const r = await getJSON(ADMIN + '/config', { cache: 'no-store' });
   document.getElementById('cfg-path').textContent = r.body.path || '';
-  document.getElementById('config').value = JSON.stringify(r.body.config || {}, null, 2);
+  const config = r.body.config || {};
+  currentConfig = config;
+  document.getElementById('config').value = JSON.stringify(config, null, 2);
+  field('server-description').value = config.description || '';
+  field('server-mode').value = Array.isArray(config.mode) ? config.mode.join(',') : (config.mode || '');
+  field('server-capability-fallback').value = config.capability_fallback || 'stub';
+  field('server-subagent-model').value = config.subagent_model || '';
+  field('server-validation-default').value = config.validation_interval_default ?? config.validation_interval ?? '';
+  field('server-validation-override').value = config.validation_interval_override ?? '';
+  const proxy = (config.agents || []).find(agent => agent && agent.launch === 'proxy') || {};
+  field('server-proxy-url').value = proxy.base_url || '';
+  field('server-proxy-model').value = proxy.model || '';
+  renderConfigSection();
   setMsg('', '');
 }
 function setMsg(text, cls) { const m = document.getElementById('cfg-msg'); m.textContent = text; m.className = 'msg ' + cls; }
 document.getElementById('reload').addEventListener('click', loadConfig);
+field('server-settings-reload').addEventListener('click', loadConfig);
+field('server-settings-save').addEventListener('click', async () => {
+  let config;
+  try { config = JSON.parse(field('config').value || '{}'); }
+  catch (error) {
+    field('server-settings-msg').textContent = 'invalid raw config JSON: ' + error.message;
+    field('server-settings-msg').className = 'msg err';
+    return;
+  }
+  const setOptional = (key, value) => {
+    const trimmed = String(value).trim();
+    if (trimmed) config[key] = trimmed; else delete config[key];
+  };
+  setOptional('description', field('server-description').value);
+  setOptional('mode', field('server-mode').value);
+  config.capability_fallback = field('server-capability-fallback').value;
+  setOptional('subagent_model', field('server-subagent-model').value);
+  setOptional('validation_interval_default', field('server-validation-default').value);
+  setOptional('validation_interval_override', field('server-validation-override').value);
+  const proxy = (config.agents || []).find(agent => agent && agent.launch === 'proxy');
+  if (proxy) {
+    proxy.base_url = field('server-proxy-url').value.trim();
+    proxy.model = field('server-proxy-model').value.trim() || null;
+  }
+  const r = await getJSON(ADMIN + '/config', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ config }),
+  });
+  field('server-settings-msg').textContent = r.ok ? 'saved; restart to apply startup settings' : ('save failed (' + r.status + ')');
+  field('server-settings-msg').className = 'msg ' + (r.ok ? 'ok' : 'err');
+  if (r.ok) await loadConfig();
+});
 document.getElementById('save').addEventListener('click', async () => {
   let parsed;
   try { parsed = JSON.parse(document.getElementById('config').value); }
@@ -5750,11 +7170,16 @@ async function tick() {
   try {
     const s = await getJSON(ADMIN + '/state', { cache: 'no-store' });
     document.getElementById('mode').textContent = (s.body && s.body.mode) || 'relay';
-    await refreshWorkers();
+    serverPid = s.body && s.body.process ? s.body.process.pid : null;
+    field('top-uptime').textContent = formatDuration(s.body && s.body.uptime_seconds);
+    await Promise.all([refreshConfiguredAgents(), refreshWebsockets(), refreshWorkers(), refreshCopilots()]);
     document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
   } catch (e) { document.getElementById('updated').textContent = 'error'; }
 }
 loadConfig();
+resetCopilotForm();
+refreshCopilotModels(false);
+refreshApiModels();
 tick();
 setInterval(tick, 3000);
 </script>
@@ -5764,8 +7189,10 @@ setInterval(tick, 3000);
 
 @router.get("/admin/emullm", response_class=HTMLResponse)
 @router.get("/emullm/admin", response_class=HTMLResponse)
+@router.get("/emullm/", response_class=HTMLResponse)
+@router.get("/emullm", response_class=HTMLResponse)
 def admin_page() -> str:
-    """Operator control page: edit config.json and start/stop managed workers."""
+    """Operator control page: configure EMULLM and manage model workers."""
     return _ADMIN_PAGE_HTML
 
 
@@ -5783,7 +7210,7 @@ def admin_set_runtime_dir(body: SetRuntimeDirRequest) -> dict[str, Any]:
 
 
 class ModelRoutesRequest(BaseModel):
-    routes: dict[str, str] = Field(default_factory=dict)
+    routes: dict[str, str | list[str]] = Field(default_factory=dict)
     replace: bool = False
 
 
@@ -5796,16 +7223,20 @@ def admin_get_model_routes() -> dict[str, Any]:
 @router.post("/admin/emullm/model_routes")
 @router.post("/emullm/admin/model_routes")
 def admin_set_model_routes(body: ModelRoutesRequest) -> dict[str, Any]:
-    """Set catalog-model-id -> serving-worker-id routes at runtime (for ad-hoc
-    workers not declared in config). Merges by default; ``replace: true`` clears
-    first; an empty worker_id removes that route."""
+    """Set model routes at runtime.
+
+    A value may be one exact worker ID or an ordered list of worker-ID globs and
+    OpenAI-compatible backend URLs. Merges by default; ``replace: true`` clears
+    first, and an empty value removes a route.
+    """
     if body.replace:
         _model_routes.clear()
-    for mid, wid in body.routes.items():
+    for mid, route in body.routes.items():
         if not isinstance(mid, str) or not mid:
             continue
-        if wid:
-            _model_routes[mid] = str(wid)
+        normalized = _normalise_model_route(route)
+        if normalized:
+            _model_routes[mid] = normalized
         else:
             _model_routes.pop(mid, None)
     return {"model_routes": dict(_model_routes)}
@@ -5881,19 +7312,26 @@ async def _serve_worker_socket(
         await websocket.close(code=1008)
         return
     await websocket.accept()
+    connection_id = _register_active_websocket(
+        websocket,
+        "worker",
+        worker_id=worker_id,
+        modelmasks=list(model_masks) if model_masks is not None else None,
+    )
     _ensure_worker_mailbox(worker_id)
     async with _worker_lock:
         _connected_workers[worker_id] = websocket
         _native_worker_ids.add(worker_id)
+        _worker_connection_ids[worker_id] = connection_id
         _set_worker_model_masks(worker_id, model_masks)
     _record_worker_connection(worker_id, model_masks)
     try:
         hello: dict[str, Any] = {"type": "hello", "worker_id": worker_id}
         if model_masks is not None:
             hello["modelmasks"] = list(model_masks)
-        await websocket.send_json(hello)
+        await _tracked_ws_send_json(websocket, connection_id, hello)
         while True:
-            data = await websocket.receive_json()
+            data = await _tracked_ws_receive_json(websocket, connection_id)
             if isinstance(data, dict) and data.get("type") == "register":
                 _apply_worker_registration(worker_id, data)
             elif isinstance(data, dict):
@@ -5912,8 +7350,10 @@ async def _serve_worker_socket(
             if _connected_workers.get(worker_id) is websocket:
                 del _connected_workers[worker_id]
                 _native_worker_ids.discard(worker_id)
+                _worker_connection_ids.pop(worker_id, None)
                 _worker_model_masks.pop(worker_id, None)
                 disconnected = True
+        _remove_active_websocket(connection_id)
         if disconnected:
             _record_worker_disconnection(worker_id)
 
@@ -5959,3 +7399,6 @@ async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
         future = _pending.pop(request_id, None)
         if future and not future.done():
             future.set_result(reply)
+
+
+router.include_router(_copilot_api.router)

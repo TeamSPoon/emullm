@@ -1,10 +1,132 @@
 {
- "description": "emullm dev config -- exercises every schema key offline (no network, no real processes).",
+ "description": "emullm dev config -- exercises every schema key and autostarts the configured headless Copilot servants.",
  "mode": "recruit,mock",
  "validation_interval_default": "never",
  "validation_interval": null,
  "validation_interval_override": null,
  "subagent_launch": "copilot",
+ "headless_copilots": [
+  {
+   "worker_id": "copilot-headless-1",
+   "session_id": "173ed2b6-6233-4e59-aa89-62bb9628a43c",
+   "model": null,
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [],
+   "role": "headless-copilot",
+   "capabilities": [],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": true,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 0.1,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000
+  },
+  {
+   "worker_id": "copilot-headless-2",
+   "session_id": "45f79464-c8d3-4525-ba27-1d1d1e374d43",
+   "model": null,
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [],
+   "role": "headless-copilot",
+   "capabilities": [],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": true,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000
+  },
+  {
+   "worker_id": "copilot-headless-3",
+   "session_id": "c2d50a44-6347-4fc1-b202-ecd185f974d9",
+   "model": null,
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [],
+   "role": "headless-copilot",
+   "capabilities": [],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": true,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000
+  },
+  {
+   "worker_id": "copilot-headless-4",
+   "session_id": "ad288b0b-fbcb-4542-b166-ba16d2a0aeaf",
+   "model": null,
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [],
+   "role": "headless-copilot",
+   "capabilities": [],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": true,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000
+  }
+ ],
  "capability_fallback": "stub",
  "services": {
   "embeddings": {
@@ -65,6 +187,7 @@
   {
    "kind": "agent",
    "id": "carol",
+   "enabled": false,
    "launch": "mock",
    "description": "Deterministic fake used for offline testing. if carol moks here then that means we pretend carol impomented or error or whatever",
    "role": "mock",
@@ -89,7 +212,7 @@
    "name": "snet",
    "validation_interval": "1week",
    "description": "Real OpenAI-compatible upstream (used only when mode includes 'proxy').",
-   "base_url": "https://llm.c.singularitynet.io/v1",
+   "base_url": "https://llm.a.singularitycompute.com/v1",
    "api_key_env": "SNET_API_KEY",
    "api_key": null,
    "model": "google/gemma-4-31b-it",
@@ -355,21 +478,85 @@
  },
  "subagent_model": "claude-sonnet-4.5",
  "model_routes": {
-  "google/gemma-4-31b-it": "codex-ide-1",
-  "google/gemma-4-26b-a4b-it": "codex-ide-1",
-  "deepseek/deepseek-v4-flash-0731": "codex-ide-1",
-  "openai/gpt-oss-20b": "codex-ide-1",
-  "openai/gpt-oss-120b": "codex-ide-1",
-  "minimax/minimax-m2.5": "codex-ide-1",
-  "minimax/minimax-m2.7": "codex-ide-1",
-  "minimax/minimax-m3": "codex-ide-1",
-  "minimax/minimax-m3-f": "codex-ide-1",
-  "meta-llama/llama-3.3-70b-instruct": "codex-ide-1",
-  "qwen/qwen3.8-27b": "codex-ide-1",
-  "asi1": "codex-ide-1",
-  "asi1-mini": "codex-ide-1",
-  "WhereIsAI/UAE-Large-V1": "codex-ide-1",
-  "BAAI/bge-base-en-v1.5": "codex-ide-1",
-  "zira/for_sol": "test-copilot"
+  "google/gemma-4-31b-it": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "google/gemma-4-26b-a4b-it": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "deepseek/deepseek-v4-flash-0731": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "openai/gpt-oss-20b": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "openai/gpt-oss-120b": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "minimax/minimax-m2.5": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "minimax/minimax-m2.7": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "minimax/minimax-m3": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "minimax/minimax-m3-f": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "meta-llama/llama-3.3-70b-instruct": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "qwen/qwen3.8-27b": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "asi1": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "asi1-mini": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "WhereIsAI/UAE-Large-V1": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "BAAI/bge-base-en-v1.5": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ],
+  "zira/for_sol": [
+   "copilot-headless-*",
+   "codex-headless-*",
+   "https://llm.a.singularitycompute.com/v1"
+  ]
  }
 }

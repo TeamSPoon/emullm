@@ -146,6 +146,17 @@ def test_expand_agents_maps_launch_types(tmp_path):
     assert all(entry.get("id") != "b" for entry in out["workers"] + out["mock_workers"])
 
 
+def test_expand_agents_skips_disabled_agents():
+    config = {
+        "agents": [
+            {"kind": "agent", "id": "carol", "enabled": False, "launch": "mock", "reply": "disabled"},
+            {"kind": "agent", "id": "alice", "enabled": True, "launch": "mock", "reply": "enabled"},
+        ]
+    }
+    out = sup.expand_agents(config)
+    assert [worker["id"] for worker in out["mock_workers"]] == ["alice"]
+
+
 def test_copilot_launch_argv_includes_model_when_set():
     with_model = sup.copilot_launch_argv(model="claude-sonnet-4.5")
     assert "--model" in with_model and "claude-sonnet-4.5" in with_model

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from . import copilot_api as _copilot
 from . import supervisor as _sup
 from .api import router as emullm_router
 
@@ -39,6 +40,7 @@ async def _lifespan(app: FastAPI):
         _api._CAPABILITY_FALLBACK = config["capability_fallback"]
     modes = _api._current_modes()
     supervisor = None
+    copilot_manager = None
     mock_worker_ids: list[str] = []
 
     mock_workers = config.get("mock_workers")
@@ -65,14 +67,41 @@ async def _lifespan(app: FastAPI):
             f"{', '.join(ids) or '(none found)'}",
             flush=True,
         )
+    definitions = config.get("headless_copilots")
+    if definitions is not None and not isinstance(definitions, list):
+        raise ValueError("config headless_copilots must be a list")
+    copilot_manager = _copilot.CopilotInstanceManager(
+        config_path=_api._CONFIG_PATH,
+        runtime_dir=_api._RUNTIME_DIR / "headless_copilots",
+        base_dir=_api._CONFIG_PATH.parent,
+        default_host_ws_url=os.environ.get("EMULLM_HOST_WS_URL", "ws://127.0.0.1:8801"),
+        definitions=definitions or [],
+        connected=lambda worker_id: worker_id in _api._connected_workers,
+    )
+    _copilot.set_manager(copilot_manager)
     try:
+        started_copilots = copilot_manager.start_autostart()
+        if definitions:
+            print(
+                f"[emullm] started {len(started_copilots)} headless Copilot servant(s): "
+                f"{', '.join(started_copilots) or '(none)'}",
+                flush=True,
+            )
         yield
     finally:
+        if copilot_manager is not None:
+            copilot_manager.stop_all()
+            _copilot.set_manager(None)
         if supervisor is not None:
             supervisor.stop_all()
             _sup.set_supervisor(None)
-        if mock_worker_ids:
-            _api.unregister_mock_workers(mock_worker_ids)
+        registered_mock_ids = [
+            worker_id
+            for worker_id, worker in list(_api._connected_workers.items())
+            if isinstance(worker, _api._MockWorker)
+        ]
+        if registered_mock_ids:
+            _api.unregister_mock_workers(registered_mock_ids)
         _api.clear_agent_policies()
         _api._SERVER_MODE = prev_mode
         _api._CAPABILITY_FALLBACK = prev_capability_fallback

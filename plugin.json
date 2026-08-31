@@ -7,7 +7,8 @@
   "entrypoint": "plugin.py",
   "scan": "startup",
   "routePrefix": "/emullm",
-  "configPage": "http://127.0.0.1:5173/emullm/admin",
+  "adminPage": "/emullm",
+  "configPage": "http://127.0.0.1:5173/emullm",
   "mailboxEndpoint": {
     "path": "/mailbox/mailboxes",
     "protocol": "ws_collab",
@@ -22,6 +23,29 @@
     "format": "json",
     "websocket": "/emullm/ws",
     "description": "Native EMULLM catalog of every HTTP and WebSocket service, including comments, parameters, request bodies, responses, reusable schemas, and the shared worker socket at /emullm/ws."
+  },
+  "plugin-api": {
+    "admin": {
+      "method": "GET",
+      "path": "/emullm/admin",
+      "description": "Explicit EMULLM operations-console alias; the primary UI also answers at /emullm."
+    },
+    "status": {
+      "method": "GET",
+      "path": "/emullm/status",
+      "description": "Live server status: mode, connected workers, models, and mailbox store health."
+    },
+    "restart": {
+      "method": "POST",
+      "path": "/emullm/admin/restart",
+      "description": "Loopback-only graceful standalone restart, including resident-servant shutdown and warm reconnect."
+    },
+    "shutdown": {
+      "method": "POST",
+      "path": "/emullm/admin/shutdown",
+      "description": "Loopback-only graceful standalone shutdown, including resident-servant cleanup."
+    },
+    "note": "Compatibility metadata for older plugin consumers. New consumers should read plugin-endpoints; the full route catalog lives at servicesEndpoint."
   },
   "serverEventLog": {
     "endpoint": "/emullm/websock_to_llm_user/events",
@@ -70,6 +94,7 @@
     "files": [],
     "steps": [
       "Install the `emullm` package into the repository .venv.",
+      "Install and authenticate GitHub Copilot CLI before creating headless Copilot servants.",
       "Start the standalone server, or set EMULLM_PLUGIN_MODE=embedded to mount it in-process.",
       "Open the administration console and confirm the transports answer."
     ]
@@ -105,17 +130,25 @@
       "workspaceShutdown": null,
       "workspaceShutdownAfter": null
     },
-    "note": "Runs in the runtimeModes.current selection. Standalone owns its server process; embedded mounts the router into Workbench. Changing modes takes effect on the next Workbench/API restart."
+    "note": "Runs in the runtimeModes.current selection. Standalone owns its server process and exposes graceful restart/shutdown controls; embedded mounts the router into Workbench and rejects standalone process controls."
   },
   "plugin-endpoints": {
+    "admin": { "method": "GET", "path": "/emullm", "description": "Primary EMULLM operations console at the plugin prefix root." },
+    "adminAlias": { "method": "GET", "path": "/emullm/admin", "description": "Explicit administration alias retained for plugin-API disambiguation." },
     "status": { "method": "GET", "path": "/emullm/admin/state", "description": "JSON worker/route/config state (see also /emullm/status for the HTML view)." },
     "config": { "method": "GET", "path": "/emullm/admin/config", "description": "Current configuration." },
+    "configSections": { "method": "PUT", "path": "/emullm/admin/config/section/{section}", "description": "Validate and atomically update or delete one services, agents, routes, workers, backends, or mock configuration section without replacing unrelated settings." },
     "services": { "method": "GET", "path": "/emullm/endpoints", "description": "Native service catalog with comments, parameter metadata, request schemas, responses, and reusable component schemas." },
     "workerWebSocket": { "method": "WS", "path": "/emullm/ws", "description": "Single worker socket; optional worker_id and modelmasks query parameters identify and filter each connection without creating new paths." },
     "mailboxWebSocket": { "method": "WS", "path": "/emullm/mailbox/ws", "description": "ws_collab-compatible durable mailbox/event socket." },
-    "restart": null,
-    "shutdown": null,
-    "note": "No HTTP route restarts or shuts down the process itself. /emullm/admin/reset clears persisted records (files/assistants/threads/events/mailbox storage) -- a data reset, not a process restart -- so it is deliberately not listed as 'restart' here."
+    "headlessCopilots": { "method": "GET", "path": "/emullm/admin/copilots", "description": "List and manage persistent-session headless Copilot servants; sibling routes create, update, start, stop, restart, reset, delete, and read logs." },
+    "headlessCopilotModels": { "method": "GET", "path": "/emullm/admin/copilots/models", "description": "List models available to the authenticated Copilot CLI account through the bundled SDK, with an explicit fallback catalog." },
+    "agents": { "method": "GET", "path": "/emullm/admin/agents", "description": "List configured agents; PUT /emullm/admin/agents/{worker_id}/enabled toggles entries such as Carol." },
+    "websocketInventory": { "method": "GET", "path": "/emullm/admin/websockets", "description": "List active worker, mailbox, and interaction-log WebSockets with endpoint metadata and messages-in/messages-out counters." },
+    "modelTestClient": { "method": "POST", "path": "/emullm/admin/test-chat", "description": "Run a cancellable model test from the admin console; DELETE /emullm/admin/test-chat/{request_id} cancels the server task and active worker request." },
+    "restart": { "method": "POST", "path": "/emullm/admin/restart", "description": "Gracefully stop resident servants, replace the standalone EMULLM process, and warm/reconnect configured servants." },
+    "shutdown": { "method": "POST", "path": "/emullm/admin/shutdown", "description": "Gracefully stop resident servants and shut down the standalone EMULLM process." },
+    "note": "Process controls are loopback-only and available in standalone mode. /emullm/admin/reset clears persisted data; it does not restart the process."
   },
   "ui": {
     "pages": [
@@ -123,7 +156,7 @@
         "id": "configure",
         "label": "Configure Workspace Emulation of LLMs",
         "kind": "admin",
-        "descriptor": "http://127.0.0.1:5173/emullm/admin",
+        "descriptor": "http://127.0.0.1:5173/emullm",
         "glyph": "⚙",
         "group": "CAPABILITIES"
       },

@@ -71,9 +71,15 @@ real client <--HTTP-- (blocks on a Future) <--WS reply-- worker (writes {"type":
   `{"type":"reject","id","reason":"..."}`. A direct `reply` remains an
   implicit acceptance for older clients. Rejection makes the relay offer the
   request to the next eligible worker instead of fabricating an answer.
+- A cancelled server request sends `{"type":"cancel","id":...}`. Headless
+  Copilot servants abort the active SDK message without stopping their
+  resident CLI runtime, and acknowledge with
+  `{"type":"cancelled","id":...,"cancelled":true}`.
 - Any `model` string is accepted and forwarded unchanged. An exact configured
-  `model_routes` entry takes precedence. Otherwise, matching `modelmasks`
-  workers are tried first, then workers with no masks (which accept all).
+  `model_routes` entry takes precedence. A legacy string value names one
+  worker; a list is an ordered failover chain of worker-ID glob patterns and
+  OpenAI-compatible backend URLs. Otherwise, matching `modelmasks` workers are
+  tried first, then workers with no masks (which accept all).
 - If no worker for that worker_id is connected, `_relay()` does **not**
   fail fast -- it polls, waiting for one to (re)connect, acting like a
   slow API server rather than a broken one. Only after
@@ -157,6 +163,21 @@ More than one worker can be connected at once, each under its own optional
 with `"<worker_id>/<persona-suffix>"` (see personas below). For every other
 model, the relay chooses matching `modelmasks` first and then unmasked
 all-model workers.
+
+The default deployment routes every configured model through:
+
+```json
+["copilot-headless-*", "codex-headless-*", "https://llm.a.singularitycompute.com/v1"]
+```
+
+The first connected matching worker group is tried in order (round-robin
+inside a group); explicit rejection advances to the next group. The URL is the
+final OpenAI-compatible fallback.
+
+Managed headless Copilot servants keep one SDK/CLI runtime resident. When
+startup warmup is enabled, each sends and awaits one configured warmup prompt
+before registering its worker WebSocket, moving the cold inference cost out of
+the client request path.
 
 Workers connect at:
 
@@ -380,6 +401,10 @@ bare path):
 
 **Admin/test-controller** (`/admin/emullm/...`):
 - `GET /admin/emullm/state`
+- `GET /admin/emullm/websockets` -- all active sockets plus message counts
+- `GET /admin/emullm/agents` / `PUT /admin/emullm/agents/{id}/enabled`
+- `POST /admin/emullm/test-chat` / `DELETE /admin/emullm/test-chat/{request_id}`
+  -- cancellable admin model-test request
 - `POST /admin/emullm/runtime_dir`
 - `POST /admin/emullm/reset`
 - `POST /admin/emullm/usage/reset`

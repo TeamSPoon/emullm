@@ -280,6 +280,8 @@ def expand_agents(config: dict[str, Any]) -> dict[str, Any]:
     for agent in agents:
         if not isinstance(agent, dict):
             continue
+        if agent.get("enabled") is False:
+            continue
         launch = str(agent.get("launch") or "").strip().lower()
         worker_id = str(agent.get("id") or agent.get("worker_id") or "").strip()
         if launch == "subagent":

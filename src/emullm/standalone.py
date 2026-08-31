@@ -64,7 +64,25 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("host", nargs="?", default=DEFAULT_HOST)
     parser.add_argument("port", nargs="?", type=int, default=DEFAULT_PORT)
     args = parser.parse_args(argv)
-    uvicorn.run("emullm.app:app", host=args.host, port=args.port, reload=False)
+    os.environ["EMULLM_HOST"] = args.host
+    os.environ["EMULLM_HTTP_PORT"] = str(args.port)
+    from . import process_control
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            "emullm.app:app",
+            host=args.host,
+            port=args.port,
+            reload=False,
+        )
+    )
+    process_control.register_shutdown_callback(
+        lambda: setattr(server, "should_exit", True)
+    )
+    try:
+        server.run()
+    finally:
+        process_control.register_shutdown_callback(None)
 
 
 def launch(
