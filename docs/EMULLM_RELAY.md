@@ -75,16 +75,25 @@ real client <--HTTP-- (blocks on a Future) <--WS reply-- worker (writes {"type":
   Copilot servants abort the active SDK message without stopping their
   resident CLI runtime, and acknowledge with
   `{"type":"cancelled","id":...,"cancelled":true}`.
-- Each resident Copilot servant independently schedules a real text-only
-  anti-idle model interaction every 40 seconds by default. It rotates 50
-  bounded micro-tasks, aborts each after at most three seconds, and reports a
+- Each resident Copilot servant independently schedules an ordinary short chat
+  every 40 seconds by default. The model is not told it is maintenance. It
+  rotates an editable catalog initially containing 50 session check-ins and
+  harmless jokes, aborts each after at most ten seconds, and reports a
   successful interaction as
   `{"type":"keepalive_reply","id":...,"prompt_index":...,"duration_ms":...}`.
   This frame updates WebSocket satisfaction age without entering client request
   telemetry. A client request or model switch preempts an active keepalive.
-- Keepalive task timing is adaptive per worker/model. After two outcomes at or
-  above two seconds (timeouts included), that task is persisted as retired and
-  skipped. A model switch resets those rankings.
+- Keepalive task timing is adaptive per worker/model. After two consecutive
+  outcomes at or above eight seconds (timeouts included), that task is persisted
+  as retired and skipped. At least one fallback task always remains, and a
+  model switch resets those rankings.
+- Shared cadence and prompt records live under
+  `anti_idle = {enabled, interval_seconds, timeout_seconds, prompts}`. Entries
+  have stable IDs, editable text, and a `deprecated` flag; the catalog may grow
+  beyond its initial 50 entries. The admin list prefixes every prompt with its
+  sorted item number, weighted average response time, attempt count, and state.
+  Per-worker values are used only when `use_shared_anti_idle` is explicitly
+  false.
 - Any `model` string is accepted and forwarded unchanged. An exact configured
   `model_routes` entry takes precedence. A legacy string value names one
   worker; a list is an ordered failover chain of worker-ID glob patterns and
@@ -228,18 +237,56 @@ last satisfied interaction (client or keepalive) and last real client work.
 requests and logical clients, keyed by `X-EmuLLM-Client-ID` when present or by
 remote host plus User-Agent otherwise.
 
-## Personas ("yourself/same", "yourself/percent25", ...)
+Each worker socket also has a temporary rolling JSONL frame log at
+`<os-temp>/emullm/socket-worker-logs/`. An immutable
+`<worker_id>.first.jsonl` preserves the first 2 MiB; `<worker_id>.jsonl` and
+`<worker_id>.1.jsonl` rotate the newest two 2 MiB tail segments. This preserves
+the first 2 MiB and newest 4 MiB (6 MiB maximum). Connect/disconnect, inbound, and outbound
+records are included; credentials are redacted and base64 media is represented
+by its encoded size. The combined newest log is available locally at
+`GET /emullm/admin/websockets/{worker_id}/log`; it inserts synthetic valid-JSONL
+`segment_boundary` records before each included file so gaps and rotations are
+obvious in a viewer. A leading `worker_start_prompt` record, sourced from managed
+configuration or worker registration, appears before the 6 MiB segment stream.
+Every stored or synthetic record carries an ISO timestamp,
+`timestamp_epoch_decimal`, and `precision_clock_decimal` with nine fractional
+digits plus the integer `precision_clock_ns`.
 
-Each worker_id, by default, offers this persona menu (`_PERSONA_SUFFIXES`):
+Base64 `image_b64`, `audio_b64`, and nested `b64_json` fields remain summarized
+in JSONL. For viewer playback, EMULLM separately decodes valid image/audio
+payloads into the worker's temporary media directory, records compact
+`media[] = {kind,mime_type,bytes,url}` metadata, and serves those URLs through
+the loopback-only admin route. One artifact is capped at 25 MiB and retained
+media is capped at 64 MiB per worker.
+
+## Pool personas (`worker-copilot-n/percentNN`)
+
+The aggregate model catalog advertises only these generic Copilot-pool personas:
 
 | suffix          | meaning                                                              |
 |-----------------|-----------------------------------------------------------------------|
-| `same`          | answer normally, full capability                                      |
 | `percent125`    | answer as if boosted: extra thorough, careful, complete                |
-| `percent100`    | same as `same` (explicit "100%" spelling)                              |
-| `percent75`     | slightly less careful/thorough, occasional minor omissions            |
+| `percent100`    | answer normally, at full capability                                    |
 | `percent25`     | noticeably weaker/terser, emulate a smaller/weaker model's style       |
-| `percent10`     | very weak/minimal/simplistic, possibly with mistakes                   |
+
+`yourself/*`, concrete `worker-copilot-<number>/*`, `same`, `percent75`, and
+`percent10` are not exported by aggregate `/v1/models`. Legacy direct requests
+remain accepted. Literal `worker-copilot-n` is assigned by client IP plus a
+1024-port source range and returns the concrete assignment in
+`X-EmuLLM-Worker-ID`. A directly requested positive numeric worker ID may be any
+number; if missing, EMULLM creates a fresh persistent worker with that ID, but
+it remains private and does not appear in the aggregate catalog.
+
+Capability selectors are also exported for `audio`, `video`, `vision`, `file`,
+`code`, `summarization`, `image-generation`, and `image-output`:
+`router/<cap>-best` chooses the highest-ranked connected worker explicitly
+advertising the required capability, while `router/<cap>-worse` chooses the
+lowest-ranked one.
+
+The public catalog excludes unexported entries by default. The local Models
+configurator pulls `GET /v1/models?hidden=true`, which includes them with
+`hidden: true` and `exported: false`, so an operator can re-check
+**Export in `/v1/models`** without deleting or hand-editing the saved override.
 
 A worker can instead declare its **own** persona menu at register time
 (`"models": {suffix: {"display_name", "instruction"}, ...}`), which
@@ -248,9 +295,8 @@ overrides the default menu for that worker_id in the aggregated
 `_PERSONA_SUFFIXES`, so a bare-bones worker still gets a sensible default
 without declaring anything.
 
-`GET /v1/models` aggregates the persona menu across every currently connected
-worker, plus the default worker_id (`"yourself"`) even if it isn't connected
-right now. It also advertises every configured services/model-route ID as an
+`GET /v1/models` aggregates public non-Copilot custom models, the generic pool
+personas, capability selectors, and configured services/model-route IDs as an
 EMULLM simulation. A managed servant with a known active backing model adds a
 direct stable alias such as `worker-copilot-1/gpt-5.6-sol`; its entry reports
 the worker kind, active backing model, description, and SDK capability metadata.

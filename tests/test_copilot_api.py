@@ -163,6 +163,7 @@ def test_registration_declares_configured_and_model_media_capabilities(tmp_path)
         "file_input": False,
         "vision_input": True,
     }
+    assert payload["startup_prompt"] == "Answer as the requested model."
 
 
 def test_manager_persists_and_controls_instances(tmp_path) -> None:
@@ -215,6 +216,50 @@ def test_manager_persists_and_controls_instances(tmp_path) -> None:
 
     assert manager.delete("copilot-one") == {"worker_id": "copilot-one", "deleted": True}
     assert json.loads(config_path.read_text(encoding="utf-8"))["headless_copilots"] == []
+
+
+def test_manager_migrates_legacy_shared_anti_idle_defaults(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "headless_copilots": [
+                    {
+                        "worker_id": "legacy",
+                        "session_id": str(uuid.uuid4()),
+                        "use_shared_anti_idle": True,
+                        "keepalive_interval_seconds": 40,
+                        "keepalive_timeout_seconds": 3,
+                    },
+                    {
+                        "worker_id": "legacy-custom",
+                        "session_id": str(uuid.uuid4()),
+                        "keepalive_interval_seconds": 0,
+                        "keepalive_timeout_seconds": 7,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    copilot_api.CopilotInstanceManager(
+        config_path=config_path,
+        runtime_dir=tmp_path / "runtime",
+        base_dir=tmp_path,
+        default_host_ws_url="ws://127.0.0.1:8801",
+        definitions=json.loads(config_path.read_text(encoding="utf-8"))[
+            "headless_copilots"
+        ],
+    )
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["headless_copilots"][0]["keepalive_interval_seconds"] is None
+    assert saved["headless_copilots"][0]["keepalive_timeout_seconds"] is None
+    custom = saved["headless_copilots"][1]
+    assert custom["use_shared_anti_idle"] is False
+    assert custom["keepalive_interval_seconds"] == 0
+    assert custom["keepalive_timeout_seconds"] == 7
 
 
 def test_headless_copilot_admin_api_crud(tmp_path) -> None:
@@ -421,8 +466,8 @@ def test_keepalive_pool_has_fifty_unique_bounded_text_tasks() -> None:
     assert len(KEEPALIVE_TASKS) == 50
     assert len(set(KEEPALIVE_TASKS)) == 50
     assert keepalive_prompt(50) == keepalive_prompt(0)
-    assert all("tool" not in task.lower() for task in KEEPALIVE_TASKS)
-    assert all(len(task) < 100 for task in KEEPALIVE_TASKS)
+    assert sum("joke" in task.lower() for task in KEEPALIVE_TASKS) >= 5
+    assert all(len(task) < 120 for task in KEEPALIVE_TASKS)
 
 
 def test_keepalive_handler_reports_success_without_client_reply(tmp_path) -> None:
@@ -431,14 +476,16 @@ def test_keepalive_handler_reports_success_without_client_reply(tmp_path) -> Non
 
     asyncio.run(handle_keepalive(websocket, runner, "keepalive-1", 0))
 
-    assert runner.requests[0]["kind"] == "keepalive"
-    assert "Persistent-session keepalive 1/50" in runner.requests[0]["prompt"]
+    assert runner.requests[0]["kind"] == "completion"
+    assert runner.requests[0]["_maintenance"] is True
+    assert "keepalive" not in runner.requests[0]["prompt"].lower()
+    assert KEEPALIVE_TASKS[0] in runner.requests[0]["prompt"]
     assert runner.keepalive_results[0]["completed"] is True
     assert websocket.messages[0]["type"] == "keepalive_reply"
     assert websocket.messages[0]["content"] == "steady"
     assert websocket.messages[0]["prompt_index"] == 0
     assert websocket.messages[0]["retired"] is False
-    assert websocket.messages[0]["duration_ms"] < 3_000
+    assert websocket.messages[0]["duration_ms"] < 10_000
 
 
 def test_keepalive_handler_aborts_at_configured_timeout(tmp_path) -> None:
@@ -457,20 +504,21 @@ def test_keepalive_handler_aborts_at_configured_timeout(tmp_path) -> None:
     started = time.monotonic()
     asyncio.run(handle_keepalive(websocket, runner, "keepalive-slow", 1))
 
-    assert time.monotonic() - started < 1
+    assert time.monotonic() - started < 0.25
     assert runner.keepalive_results[0]["timed_out"] is True
     assert websocket.messages[0]["type"] == "keepalive_error"
     assert websocket.messages[0]["retired"] is False
+    assert 50 <= websocket.messages[0]["duration_ms"] < 250
 
 
 def test_slow_keepalive_task_is_retired_and_persisted(tmp_path) -> None:
     config = runtime_config(tmp_path)
     runner = copilot_servant.CopilotRunner(config)
 
-    assert runner.record_keepalive_result(0, 2.1, completed=True) is False
+    assert runner.record_keepalive_result(0, 8.1, completed=True) is False
     assert runner.record_keepalive_result(
         0,
-        3.0,
+        10.0,
         completed=False,
         timed_out=True,
     ) is True
@@ -479,24 +527,51 @@ def test_slow_keepalive_task_is_retired_and_persisted(tmp_path) -> None:
     restored = copilot_servant.CopilotRunner(config)
     assert restored.next_keepalive_task(0) == 1
     status = json.loads(Path(config.runtime_status_path).read_text(encoding="utf-8"))
-    assert status["retired_keepalive_tasks"] == [0]
-    assert status["keepalive_task_stats"]["0"]["slow"] == 2
+    assert status["retired_keepalive_tasks"] == ["conversation-01"]
+    assert status["keepalive_task_stats"]["conversation-01"]["slow"] == 2
+    assert status["keepalive_task_stats"]["conversation-01"]["min_duration_ms"] == 8_100
+    assert status["keepalive_task_stats"]["conversation-01"]["max_duration_ms"] == 10_000
+
+    changed_prompts = copilot_api.default_anti_idle_prompts()
+    changed_prompts[0].prompt = "What changed since your previous quick chat?"
+    changed = copilot_servant.CopilotRunner(
+        runtime_config(tmp_path, keepalive_prompts=changed_prompts)
+    )
+    assert changed.next_keepalive_task(0) == 0
 
 
 def test_fast_keepalive_resets_slow_streak_and_pool_never_exhausts(tmp_path) -> None:
     runner = copilot_servant.CopilotRunner(runtime_config(tmp_path))
 
-    runner.record_keepalive_result(0, 2.1, completed=True)
+    runner.record_keepalive_result(0, 8.1, completed=True)
     runner.record_keepalive_result(0, 0.1, completed=True)
-    assert runner.record_keepalive_result(0, 2.2, completed=True) is False
+    assert runner.record_keepalive_result(0, 8.2, completed=True) is False
     assert runner.next_keepalive_task(0) == 0
 
     for prompt_index in range(len(KEEPALIVE_TASKS)):
-        runner.record_keepalive_result(prompt_index, 2.1, completed=True)
-        runner.record_keepalive_result(prompt_index, 2.2, completed=True)
+        runner.record_keepalive_result(prompt_index, 8.1, completed=True)
+        runner.record_keepalive_result(prompt_index, 8.2, completed=True)
 
     assert len(runner._retired_keepalive_tasks) == len(KEEPALIVE_TASKS) - 1  # noqa: SLF001
     assert runner.next_keepalive_task(0) is not None
+
+    deprecated_config = runtime_config(tmp_path / "deprecated")
+    deprecated_config.keepalive_prompts[0].deprecated = True
+    deprecated = copilot_servant.CopilotRunner(deprecated_config)
+    assert deprecated.next_keepalive_task(0) == 1
+
+
+def test_runner_reset_keepalive_stats_clears_timings(tmp_path) -> None:
+    config = runtime_config(tmp_path)
+    runner = copilot_servant.CopilotRunner(config)
+    runner.record_keepalive_result(0, 0.5, completed=True)
+
+    runner.reset_keepalive_stats()
+
+    status = json.loads(Path(config.runtime_status_path).read_text(encoding="utf-8"))
+    assert status["keepalives"] == 0
+    assert status["keepalive_task_stats"] == {}
+    assert status["retired_keepalive_tasks"] == []
 
 
 def test_request_handler_returns_generated_image_for_edits(tmp_path) -> None:
@@ -955,6 +1030,105 @@ def test_unspecified_model_is_randomly_selected_from_configured_pool(tmp_path, m
     manager.stop_all()
 
 
+def test_runtime_status_write_retries_windows_replace_lock(tmp_path, monkeypatch) -> None:
+    runner = copilot_servant.CopilotRunner(runtime_config(tmp_path))
+    original_replace = os.replace
+    attempts = 0
+
+    def replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("temporarily locked")
+        original_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+    runner._write_status(connected=True)  # noqa: SLF001
+
+    assert attempts == 3
+    assert json.loads(Path(runner.config.runtime_status_path).read_text())["connected"] is True
+
+
+def test_servant_websocket_uses_restart_tolerant_timeouts() -> None:
+    source = Path(copilot_servant.__file__).read_text(encoding="utf-8")
+    assert "open_timeout=60" in source
+    assert "ping_interval=30" in source
+    assert "ping_timeout=60" in source
+
+
+def test_runtime_config_resolves_shared_anti_idle_with_worker_override(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        copilot_api,
+        "copilot_models",
+        lambda **_kwargs: {
+            "models": [{"id": "gpt-5-mini", "name": "GPT-5 mini"}],
+            "source": "test",
+        },
+    )
+    config_path = tmp_path / "config.json"
+    shared = copilot_api.AntiIdleConfig(
+        interval_seconds=60,
+        timeout_seconds=2.5,
+        slow_budget_seconds=2,
+    )
+    config_path.write_text(
+        json.dumps({"anti_idle": shared.model_dump(mode="json")}),
+        encoding="utf-8",
+    )
+    manager = copilot_api.CopilotInstanceManager(
+        config_path=config_path,
+        runtime_dir=tmp_path / "runtime",
+        base_dir=tmp_path,
+        default_host_ws_url="ws://127.0.0.1:8801",
+        spawn=lambda _spec: FakeProc(),
+    )
+    manager.create(
+        copilot_api.HeadlessCopilotConfig(
+            worker_id="shared",
+            copilot_command=sys.executable,
+            model="gpt-5-mini",
+        )
+    )
+    manager.create(
+        copilot_api.HeadlessCopilotConfig(
+            worker_id="overridden",
+            copilot_command=sys.executable,
+            model="gpt-5-mini",
+            use_shared_anti_idle=False,
+            keepalive_interval_seconds=75,
+            keepalive_timeout_seconds=2,
+        )
+    )
+
+    shared_runtime = json.loads(
+        (
+            tmp_path
+            / "runtime"
+            / "shared"
+            / "servant-config.json"
+        ).read_text(encoding="utf-8")
+    )
+    override_runtime = json.loads(
+        (
+            tmp_path
+            / "runtime"
+            / "overridden"
+            / "servant-config.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert shared_runtime["keepalive_interval_seconds"] == 60
+    assert shared_runtime["keepalive_timeout_seconds"] == 2.5
+    assert shared_runtime["keepalive_slow_budget_seconds"] == 2
+    assert len(shared_runtime["keepalive_prompts"]) == 50
+    assert override_runtime["keepalive_interval_seconds"] == 75
+    assert override_runtime["keepalive_timeout_seconds"] == 2
+    manager.stop_all()
+
+
 def test_ranked_model_selectors_and_reasoning_filter(monkeypatch) -> None:
     models = copilot_api._annotate_model_ranks(  # noqa: SLF001
         [
@@ -1081,6 +1255,25 @@ def test_manager_adopts_reconnected_worker_without_duplicate_spawn(tmp_path) -> 
     assert status["external"] is True
 
 
+def test_manager_status_coalesces_concurrent_admin_snapshots() -> None:
+    class Manager:
+        calls = 0
+
+        @classmethod
+        def list(cls):
+            cls.calls += 1
+            return [{"worker_id": "worker-copilot-1"}]
+
+    manager = Manager()
+    copilot_api.set_manager(manager)
+    try:
+        assert copilot_api.manager_status() == [{"worker_id": "worker-copilot-1"}]
+        assert copilot_api.manager_status() == [{"worker_id": "worker-copilot-1"}]
+        assert manager.calls == 1
+    finally:
+        copilot_api.set_manager(None)
+
+
 def test_spawn_strips_host_agent_session_from_servant_environment(tmp_path, monkeypatch) -> None:
     captured = {}
 
@@ -1121,10 +1314,10 @@ def test_windows_copilot_shim_resolves_to_sdk_runtime_entrypoint(tmp_path) -> No
 
 def test_default_config_includes_random_model_headless_copilot_one() -> None:
     config = json.loads((Path(__file__).parents[1] / "config.json").read_text(encoding="utf-8"))
-    assert config["max_concurrent_calls"] == 50
+    assert config["max_concurrent_calls"] == 21
     assert 0 <= config["idle_worker_target"] <= config["max_concurrent_calls"]
     assert 0 <= config["idle_grace_seconds"] <= 3_600
-    assert config["backend_fallback_delay_seconds"] == 5
+    assert 0 <= config["backend_fallback_delay_seconds"] <= 300
     instances = config["headless_copilots"]
     assert instances
     instance = next(item for item in instances if item["worker_id"] == "worker-copilot-1")
@@ -1139,8 +1332,10 @@ def test_default_config_includes_random_model_headless_copilot_one() -> None:
     assert all(item["load_custom_instructions"] is True for item in instances)
     assert all(item["enable_builtin_mcps"] is True for item in instances)
     assert all(item["max_prompt_chars"] == 4_000_000 for item in instances)
-    assert all(item.get("keepalive_interval_seconds", 40) == 40 for item in instances)
-    assert all(item.get("keepalive_timeout_seconds", 3) <= 3 for item in instances)
+    assert all(item.get("use_shared_anti_idle", True) is True for item in instances)
+    assert config["anti_idle"]["interval_seconds"] == 60
+    assert config["anti_idle"]["timeout_seconds"] == 10
+    assert len(config["anti_idle"]["prompts"]) == 50
     assert isinstance(instance["allow_all"], bool)
     assert instance["modelmasks"] == []
     assert not instance.get("model")

@@ -140,14 +140,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from contextvars import ContextVar
 from fnmatch import fnmatchcase
 import hashlib
 import ipaddress
 import json
+import logging
+import math
 import mimetypes
 import os
+import re
 import secrets
 import struct
+import tempfile
 import threading
 import time
 import urllib.request
@@ -155,9 +160,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.background import BackgroundTask, BackgroundTasks
@@ -168,39 +173,82 @@ from . import process_control as _process_control
 from .test_media import test_media_samples
 from . import supervisor as _sup
 
+_request_affinity: ContextVar[dict[str, Any] | None] = ContextVar(
+    "emullm_request_affinity",
+    default=None,
+)
+_request_assigned_worker: ContextVar[str | None] = ContextVar(
+    "emullm_request_assigned_worker",
+    default=None,
+)
+
 
 class _ClientTrackingRoute(APIRoute):
     def get_route_handler(self):
         original = super().get_route_handler()
 
         async def tracked(request: Request) -> Response:
+            path = request.url.path.rstrip("/")
+            if (
+                path == "/emullm/admin"
+                or path.startswith("/emullm/admin/")
+                or path == "/admin/emullm"
+                or path.startswith("/admin/emullm/")
+            ):
+                _require_local_process_control(request)
             if not request.url.path.startswith("/v1/"):
                 return await original(request)
+            client = request.client
+            host = client.host if client is not None else "unknown"
+            port = client.port if client is not None else 0
+            port_start = (
+                port // _COPILOT_AFFINITY_PORT_RANGE
+            ) * _COPILOT_AFFINITY_PORT_RANGE
+            affinity_token = _request_affinity.set(
+                {
+                    "host": host,
+                    "port": port,
+                    "port_start": port_start,
+                    "port_end": (
+                        port_start + _COPILOT_AFFINITY_PORT_RANGE - 1
+                    ),
+                }
+            )
+            assigned_token = _request_assigned_worker.set(None)
+            await _wait_for_client_worker_capacity(request)
             request_token = _begin_openai_client_request(request)
             try:
-                response = await original(request)
-            except BaseException as error:
-                _finish_openai_client_request(
+                try:
+                    response = await original(request)
+                except BaseException as error:
+                    _finish_openai_client_request(
+                        request_token,
+                        int(getattr(error, "status_code", 500)),
+                    )
+                    raise
+                assigned_worker = _request_assigned_worker.get()
+                if assigned_worker:
+                    response.headers["X-EmuLLM-Worker-ID"] = assigned_worker
+                finalize = BackgroundTask(
+                    _finish_openai_client_request,
                     request_token,
-                    int(getattr(error, "status_code", 500)),
+                    response.status_code,
                 )
-                raise
-            finalize = BackgroundTask(
-                _finish_openai_client_request,
-                request_token,
-                response.status_code,
-            )
-            response.background = (
-                BackgroundTasks([finalize, response.background])
-                if response.background is not None
-                else finalize
-            )
-            return response
+                response.background = (
+                    BackgroundTasks([finalize, response.background])
+                    if response.background is not None
+                    else finalize
+                )
+                return response
+            finally:
+                _request_assigned_worker.reset(assigned_token)
+                _request_affinity.reset(affinity_token)
 
         return tracked
 
 
 router = APIRouter(route_class=_ClientTrackingRoute)
+_LOGGER = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT_SECONDS = 900  # generous -- a human/agent may take a while to reply
 
@@ -609,10 +657,11 @@ async def _observe(worker_id: str, model: str, prompt_text: str, reply_text: str
     if worker is None:
         return
     try:
-        await worker.send_json(
+        await _send_worker_json(
+            worker_id,
+            worker,
             {"type": "observe", "model": model, "prompt": prompt_text, "reply": reply_text}
         )
-        _increment_active_websocket(_worker_connection_ids.get(worker_id), "messages_out")
     except Exception:  # noqa: BLE001
         pass
 
@@ -748,18 +797,41 @@ _worker_last_busy_at: dict[str, float] = {}
 _worker_load_lock = threading.RLock()
 _worker_service_stats: dict[str, dict[str, dict[str, float | int]]] = {}
 _model_service_stats: dict[str, dict[str, dict[str, float | int]]] = {}
-_active_service_requests: dict[str, dict[str, str]] = {}
+_active_service_requests: dict[str, dict[str, Any]] = {}
 _waiting_for_worker: dict[str, dict[str, Any]] = {}
 _waiting_for_worker_lock = threading.RLock()
 _admin_test_tasks: dict[str, "asyncio.Task[Any]"] = {}
 _active_websockets: dict[str, dict[str, Any]] = {}
 _active_websockets_lock = threading.RLock()
 _worker_connection_ids: dict[str, str] = {}
+_socket_worker_log_dir = (
+    Path(tempfile.gettempdir()) / "emullm" / "socket-worker-logs"
+)
+_socket_worker_log_segment_bytes = 2 * 1024 * 1024
+_socket_worker_log_lock = threading.RLock()
+_socket_worker_media_file_bytes = 25 * 1024 * 1024
+_socket_worker_media_total_bytes = 64 * 1024 * 1024
 _openai_clients: dict[str, dict[str, Any]] = {}
 _openai_requests: dict[str, dict[str, Any]] = {}
+_client_capacity_waiters: dict[str, int] = {}
 _openai_clients_lock = threading.RLock()
 _MAX_OPENAI_CLIENTS = 500
 _MAX_OPENAI_REQUESTS = 500
+_CLIENT_WORKER_RESERVE_MIN = 5
+_CLIENT_WORKER_RESERVE_FRACTION = 0.30
+_STUCK_WORKER_SECONDS = 120.0
+_BULK_WORKER_ACTION_BATCH_SIZE = 7
+_WORKER_RECONNECT_TIMEOUT_SECONDS = 60.0
+_WORKER_CAPACITY_PATHS = {
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/messages",
+    "/v1/responses",
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/audio/transcriptions",
+    "/v1/audio/speech",
+}
 _ON_DEMAND_COPILOT_PREFIX = "worker-copilot-"
 _ON_DEMAND_COPILOT_START = 5
 _BASELINE_COPILOT_WORKERS = 4
@@ -836,6 +908,395 @@ def _register_active_websocket(
     return connection_id
 
 
+def _socket_log_paths(worker_id: str) -> tuple[Path, Path, Path]:
+    current = _socket_worker_log_dir / f"{worker_id}.jsonl"
+    return (
+        current.with_name(f"{worker_id}.first.jsonl"),
+        current,
+        current.with_name(f"{worker_id}.1.jsonl"),
+    )
+
+
+def _worker_start_prompt(worker_id: str, first: Path) -> tuple[str | None, str]:
+    manager = _copilot_api.get_manager()
+    if manager is not None:
+        try:
+            instance = manager.get(worker_id)
+        except _copilot_api.CopilotInstanceError:
+            instance = None
+        config = instance.get("config") if isinstance(instance, dict) else None
+        prompt = config.get("system_prompt") if isinstance(config, dict) else None
+        if isinstance(prompt, str) and prompt:
+            return prompt, "managed-config"
+    if first.is_file():
+        for raw_line in first.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).splitlines():
+            try:
+                record = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            frame = record.get("frame") if isinstance(record, dict) else None
+            prompt = (
+                frame.get("startup_prompt")
+                if isinstance(frame, dict)
+                and frame.get("type") == "register"
+                else None
+            )
+            if isinstance(prompt, str) and prompt:
+                return prompt, "worker-registration"
+    return None, "unavailable"
+
+
+def _nanosecond_decimal(value: int) -> str:
+    return f"{value // 1_000_000_000}.{value % 1_000_000_000:09d}"
+
+
+def _socket_log_clock_fields() -> dict[str, Any]:
+    from datetime import datetime, timezone
+
+    wall_ns = time.time_ns()
+    precision_ns = time.perf_counter_ns()
+    return {
+        "timestamp": datetime.fromtimestamp(
+            wall_ns / 1_000_000_000,
+            tz=timezone.utc,
+        ).isoformat(timespec="microseconds"),
+        "timestamp_epoch_decimal": _nanosecond_decimal(wall_ns),
+        "precision_clock_decimal": _nanosecond_decimal(precision_ns),
+        "precision_clock_ns": precision_ns,
+    }
+
+
+def _socket_media_extension(mime_type: str) -> str:
+    return {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/mpeg": ".mp3",
+        "audio/ogg": ".ogg",
+        "audio/flac": ".flac",
+        "audio/mp4": ".m4a",
+        "audio/webm": ".webm",
+    }.get(mime_type.lower(), ".bin")
+
+
+def _socket_worker_media_dir(worker_id: str) -> Path:
+    return _socket_worker_log_dir / "media" / worker_id
+
+
+def _prune_socket_worker_media(directory: Path) -> None:
+    files = sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file() and not path.name.endswith(".tmp")
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    retained_bytes = 0
+    for path in files:
+        size = path.stat().st_size
+        if retained_bytes + size <= _socket_worker_media_total_bytes:
+            retained_bytes += size
+            continue
+        path.unlink(missing_ok=True)
+
+
+def _store_socket_media(
+    worker_id: str,
+    encoded: str,
+    kind: str,
+    mime_type: str,
+    source_field: str,
+) -> dict[str, Any]:
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return {
+            "kind": kind,
+            "mime_type": mime_type,
+            "source_field": source_field,
+            "available": False,
+            "error": "invalid base64",
+        }
+    if not data:
+        return {
+            "kind": kind,
+            "mime_type": mime_type,
+            "source_field": source_field,
+            "available": False,
+            "error": "empty media",
+        }
+    if len(data) > _socket_worker_media_file_bytes:
+        return {
+            "kind": kind,
+            "mime_type": mime_type,
+            "source_field": source_field,
+            "available": False,
+            "bytes": len(data),
+            "error": (
+                f"media exceeds {_socket_worker_media_file_bytes}-byte "
+                "preview limit"
+            ),
+        }
+    artifact_id = hashlib.sha256(data).hexdigest()
+    extension = _socket_media_extension(mime_type)
+    filename = f"{artifact_id}{extension}"
+    directory = _socket_worker_media_dir(worker_id)
+    path = directory / filename
+    with _socket_worker_log_lock:
+        directory.mkdir(parents=True, exist_ok=True)
+        if not path.is_file():
+            temporary = directory / f".{filename}.{uuid.uuid4().hex}.tmp"
+            try:
+                temporary.write_bytes(data)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        else:
+            os.utime(path, None)
+        _prune_socket_worker_media(directory)
+    return {
+        "artifact_id": artifact_id,
+        "kind": kind,
+        "mime_type": mime_type,
+        "bytes": len(data),
+        "source_field": source_field,
+        "available": path.is_file(),
+        "url": (
+            f"/emullm/admin/websockets/{worker_id}/media/{filename}"
+            if path.is_file()
+            else None
+        ),
+    }
+
+
+def _socket_log_media(
+    worker_id: str,
+    value: Any,
+    *,
+    path: str = "",
+    inherited_mime: str | None = None,
+    depth: int = 0,
+) -> list[dict[str, Any]]:
+    if depth > 6:
+        return []
+    if isinstance(value, dict):
+        mime_type = str(
+            value.get("mime")
+            or value.get("mime_type")
+            or inherited_mime
+            or ""
+        ).lower()
+        media: list[dict[str, Any]] = []
+        for key, child in list(value.items())[:128]:
+            child_path = f"{path}.{key}" if path else str(key)
+            kind = (
+                "image"
+                if key in {"image_b64", "b64_json"}
+                else ("audio" if key == "audio_b64" else None)
+            )
+            if kind is not None and isinstance(child, str):
+                resolved_mime = mime_type or (
+                    "image/png" if kind == "image" else "audio/wav"
+                )
+                if resolved_mime.startswith(f"{kind}/"):
+                    media.append(
+                        _store_socket_media(
+                            worker_id,
+                            child,
+                            kind,
+                            resolved_mime,
+                            child_path,
+                        )
+                    )
+                continue
+            media.extend(
+                _socket_log_media(
+                    worker_id,
+                    child,
+                    path=child_path,
+                    inherited_mime=mime_type or inherited_mime,
+                    depth=depth + 1,
+                )
+            )
+        return media
+    if isinstance(value, (list, tuple)):
+        media = []
+        for index, child in enumerate(value[:64]):
+            media.extend(
+                _socket_log_media(
+                    worker_id,
+                    child,
+                    path=f"{path}[{index}]",
+                    inherited_mime=inherited_mime,
+                    depth=depth + 1,
+                )
+            )
+        return media
+    return []
+
+
+def _socket_log_value(
+    value: Any,
+    *,
+    key: str = "",
+    depth: int = 0,
+) -> Any:
+    lowered = key.lower()
+    if lowered in {
+        "api_key",
+        "authorization",
+        "token",
+        "access_token",
+        "refresh_token",
+    }:
+        return "[redacted]"
+    if isinstance(value, str):
+        if lowered.endswith("_b64") or lowered in {"data_b64"}:
+            return {"omitted_base64_characters": len(value)}
+        if len(value) > 16_384:
+            return value[:16_384] + f"...[truncated {len(value) - 16_384} chars]"
+        return value
+    if depth >= 6:
+        return "[maximum depth]"
+    if isinstance(value, dict):
+        items = list(value.items())
+        result = {
+            str(child_key): _socket_log_value(
+                child_value,
+                key=str(child_key),
+                depth=depth + 1,
+            )
+            for child_key, child_value in items[:128]
+        }
+        if len(items) > 128:
+            result["_omitted_fields"] = len(items) - 128
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [
+            _socket_log_value(item, depth=depth + 1)
+            for item in value[:64]
+        ]
+        if len(value) > 64:
+            result.append({"omitted_items": len(value) - 64})
+        return result
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)
+
+
+def _append_socket_worker_log(
+    worker_id: str,
+    connection_id: str,
+    direction: str,
+    payload: Any,
+) -> tuple[Path, int]:
+    source, target = (
+        ("EMULLM", worker_id)
+        if direction == "outbound"
+        else (
+            (worker_id, "EMULLM")
+            if direction == "inbound"
+            else ("SYSTEM", worker_id)
+        )
+    )
+    record = {
+        **_socket_log_clock_fields(),
+        "worker_id": worker_id,
+        "connection_id": connection_id,
+        "direction": direction,
+        "from": source,
+        "sender": source,
+        "frame": _socket_log_value(payload),
+    }
+    media = _socket_log_media(worker_id, payload)
+    if media:
+        record["media"] = media
+    line = (
+        json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(line) > _socket_worker_log_segment_bytes:
+        record["frame"] = {
+            "type": payload.get("type") if isinstance(payload, dict) else None,
+            "id": payload.get("id") if isinstance(payload, dict) else None,
+            "omitted_serialized_bytes": len(line),
+        }
+        line = (
+            json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+    first, current, previous = _socket_log_paths(worker_id)
+    with _socket_worker_log_lock:
+        current.parent.mkdir(parents=True, exist_ok=True)
+        first_bytes = first.stat().st_size if first.is_file() else 0
+        tail_started = current.is_file() or previous.is_file()
+        if (
+            not tail_started
+            and first_bytes + len(line) <= _socket_worker_log_segment_bytes
+        ):
+            with first.open("ab") as stream:
+                stream.write(line)
+        else:
+            current_bytes = current.stat().st_size if current.is_file() else 0
+            if current_bytes + len(line) > _socket_worker_log_segment_bytes:
+                previous.unlink(missing_ok=True)
+                if current.is_file():
+                    os.replace(current, previous)
+            with current.open("ab") as stream:
+                stream.write(line)
+        total_bytes = sum(
+            path.stat().st_size
+            for path in (first, previous, current)
+            if path.is_file()
+        )
+    return current, total_bytes
+
+
+def _track_worker_socket_frame(
+    connection_id: str,
+    direction: str,
+    payload: Any,
+) -> None:
+    with _active_websockets_lock:
+        connection = _active_websockets.get(connection_id)
+        worker_id = (
+            str(connection.get("worker_id") or "")
+            if connection is not None and connection.get("kind") == "worker"
+            else ""
+        )
+    if not worker_id:
+        return
+    try:
+        current, total_bytes = _append_socket_worker_log(
+            worker_id,
+            connection_id,
+            direction,
+            payload,
+        )
+    except OSError as error:
+        _LOGGER.warning("could not write worker socket log for %s: %s", worker_id, error)
+        _update_active_websocket(connection_id, log_error=str(error))
+        return
+    _update_active_websocket(
+        connection_id,
+        log_path=str(current),
+        log_url=(
+            "/emullm/admin/websockets/"
+            f"{worker_id}/log"
+        ),
+        log_bytes=total_bytes,
+        log_limit_bytes=3 * _socket_worker_log_segment_bytes,
+        log_error=None,
+    )
+
+
 def _update_active_websocket(connection_id: str, **metadata: Any) -> None:
     with _active_websockets_lock:
         if connection_id in _active_websockets:
@@ -885,6 +1346,7 @@ async def _tracked_ws_send_json(
 ) -> None:
     await websocket.send_json(payload)
     _increment_active_websocket(connection_id, "messages_out")
+    _track_worker_socket_frame(connection_id, "outbound", payload)
 
 
 async def _tracked_ws_receive_json(
@@ -892,7 +1354,20 @@ async def _tracked_ws_receive_json(
 ) -> Any:
     payload = await websocket.receive_json()
     _increment_active_websocket(connection_id, "messages_in")
+    _track_worker_socket_frame(connection_id, "inbound", payload)
     return payload
+
+
+async def _send_worker_json(
+    worker_id: str,
+    websocket: Any,
+    payload: dict[str, Any],
+) -> None:
+    connection_id = _worker_connection_ids.get(worker_id)
+    if connection_id is None:
+        await websocket.send_json(payload)
+        return
+    await _tracked_ws_send_json(websocket, connection_id, payload)
 
 
 def _active_websocket_rows() -> list[dict[str, Any]]:
@@ -935,6 +1410,63 @@ def _openai_client_key(request: Request) -> tuple[str, str, str | None, str]:
     identity = f"id:{declared_id}" if declared_id else f"agent:{user_agent}"
     digest = hashlib.sha256(f"{host}\0{identity}".encode("utf-8")).hexdigest()[:16]
     return f"client-{digest}", host, declared_id, user_agent
+
+
+def _client_worker_capacity() -> tuple[int, int]:
+    connected = len(_connected_workers)
+    reserve = min(
+        connected,
+        max(
+            _CLIENT_WORKER_RESERVE_MIN,
+            math.ceil(connected * _CLIENT_WORKER_RESERVE_FRACTION),
+        ),
+    )
+    return max(1, min(_max_concurrent_calls, connected - reserve)), reserve
+
+
+async def _wait_for_client_worker_capacity(request: Request) -> None:
+    if (
+        request.method != "POST"
+        or request.url.path.rstrip("/") not in _WORKER_CAPACITY_PATHS
+    ):
+        return
+    client_id, *_ = _openai_client_key(request)
+    deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
+    waiting = False
+    try:
+        while True:
+            limit, reserve = _client_worker_capacity()
+            with _openai_clients_lock:
+                active = int(
+                    (_openai_clients.get(client_id) or {}).get(
+                        "active_requests",
+                        0,
+                    )
+                )
+                if active < limit:
+                    return
+                if not waiting:
+                    _client_capacity_waiters[client_id] = (
+                        _client_capacity_waiters.get(client_id, 0) + 1
+                    )
+                    waiting = True
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        f"client capacity wait timed out; maximum {limit} active "
+                        f"request(s), {reserve} worker(s) reserved"
+                    ),
+                )
+            await asyncio.sleep(0.1)
+    finally:
+        if waiting:
+            with _openai_clients_lock:
+                remaining = _client_capacity_waiters.get(client_id, 0) - 1
+                if remaining > 0:
+                    _client_capacity_waiters[client_id] = remaining
+                else:
+                    _client_capacity_waiters.pop(client_id, None)
 
 
 def _begin_openai_client_request(
@@ -1153,6 +1685,11 @@ _DEFAULT_WORKER_ROLE = "trusted"
 _worker_roles: dict[str, str] = {}
 
 _DEFAULT_WORKER_ID = "yourself"
+_COPILOT_POOL_WORKER_ID = "worker-copilot-n"
+_COPILOT_AFFINITY_PORT_RANGE = 1024
+_copilot_client_affinity: dict[str, dict[str, Any]] = {}
+_copilot_client_affinity_lock = threading.RLock()
+_MAX_COPILOT_CLIENT_AFFINITIES = 5_000
 
 # A missing entry means the worker accepts all models. A present empty tuple
 # means it intentionally accepts none; non-empty entries are glob patterns.
@@ -1192,13 +1729,226 @@ _PERSONA_SUFFIXES: dict[str, dict[str, Any]] = {
         "instruction": "Answer as if only about 10% as capable as usual: very weak, minimal, simplistic -- emulate a small/weak model's style, possibly with mistakes.",
     },
 }
-_DEFAULT_MODEL_ID = f"{_DEFAULT_WORKER_ID}/same"
+_EXPORTED_PERSONA_SUFFIXES = {"percent125", "percent100", "percent25"}
+_HIDDEN_PERSONA_SUFFIXES = {"same", "percent75", "percent10"}
+_DEFAULT_MODEL_ID = f"{_COPILOT_POOL_WORKER_ID}/percent100"
 _EMULLM_DEFAULT_MODEL_ID = "emullm/default"
+_CAPABILITY_MODEL_ALIASES: dict[str, set[str]] = {
+    "audio": {"audio_input"},
+    "video": {"vision_input", "file_input"},
+    "vision": {"vision_input"},
+    "file": {"file_input"},
+    "code": {"code"},
+    "summarization": {"summarization"},
+    "image-generation": {"image_generation"},
+    "image-output": {"image_output"},
+}
+
+
+def _catalog_model_is_visible(model_id: str) -> bool:
+    worker_id, _, suffix = model_id.partition("/")
+    return (
+        suffix not in _HIDDEN_PERSONA_SUFFIXES
+        and not _numeric_copilot_worker_id(worker_id)
+    )
+
+
+def _numeric_copilot_worker_id(worker_id: str) -> bool:
+    return bool(re.fullmatch(r"worker-copilot-[1-9][0-9]*", worker_id))
+
+
+def _capability_alias_spec(
+    model_id: str,
+) -> tuple[str, str, set[str]] | None:
+    prefix = "router/"
+    if not model_id.startswith(prefix):
+        return None
+    alias = model_id[len(prefix) :]
+    selector = next(
+        (
+            candidate
+            for candidate in ("best", "worse")
+            if alias.endswith(f"-{candidate}")
+        ),
+        None,
+    )
+    if selector is None:
+        return None
+    capability = alias[: -(len(selector) + 1)]
+    if capability not in _CAPABILITY_MODEL_ALIASES:
+        return None
+    return selector, capability, set(_CAPABILITY_MODEL_ALIASES[capability])
+
+
+def _worker_quality_rank(worker_id: str) -> int:
+    backing_model = _worker_runtime_models.get(worker_id)
+    metadata = (
+        _copilot_model_metadata(backing_model)
+        if backing_model
+        else None
+    )
+    rank = metadata.get("quality_rank") if isinstance(metadata, dict) else None
+    return int(rank) if isinstance(rank, int) and rank > 0 else 10_000
+
+
+def _capability_alias_worker(model_id: str) -> str:
+    spec = _capability_alias_spec(model_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"unknown capability alias '{model_id}'")
+    selector, capability, required = spec
+    candidates = [
+        worker_id
+        for worker_id in _connected_workers
+        if _worker_ready_for_offer(worker_id)
+        if all(
+            _worker_capabilities.get(worker_id, {}).get(name) is True
+            for name in required
+        )
+    ]
+    if not candidates:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"no connected worker explicitly advertises capability "
+                f"'{capability}'"
+            ),
+        )
+    candidates.sort(
+        key=lambda worker_id: (
+            _worker_quality_rank(worker_id)
+            if selector == "best"
+            else -_worker_quality_rank(worker_id),
+            _worker_load(worker_id),
+            worker_id,
+        )
+    )
+    worker_id = candidates[0]
+    _request_assigned_worker.set(worker_id)
+    return worker_id
+
+
+def _copilot_pool_workers() -> list[str]:
+    connected = sorted(
+        worker_id
+        for worker_id in _connected_workers
+        if _numeric_copilot_worker_id(worker_id)
+    )
+    if connected:
+        return connected
+    manager = _copilot_api.get_manager()
+    if manager is not None:
+        configured = sorted(
+            str(instance.get("worker_id") or "")
+            for instance in manager.list()
+            if _numeric_copilot_worker_id(
+                str(instance.get("worker_id") or "")
+            )
+        )
+        if configured:
+            return configured
+    return ["worker-copilot-1"]
+
+
+def _copilot_pool_model_entry(
+    suffix: str,
+    persona: dict[str, Any],
+) -> dict[str, Any]:
+    entry = _model_entry(_COPILOT_POOL_WORKER_ID, suffix, persona)
+    workers = _copilot_pool_workers()
+    entry.update(
+        display_name=f"Copilot pool N · {persona.get('display_name') or suffix}",
+        description=(
+            "Client-affine Copilot pool alias. Literal n is assigned by client "
+            "IP and 1024-port source range; replace n with any positive integer "
+            "to address or create that exact worker."
+        ),
+        owned_by="emullm-copilot-pool",
+        connected=any(worker in _connected_workers for worker in workers),
+        active_workers=[
+            worker for worker in workers if worker in _connected_workers
+        ],
+        routing_mode="client_ip_port_range_affinity",
+        affinity_port_range_size=_COPILOT_AFFINITY_PORT_RANGE,
+        assigned_worker_header="X-EmuLLM-Worker-ID",
+    )
+    return entry
+
+
+def _capability_alias_model_entry(
+    selector: str,
+    capability: str,
+    required: set[str],
+) -> dict[str, Any]:
+    capable_workers = [
+        worker_id
+        for worker_id in _connected_workers
+        if all(
+            _worker_capabilities.get(worker_id, {}).get(name) is True
+            for name in required
+        )
+    ]
+    return {
+        "id": f"router/{capability}-{selector}",
+        "object": "model",
+        "display_name": f"{selector.title()} · {capability}",
+        "description": (
+            f"Routes to the {selector} quality-ranked connected worker that "
+            f"explicitly advertises: {', '.join(sorted(required))}."
+        ),
+        "owned_by": "emullm-capability-router",
+        "connected": bool(capable_workers),
+        "active_workers": sorted(capable_workers),
+        "selection": selector,
+        "capability_alias": capability,
+        "required_capabilities": sorted(required),
+        "assigned_worker_header": "X-EmuLLM-Worker-ID",
+        "simulated": False,
+    }
+
+
+def _assign_copilot_pool_worker() -> str:
+    candidates = _copilot_pool_workers()
+    affinity = _request_affinity.get()
+    if affinity is None:
+        index = _round_robin_state.get(_COPILOT_POOL_WORKER_ID, 0)
+        worker_id = candidates[index % len(candidates)]
+        _round_robin_state[_COPILOT_POOL_WORKER_ID] = index + 1
+    else:
+        key = (
+            f"{affinity['host']}:{affinity['port_start']}-"
+            f"{affinity['port_end']}"
+        )
+        with _copilot_client_affinity_lock:
+            existing = _copilot_client_affinity.get(key)
+            if existing and existing.get("worker_id") in candidates:
+                worker_id = str(existing["worker_id"])
+            else:
+                digest = hashlib.sha256(key.encode("utf-8")).digest()
+                worker_id = candidates[
+                    int.from_bytes(digest[:8], "big") % len(candidates)
+                ]
+                if len(_copilot_client_affinity) >= _MAX_COPILOT_CLIENT_AFFINITIES:
+                    oldest = min(
+                        _copilot_client_affinity,
+                        key=lambda item: float(
+                            _copilot_client_affinity[item]["last_used_at"]
+                        ),
+                    )
+                    _copilot_client_affinity.pop(oldest, None)
+            _copilot_client_affinity[key] = {
+                "worker_id": worker_id,
+                "host": affinity["host"],
+                "port_start": affinity["port_start"],
+                "port_end": affinity["port_end"],
+                "last_used_at": time.time(),
+            }
+    _request_assigned_worker.set(worker_id)
+    return worker_id
 
 
 def _split_model_id(model: str) -> tuple[str, str]:
     """"<worker_id>/<suffix>" -> (worker_id, suffix); a bare id with no
-    "/" is treated as that worker_id with the "same" persona."""
+    "/" retains the legacy "same" parsing so opaque model IDs pass through."""
     worker_id, sep, suffix = model.partition("/")
     if not worker_id:
         worker_id = _DEFAULT_WORKER_ID
@@ -1598,13 +2348,8 @@ def _service_stats_snapshot() -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def _worker_retry_delay(worker_id: str) -> float:
-    retry_at = _worker_not_ready_until.get(worker_id)
-    if retry_at is None:
-        return 0.0
-    if retry_at <= time.monotonic():
-        _worker_not_ready_until.pop(worker_id, None)
-        return 0.0
-    return retry_at - time.monotonic()
+    del worker_id
+    return 0.0
 
 
 def _worker_ready_for_offer(worker_id: str) -> bool:
@@ -1652,6 +2397,14 @@ def _worker_candidates_for_model(
         )  # Explicit operator route always wins unless temporarily not ready.
 
     requested_worker_id, _ = _split_model_id(model)
+    if (
+        requested_worker_id == _COPILOT_POOL_WORKER_ID
+        or _capability_alias_spec(model) is not None
+    ):
+        return _capability_ordered_workers(
+            [resolved_worker_id],
+            required_capabilities,
+        )
     if requested_worker_id != _DEFAULT_WORKER_ID and requested_worker_id in _connected_workers:
         return _capability_ordered_workers(
             [requested_worker_id],
@@ -2918,9 +3671,20 @@ def _copilot_public_model_id(backing_model: str) -> str:
 
 
 def _resolved_emullm_default_model() -> str:
-    if _advertised_default and _advertised_default != _EMULLM_DEFAULT_MODEL_ID:
-        return _advertised_default
-    return _DEFAULT_MODEL_ID
+    candidate = (
+        _advertised_default
+        if _advertised_default
+        and _advertised_default != _EMULLM_DEFAULT_MODEL_ID
+        else _DEFAULT_MODEL_ID
+    )
+    worker_id, suffix = _split_model_id(candidate)
+    if worker_id == _DEFAULT_WORKER_ID:
+        return f"{_COPILOT_POOL_WORKER_ID}/" + (
+            suffix if suffix in _EXPORTED_PERSONA_SUFFIXES else "percent100"
+        )
+    if suffix in _HIDDEN_PERSONA_SUFFIXES:
+        return f"{worker_id}/percent100"
+    return candidate
 
 
 def _emullm_default_model_entry() -> dict[str, Any]:
@@ -2977,16 +3741,27 @@ def _merge_model_patch(base: dict[str, Any], patch: dict[str, Any]) -> dict[str,
 
 def _apply_model_catalog_override(
     entry: dict[str, Any],
+    *,
+    include_hidden: bool = False,
 ) -> dict[str, Any] | None:
     model_id = str(entry["id"])
     override = _model_catalog_overrides.get(model_id)
     if not isinstance(override, dict):
-        return entry
-    if override.get("hidden") is True:
+        if not include_hidden:
+            return entry
+        visible = dict(entry)
+        visible["hidden"] = False
+        visible["exported"] = True
+        return visible
+    is_hidden = override.get("hidden") is True
+    if is_hidden and not include_hidden:
         return None
     patch = override.get("patch")
     merged = _merge_model_patch(entry, patch) if isinstance(patch, dict) else dict(entry)
     merged["id"] = model_id
+    if include_hidden:
+        merged["hidden"] = is_hidden
+        merged["exported"] = not is_hidden
     return merged
 
 
@@ -3396,6 +4171,32 @@ def _proxy_available() -> bool:
 
 
 def _require_model(model: str) -> tuple[str, str, dict[str, Any]]:
+    requested_worker_id, requested_suffix = _split_model_id(model)
+    if requested_worker_id == _COPILOT_POOL_WORKER_ID:
+        persona = _PERSONA_SUFFIXES.get(requested_suffix)
+        if requested_suffix not in _EXPORTED_PERSONA_SUFFIXES or persona is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown Copilot pool persona '{model}'",
+            )
+        return _assign_copilot_pool_worker(), requested_suffix, persona
+    if _numeric_copilot_worker_id(requested_worker_id):
+        persona = _models_for(requested_worker_id).get(requested_suffix)
+        if persona is not None:
+            return requested_worker_id, requested_suffix, persona
+        return requested_worker_id, "", {
+            "instruction": None,
+            "passthrough": True,
+            "served_model": model,
+        }
+    if _capability_alias_spec(model) is not None:
+        return _capability_alias_worker(model), "", {
+            "instruction": (
+                f"Serve the capability-selected model alias '{model}' faithfully."
+            ),
+            "passthrough": True,
+            "served_model": model,
+        }
     # A configured/runtime route sends this exact catalog id to a serving worker,
     # forwarding the original id so the worker knows which model to emulate.
     route = _model_routes.get(model)
@@ -3423,7 +4224,7 @@ def _require_model(model: str) -> tuple[str, str, dict[str, Any]]:
             "passthrough": True,
             "served_model": model,
         }
-    worker_id, suffix = _split_model_id(model)
+    worker_id, suffix = requested_worker_id, requested_suffix
     persona = _models_for(worker_id).get(suffix)
     if persona is not None and suffix != "same":
         # Percent dials are virtual personas even when their prefix is not a
@@ -3594,7 +4395,6 @@ async def _relay_model_route_chain(
     required_capabilities = _required_input_capabilities(extra)
     service_kind = str((extra or {}).get("kind") or "chat")
     failures: list[str] = []
-    retry_delays: list[float] = []
     backend_delay_complete = False
     for target in targets:
         is_backend = target.startswith(
@@ -3668,9 +4468,8 @@ async def _relay_model_route_chain(
                     extra=extra,
                 )
             except _WorkerNotReady as error:
-                retry_delays.append(error.retry_after)
                 failures.append(
-                    f"{worker_id}: not ready for {error.retry_after:g}s ({error.reason})"
+                    f"{worker_id}: not ready ({error.reason})"
                 )
                 continue
             except _WorkerRejected as error:
@@ -3690,11 +4489,6 @@ async def _relay_model_route_chain(
     raise HTTPException(
         status_code=503,
         detail=f"all configured routes failed for model '{model}' ({detail})",
-        headers=(
-            {"Retry-After": str(max(1, round(min(retry_delays))))}
-            if retry_delays
-            else None
-        ),
     )
 
 
@@ -3937,6 +4731,97 @@ async def _ensure_on_demand_copilot(
         _clear_waiting_for_worker(wait_id)
 
 
+def _provision_explicit_copilot_worker(
+    worker_id: str,
+) -> Any:
+    if not _numeric_copilot_worker_id(worker_id) or len(worker_id) > 128:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "explicit Copilot worker IDs must be "
+                "worker-copilot-<positive integer>"
+            ),
+        )
+    manager = _copilot_api.get_manager()
+    if manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="headless Copilot manager is unavailable",
+        )
+    with _on_demand_copilot_lock:
+        try:
+            instance = manager.get(worker_id)
+        except _copilot_api.CopilotInstanceMissing:
+            client_requested = [
+                item
+                for item in manager.list()
+                if item.get("role") == "client-requested-copilot"
+            ]
+            if len(client_requested) >= _max_concurrent_calls:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "client-requested Copilot worker quota reached "
+                        f"({_max_concurrent_calls}); remove an unused worker "
+                        "from the local admin UI before creating another"
+                    ),
+                )
+            manager.create(
+                _copilot_api.HeadlessCopilotConfig(
+                    worker_id=worker_id,
+                    model=None,
+                    model_selector="random",
+                    modelmasks=[f"{worker_id}/*"],
+                    role="client-requested-copilot",
+                    autostart=True,
+                    warmup=True,
+                    use_shared_anti_idle=True,
+                ),
+                start=True,
+            )
+        else:
+            if not instance.get("running") and not instance.get("connected"):
+                manager.start(worker_id)
+    return manager
+
+
+async def _ensure_explicit_copilot_worker(worker_id: str) -> None:
+    if worker_id in _connected_workers:
+        return
+    manager = await asyncio.to_thread(
+        _provision_explicit_copilot_worker,
+        worker_id,
+    )
+    wait_id = f"explicit-provision-{uuid.uuid4().hex}"
+    try:
+        deadline = time.monotonic() + min(90.0, _REQUEST_TIMEOUT_SECONDS)
+        while time.monotonic() < deadline:
+            instance = await asyncio.to_thread(manager.get, worker_id)
+            if instance.get("connected"):
+                return
+            _mark_waiting_for_worker(
+                wait_id,
+                worker_id,
+                f"{worker_id}/percent100",
+                "waiting for explicitly numbered Copilot worker to connect",
+            )
+            if not instance.get("running") and instance.get("returncode") is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"explicit worker '{worker_id}' exited with "
+                        f"code {instance['returncode']}"
+                    ),
+                )
+            await asyncio.sleep(0.2)
+        raise HTTPException(
+            status_code=504,
+            detail=f"explicit worker '{worker_id}' did not connect in time",
+        )
+    finally:
+        _clear_waiting_for_worker(wait_id)
+
+
 def _idle_copilot_worker_count() -> int:
     return sum(
         1
@@ -3956,7 +4841,7 @@ async def maintain_idle_copilot_workers_once() -> list[str]:
         return started
     manager = _copilot_api.get_manager()
     if manager is not None:
-        instances = manager.list()
+        instances = await asyncio.to_thread(_copilot_api.manager_status)
         if any(
             instance.get("running") and not instance.get("connected")
             for instance in instances
@@ -3967,6 +4852,7 @@ async def maintain_idle_copilot_workers_once() -> list[str]:
             if (
                 _is_elastic_copilot(worker_id)
                 and not _is_on_demand_copilot(worker_id)
+                and instance.get("role") != "client-requested-copilot"
                 and instance.get("running")
                 and _worker_load(worker_id) == 0
             ):
@@ -3999,7 +4885,7 @@ async def maintain_idle_copilot_workers_once() -> list[str]:
             else:
                 await asyncio.to_thread(manager.stop, worker_id)
     target = min(_idle_worker_target, _max_concurrent_calls)
-    while _idle_copilot_worker_count() < target:
+    if _idle_copilot_worker_count() < target:
         worker_id = await _ensure_on_demand_copilot(
             _copilot_public_model_id("auto"),
             "auto",
@@ -4097,6 +4983,9 @@ async def _relay_full(
     this fails FAST with 429 (and a Retry-After telling the caller when to
     come back -- possibly minutes away), rather than queuing yet more work
     onto an already-busy worker."""
+    if capability_alias := _capability_alias_spec(model):
+        required_capabilities = set(required_capabilities or set())
+        required_capabilities.update(capability_alias[2])
     extra: dict[str, Any] = {}
     if images:
         extra["images"] = images
@@ -4138,61 +5027,66 @@ async def _relay_full(
     if configured_route is None and (
         backing_model := _copilot_backing_model(model)
     ):
-        worker_id = await _ensure_on_demand_copilot(model, backing_model)
-        retry_delay = _worker_retry_delay(worker_id)
-        if retry_delay > 0:
-            _release_worker_reservation(worker_id)
-            raise HTTPException(
-                status_code=503,
-                detail=f"on-demand worker '{worker_id}' is temporarily not ready",
-                headers={"Retry-After": str(max(1, round(retry_delay)))},
-            )
-        try:
-            _check_and_record_usage(worker_id)
-        except BaseException:
-            _release_worker_reservation(worker_id)
-            raise
-        try:
-            result = await _relay_to_worker(
+        primary_worker_id = await _ensure_on_demand_copilot(model, backing_model)
+        worker_ids = list(dict.fromkeys([
+            primary_worker_id,
+            *_route_worker_candidates(
+                model,
+                "worker-copilot-*",
+                resolved_capabilities,
+            ),
+        ]))
+        failures: list[str] = []
+        for worker_id in worker_ids:
+            try:
+                _check_and_record_usage(worker_id)
+            except HTTPException as error:
+                if worker_id == primary_worker_id:
+                    _release_worker_reservation(worker_id)
+                failures.append(f"{worker_id}: {error.detail}")
+                continue
+            try:
+                result = await _relay_to_worker(
+                    worker_id,
+                    model,
+                    prompt_text,
+                    (
+                        f"You are the GitHub Copilot backing model '{backing_model}'. "
+                        "Answer directly at your native capability."
+                    ),
+                    wait=len(worker_ids) == 1,
+                    extra=extra or None,
+                )
+            except _WorkerNotReady as error:
+                failures.append(f"{worker_id}: not ready ({error.reason})")
+                continue
+            except _WorkerRejected as error:
+                failures.append(f"{worker_id}: rejected ({error.reason})")
+                continue
+            except HTTPException as error:
+                failures.append(f"{worker_id}: {error.detail}")
+                continue
+            if result is _PASS:
+                failures.append(f"{worker_id}: disconnected before accepting")
+                continue
+            await _mirror_to_observers(
                 worker_id,
                 model,
                 prompt_text,
-                (
-                    f"You are the GitHub Copilot backing model '{backing_model}'. "
-                    "Answer directly at your native capability."
-                ),
-                wait=True,
-                extra=extra or None,
+                _reply_content(result),
             )
-        except _WorkerNotReady as error:
-            retry_after = max(1, round(error.retry_after))
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"on-demand worker '{worker_id}' is temporarily not ready: "
-                    f"{error.reason}"
-                ),
-                headers={"Retry-After": str(retry_after)},
-            ) from error
-        except _WorkerRejected as error:
-            raise HTTPException(
-                status_code=503,
-                detail=f"on-demand worker '{worker_id}' rejected the request: {error.reason}",
-            ) from error
-        if result is _PASS:
-            raise HTTPException(
-                status_code=503,
-                detail=f"on-demand worker '{worker_id}' disconnected before accepting",
-            )
-        await _mirror_to_observers(
-            worker_id,
-            model,
-            prompt_text,
-            _reply_content(result),
+            return result
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"no eligible servant completed model '{model}' "
+                f"({'; '.join(failures) or 'no candidates'})"
+            ),
         )
-        return result
 
     resolved_worker_id, _, persona = _require_model(model)
+    if _numeric_copilot_worker_id(resolved_worker_id):
+        await _ensure_explicit_copilot_worker(resolved_worker_id)
     worker_ids = _worker_candidates_for_model(
         model,
         resolved_worker_id,
@@ -4240,22 +5134,14 @@ async def _relay_full(
             [
                 *(f"{item.worker_id}: rejected ({item.reason})" for item in rejections),
                 *(
-                    f"{item.worker_id}: not ready for {item.retry_after:g}s ({item.reason})"
+                    f"{item.worker_id}: not ready ({item.reason})"
                     for item in not_ready
                 ),
             ]
         )
-        headers = None
-        if not_ready:
-            headers = {
-                "Retry-After": str(
-                    max(1, round(min(item.retry_after for item in not_ready)))
-                )
-            }
         raise HTTPException(
             status_code=503,
             detail=f"no eligible worker completed model '{model}' ({reasons})",
-            headers=headers,
         )
     # Every step passed (e.g. `recruit` with nobody connected and no fallback).
     raise HTTPException(
@@ -4357,7 +5243,9 @@ async def _set_worker_runtime_model(
         else []
     )
     try:
-        await peer.send_json(
+        await _send_worker_json(
+            worker_id,
+            peer,
             {
                 "type": "set_model",
                 "id": control_id,
@@ -4366,10 +5254,6 @@ async def _set_worker_runtime_model(
                 "capabilities": _on_demand_copilot_capabilities(model_entry),
                 "supported_media_types": media_types,
             }
-        )
-        _increment_active_websocket(
-            _worker_connection_ids.get(worker_id),
-            "messages_out",
         )
         response = await asyncio.wait_for(future, timeout=60)
         if response.get("type") == "model_change_error":
@@ -4459,18 +5343,20 @@ async def _relay_to_worker(
                 continue
             _clear_waiting_for_worker(request_id)
             try:
-                await peer.send_json(payload)
                 if peer_override is None:
-                    _increment_active_websocket(
-                        _worker_connection_ids.get(worker_id), "messages_out"
-                    )
+                    await _send_worker_json(worker_id, peer, payload)
+                else:
+                    await peer.send_json(payload)
                 sent_peer = peer
                 service_started = time.monotonic()
+                _request_assigned_worker.set(worker_id)
                 with _worker_load_lock:
                     _active_service_requests[request_id] = {
                         "worker_id": worker_id,
                         "model": model,
                         "service_kind": service_kind,
+                        "started_at": _now_iso(),
+                        "started_monotonic": service_started,
                     }
             except Exception:
                 if not wait:
@@ -4503,10 +5389,11 @@ async def _relay_to_worker(
         if sent_peer is not None and peer_override is None:
             try:
                 await asyncio.shield(
-                    sent_peer.send_json({"type": "cancel", "id": request_id})
-                )
-                _increment_active_websocket(
-                    _worker_connection_ids.get(worker_id), "messages_out"
+                    _send_worker_json(
+                        worker_id,
+                        sent_peer,
+                        {"type": "cancel", "id": request_id},
+                    )
                 )
             except Exception:
                 pass
@@ -4529,27 +5416,56 @@ async def _relay_to_worker(
 
 
 @router.get("/v1/models")
-def list_models() -> dict[str, Any]:
+def list_models(hidden: bool = False) -> dict[str, Any]:
     """Aggregates the model/persona menu across every currently connected
     worker, plus the default worker_id's fallback menu even if it isn't
     connected right now (so the primary identity is always discoverable)."""
-    worker_ids = sorted(set(_connected_workers) | {_DEFAULT_WORKER_ID})
+    worker_ids = sorted(
+        worker_id
+        for worker_id in _connected_workers
+        if worker_id != _DEFAULT_WORKER_ID
+        and not _numeric_copilot_worker_id(worker_id)
+    )
     worker_data = [
         _model_entry(worker_id, suffix, persona)
         for worker_id in worker_ids
         for suffix, persona in _models_for(worker_id).items()
+        if suffix not in _HIDDEN_PERSONA_SUFFIXES
+    ]
+    pool_data = [
+        _copilot_pool_model_entry(suffix, _PERSONA_SUFFIXES[suffix])
+        for suffix in ("percent125", "percent100", "percent25")
+    ]
+    capability_data = [
+        _capability_alias_model_entry(selector, capability, required)
+        for capability, required in _CAPABILITY_MODEL_ALIASES.items()
+        for selector in ("best", "worse")
     ]
     backing_aliases = [
         alias
         for worker_id in sorted(_connected_workers)
+        if not _numeric_copilot_worker_id(worker_id)
         if (alias := _backing_model_alias_entry(worker_id)) is not None
     ]
-    seen = {entry["id"] for entry in [*worker_data, *backing_aliases]}
+    seen = {
+        entry["id"]
+        for entry in [
+            *pool_data,
+            *capability_data,
+            *worker_data,
+            *backing_aliases,
+        ]
+    }
     seen.add(_EMULLM_DEFAULT_MODEL_ID)
     configured_ids = [
         model_id
         for model_id in [*advertised_catalog()["models"], *_model_routes.keys()]
-        if model_id and model_id not in seen and not seen.add(model_id)
+        if (
+            model_id
+            and _catalog_model_is_visible(model_id)
+            and model_id not in seen
+            and not seen.add(model_id)
+        )
     ]
     configured_data = [
         _configured_model_entry(model_id) for model_id in configured_ids
@@ -4562,6 +5478,8 @@ def list_models() -> dict[str, Any]:
     ]
     base_data = [
         _emullm_default_model_entry(),
+        *pool_data,
+        *capability_data,
         *worker_data,
         *backing_aliases,
         *configured_data,
@@ -4570,11 +5488,19 @@ def list_models() -> dict[str, Any]:
     data = [
         configured
         for entry in base_data
-        if (configured := _apply_model_catalog_override(entry)) is not None
+        if (
+            configured := _apply_model_catalog_override(
+                entry,
+                include_hidden=hidden,
+            )
+        )
+        is not None
     ]
     base_ids = {entry["id"] for entry in base_data}
     for model_id, override in _model_catalog_overrides.items():
-        if model_id in base_ids or override.get("hidden") is True:
+        if model_id in base_ids or not _catalog_model_is_visible(model_id):
+            continue
+        if override.get("hidden") is True and not hidden:
             continue
         patch = override.get("patch")
         if not isinstance(patch, dict):
@@ -4586,7 +5512,8 @@ def list_models() -> dict[str, Any]:
                 "owned_by": "emullm-operator",
                 "connected": False,
                 "simulated": True,
-            }
+            },
+            include_hidden=hidden,
         )
         if custom is not None:
             data.append(custom)
@@ -4595,8 +5522,34 @@ def list_models() -> dict[str, Any]:
 
 @router.get("/v1/models/{model_id:path}")
 def get_model(model_id: str) -> dict[str, Any]:
+    if not _catalog_model_is_visible(model_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"legacy persona model '{model_id}' is not exported",
+        )
     if model_id == _EMULLM_DEFAULT_MODEL_ID:
         entry = _apply_model_catalog_override(_emullm_default_model_entry())
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
+        return entry
+    worker_id, suffix = _split_model_id(model_id)
+    if (
+        worker_id == _COPILOT_POOL_WORKER_ID
+        and suffix in _EXPORTED_PERSONA_SUFFIXES
+    ):
+        entry = _apply_model_catalog_override(
+            _copilot_pool_model_entry(
+                suffix,
+                _PERSONA_SUFFIXES[suffix],
+            )
+        )
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
+        return entry
+    if spec := _capability_alias_spec(model_id):
+        entry = _apply_model_catalog_override(
+            _capability_alias_model_entry(*spec)
+        )
         if entry is None:
             raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
         return entry
@@ -4614,11 +5567,13 @@ def get_model(model_id: str) -> dict[str, Any]:
             if entry is None:
                 raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
             return entry
-    worker_id, suffix = _split_model_id(model_id)
     if suffix == _worker_runtime_models.get(worker_id):
         alias = _backing_model_alias_entry(worker_id)
         if alias is not None:
-            return alias
+            entry = _apply_model_catalog_override(alias)
+            if entry is None:
+                raise HTTPException(status_code=404, detail=f"model '{model_id}' is hidden")
+            return entry
     persona = _models_for(worker_id).get(suffix)
     if persona is None:
         override = _model_catalog_overrides.get(model_id)
@@ -5655,13 +6610,22 @@ def _force_worker_id(model: str, worker_id: str) -> str:
 def specific_worker_list_models(worker_id: str) -> dict[str, Any]:
     return {
         "object": "list",
-        "data": [_model_entry(worker_id, suffix, persona) for suffix, persona in _models_for(worker_id).items()]
+        "data": [
+            _model_entry(worker_id, suffix, persona)
+            for suffix, persona in _models_for(worker_id).items()
+            if suffix not in _HIDDEN_PERSONA_SUFFIXES
+        ]
     }
 
 
 @router.get("/emullm/specific_worker/{worker_id}/v1/models/{model_id:path}")
 def specific_worker_get_model(worker_id: str, model_id: str) -> dict[str, Any]:
     _, suffix = _split_model_id(model_id)
+    if suffix in _HIDDEN_PERSONA_SUFFIXES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"legacy persona model '{model_id}' is not exported",
+        )
     persona = _models_for(worker_id).get(suffix)
     if persona is None:
         raise HTTPException(status_code=404, detail=f"unknown model '{model_id}' for worker '{worker_id}'")
@@ -5786,6 +6750,17 @@ class _JsonRecordStore:
                     continue
             return records
 
+    def count(self) -> int:
+        with self._lock:
+            try:
+                return sum(
+                    1
+                    for entry in os.scandir(self._dir)
+                    if entry.is_file() and entry.name.endswith(".json")
+                )
+            except OSError:
+                return 0
+
     def save(self, record: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self._dir.mkdir(parents=True, exist_ok=True)
@@ -5843,6 +6818,7 @@ class _JsonRecordStore:
 _MAILBOX_CONFIG_SCHEMA_VERSION = 2
 _MAILBOX_MAX_ID_LENGTH = 64
 _mailbox_lock = threading.RLock()
+_mailbox_event_summary_cache: dict[Path, tuple[int, int, int, str | None]] = {}
 _LLM_USER_ID = "LLM_USER"
 _LLM_USER_MAILBOX = "websock_to_llm_user"
 
@@ -5962,6 +6938,41 @@ def _mailbox_events(mailbox: str) -> list[dict[str, Any]]:
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot read mailbox event log at {path}") from exc
     return events
+
+
+def _mailbox_event_summary(mailbox: str) -> tuple[int, str | None]:
+    """Count a JSONL stream without deserializing its complete history."""
+    path = _mailbox_event_log_path(mailbox)
+    with _mailbox_lock:
+        if not path.is_file():
+            _mailbox_event_summary_cache.pop(path, None)
+            return 0, None
+        metadata = path.stat()
+        cached = _mailbox_event_summary_cache.get(path)
+        if cached and cached[:2] == (metadata.st_mtime_ns, metadata.st_size):
+            return cached[2], cached[3]
+        count = 0
+        last_line: bytes | None = None
+        with path.open("rb") as handle:
+            for line in handle:
+                if line.strip():
+                    count += 1
+                    last_line = line
+        last_activity = None
+        if last_line is not None:
+            try:
+                last_event = json.loads(last_line.decode("utf-8-sig"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"cannot read mailbox event log at {path}") from exc
+            if isinstance(last_event, dict):
+                last_activity = last_event.get("ts")
+        _mailbox_event_summary_cache[path] = (
+            metadata.st_mtime_ns,
+            metadata.st_size,
+            count,
+            last_activity,
+        )
+        return count, last_activity
 
 
 def _mailbox_json_value(value: Any) -> Any:
@@ -6268,17 +7279,20 @@ def _clear_mailbox_cursor(mailbox: str, agent: str) -> dict[str, Any]:
 
 
 def _mailbox_event_count() -> int:
-    count = 0
     directory = _mailbox_events_dir()
     with _mailbox_lock:
         if not directory.is_dir():
             return 0
-        for path in directory.glob("*.jsonl"):
-            try:
-                count += len(_mailbox_events(path.stem))
-            except ValueError:
-                continue
-    return count
+        paths = list(directory.glob("*.jsonl"))
+    return sum(_mailbox_event_summary(path.stem)[0] for path in paths)
+
+
+def _mailbox_count() -> int:
+    with _mailbox_lock:
+        config = _load_mailbox_config()
+        return sum(
+            1 for record in config["mailboxes"].values() if isinstance(record, dict)
+        )
 
 
 def _clear_mailbox_storage() -> dict[str, int]:
@@ -6431,8 +7445,8 @@ def _record_relay_not_ready(
     data = {
         "text": reason,
         "reason": reason,
-        "retry_after": retry_after,
-        "retry_at": time.time() + retry_after,
+        "reported_retry_after": retry_after,
+        "cooldown_applied": False,
         "model": model,
         "worker_id": worker_id,
         "from": worker_id,
@@ -6540,7 +7554,7 @@ _tokens_store = _JsonRecordStore("tokens")
 
 def _mailbox_descriptor(record: dict[str, Any], agent: str | None = None) -> dict[str, Any]:
     mailbox = _mailbox_id(record.get("id"))
-    events = _mailbox_events(mailbox)
+    message_count, last_activity = _mailbox_event_summary(mailbox)
     descriptor: dict[str, Any] = {
         "id": mailbox,
         "name": str(record.get("name") or mailbox),
@@ -6552,9 +7566,9 @@ def _mailbox_descriptor(record: dict[str, Any], agent: str | None = None) -> dic
         "storage": "events_logs",
         "hidden": bool(record.get("hidden")),
         "writable": bool(record.get("writable", True)),
-        "messages": len(events),
+        "messages": message_count,
         "connected": mailbox in _connected_workers,
-        "last_activity": events[-1].get("ts") if events else None,
+        "last_activity": last_activity,
         "filename": str(_mailbox_event_log_path(mailbox)),
         "endpoints": _mailbox_endpoint_paths(mailbox),
     }
@@ -8043,6 +9057,52 @@ def admin_state() -> dict[str, Any]:
             },
         )
     waiting = _waiting_for_worker_snapshot()
+    now_monotonic = time.monotonic()
+    with _worker_load_lock:
+        active_service_requests = [
+            {
+                "request_id": request_id,
+                "worker_id": str(metadata.get("worker_id") or ""),
+                "model": str(metadata.get("model") or ""),
+                "service_kind": str(metadata.get("service_kind") or ""),
+                "started_at": metadata.get("started_at"),
+                "age_seconds": round(
+                    max(
+                        0.0,
+                        now_monotonic
+                        - float(metadata.get("started_monotonic") or now_monotonic),
+                    ),
+                    1,
+                ),
+            }
+            for request_id, metadata in _active_service_requests.items()
+        ]
+    stuck_workers = [
+        request
+        for request in active_service_requests
+        if request["age_seconds"] >= _STUCK_WORKER_SECONDS
+    ]
+    headless_copilots = _copilot_api.manager_status()
+    connection_errors = []
+    for instance in headless_copilots:
+        runtime = instance.get("runtime")
+        runtime = runtime if isinstance(runtime, dict) else {}
+        error_count = max(0, int(runtime.get("connection_errors") or 0))
+        last_error = str(runtime.get("last_connection_error") or "").strip()
+        if not error_count and not last_error:
+            continue
+        connection_errors.append(
+            {
+                "worker_id": str(instance.get("worker_id") or ""),
+                "connected": bool(instance.get("connected")),
+                "running": bool(instance.get("running")),
+                "connection_errors": error_count,
+                "last_connection_error": last_error or None,
+                "last_disconnected_at": runtime.get("last_disconnected_at"),
+            }
+        )
+    client_worker_limit, client_worker_reserve = _client_worker_capacity()
+    client_capacity_waiting = sum(_client_capacity_waiters.values())
     connected_workers = sorted(_connected_workers.keys())
     busy_workers = sum(
         1 for worker_id in connected_workers if _worker_load(worker_id) > 0
@@ -8102,8 +9162,16 @@ def admin_state() -> dict[str, Any]:
             "idle_grace_seconds": _idle_grace_seconds,
             "idle_maintenance_paused": _idle_maintenance_paused,
             "backend_fallback_delay_seconds": _backend_fallback_delay_seconds,
+            "client_worker_limit": client_worker_limit,
+            "client_worker_reserve": client_worker_reserve,
+            "client_capacity_waiting": client_capacity_waiting,
+            "stuck_worker_seconds": _STUCK_WORKER_SECONDS,
+            "stuck_workers": len(stuck_workers),
         },
         "waiting_for_worker": waiting,
+        "active_service_requests": active_service_requests,
+        "stuck_workers": stuck_workers,
+        "connection_errors": connection_errors,
         "worker_not_ready": {
             worker_id: {"retry_after": round(delay, 3)}
             for worker_id in list(_worker_not_ready_until)
@@ -8117,15 +9185,15 @@ def admin_state() -> dict[str, Any]:
             "port": int(os.environ.get("EMULLM_HTTP_PORT", "8801")),
             "shutdown_available": _process_control.shutdown_available(),
         },
-        "record_counts": {kind: len(store.list()) for kind, store in _KIND_STORES.items()},
+        "record_counts": {kind: store.count() for kind, store in _KIND_STORES.items()},
         "mailboxes": {
             "config_path": str(_mailbox_config_path()),
             "events_dir": str(_mailbox_events_dir()),
-            "count": len(_mailbox_directory(include_activity=True)),
+            "count": _mailbox_count(),
             "event_count": _mailbox_event_count(),
         },
         "managed_workers": _sup.get_supervisor().status() if _sup.get_supervisor() else [],
-        "headless_copilots": _copilot_api.manager_status(),
+        "headless_copilots": headless_copilots,
         "active_websockets": _active_websocket_rows(),
         "backend": (
             {"name": _b.get("name"), "base_url": _b.get("base_url"), "model": _b.get("model")}
@@ -8184,6 +9252,9 @@ _STATUS_PAGE_HTML = """<!doctype html>
   .muted { color: #888; }
   .dot { height: 0.6rem; width: 0.6rem; border-radius: 50%; display: inline-block; margin-right: 0.35rem; }
   .on { background: #2ecc71; } .off { background: #bbb; }
+  .poll-controls { display: flex; flex-wrap: wrap; gap: 0.5rem 0.8rem; align-items: center; }
+  .poll-controls label { display: inline-flex; gap: 0.35rem; align-items: center; }
+  .poll-controls select { width: auto; }
   code { background: #8881; padding: 0.05rem 0.3rem; border-radius: 4px; }
   footer { margin-top: 1.5rem; color: #888; font-size: 0.8rem; }
 </style>
@@ -8191,8 +9262,20 @@ _STATUS_PAGE_HTML = """<!doctype html>
 <body>
 <h1>emullm status <span id="view-tag" class="muted" style="font-size:1rem"></span></h1>
 <p class="sub">mode <span id="mode" class="mode">-</span> &middot;
-  auto-refreshing every 3s &middot; <span id="updated" class="muted">-</span> &middot;
+  <span id="poll-status">polling</span> &middot; <span id="updated" class="muted">-</span> &middot;
   <a id="view-toggle" href="/emullm/status/detail">detailed view</a></p>
+<div class="poll-controls">
+  <label>Polling
+    <select id="poll-window">
+      <option value="0">continuous</option>
+      <option value="60000">stop after 1 minute</option>
+      <option value="120000" selected>stop after 2 minutes</option>
+      <option value="300000">stop after 5 minutes</option>
+    </select>
+  </label>
+  <label><input id="poll-hidden" type="checkbox"> poll hidden page every 2 minutes</label>
+  <button id="poll-wake" type="button">Wake / refresh now</button>
+</div>
 
 <div class="cards">
   <div class="card"><div class="k">Workers</div><div class="v" id="worker-count">-</div></div>
@@ -8216,6 +9299,13 @@ _STATUS_PAGE_HTML = """<!doctype html>
 
 <script>
 const DETAIL = __DETAIL__;
+const POLL_VISIBLE_MS = 3000;
+const POLL_HIDDEN_MS = 120000;
+const POLL_WINDOW_KEY = 'emullm.poll.window';
+const POLL_HIDDEN_KEY = 'emullm.poll.hidden';
+let pollTimer = null;
+let pollWindowStartedAt = Date.now();
+let pollInFlight = false;
 function fmtUptime(s) {
   s = Math.floor(s || 0);
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
@@ -8313,8 +9403,59 @@ async function refresh() {
     document.getElementById('updated').textContent = 'error fetching state';
   }
 }
-refresh();
-setInterval(refresh, 3000);
+function storedPollValue(key, fallback) {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+}
+function savePollValue(key, value) {
+  try { localStorage.setItem(key, value); } catch {}
+}
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  const hiddenPolling = document.getElementById('poll-hidden').checked;
+  if (document.hidden && !hiddenPolling) {
+    document.getElementById('poll-status').textContent = 'paused while hidden';
+    return;
+  }
+  const windowMs = Number(document.getElementById('poll-window').value);
+  if (!document.hidden && windowMs > 0 && Date.now() - pollWindowStartedAt >= windowMs) {
+    document.getElementById('poll-status').textContent = 'paused · wake to resume';
+    return;
+  }
+  const delay = document.hidden ? POLL_HIDDEN_MS : POLL_VISIBLE_MS;
+  document.getElementById('poll-status').textContent = document.hidden
+    ? 'hidden · every 2 minutes'
+    : 'every 3 seconds';
+  pollTimer = setTimeout(runPoll, delay);
+}
+async function runPoll(wake = false) {
+  if (wake) pollWindowStartedAt = Date.now();
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try { await refresh(); } finally {
+    pollInFlight = false;
+    schedulePoll();
+  }
+}
+const pollWindow = document.getElementById('poll-window');
+const savedPollWindow = storedPollValue(POLL_WINDOW_KEY, '120000');
+pollWindow.value = Array.from(pollWindow.options).some(option => option.value === savedPollWindow)
+  ? savedPollWindow : '120000';
+const pollHidden = document.getElementById('poll-hidden');
+pollHidden.checked = storedPollValue(POLL_HIDDEN_KEY, 'false') === 'true';
+pollWindow.addEventListener('change', () => {
+  savePollValue(POLL_WINDOW_KEY, pollWindow.value);
+  runPoll(true);
+});
+pollHidden.addEventListener('change', () => {
+  savePollValue(POLL_HIDDEN_KEY, String(pollHidden.checked));
+  runPoll(true);
+});
+document.getElementById('poll-wake').addEventListener('click', () => runPoll(true));
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) schedulePoll();
+  else runPoll(true);
+});
+runPoll(true);
 </script>
 </body>
 </html>"""
@@ -8443,6 +9584,7 @@ class AdminBackendConfig(BaseModel):
     default: bool = False
     validation_interval: str | int | float | None = None
     expected_name: str | None = Field(default=None, max_length=100)
+    expected_revision: str | None = Field(default=None, max_length=64)
 
     @field_validator("base_url")
     @classmethod
@@ -8621,6 +9763,7 @@ class EmullmConfig(BaseModel):
     # legacy flat forms (still honored by the runtime today):
     workers: list[WorkerConfig] | None = None
     headless_copilots: list[_copilot_api.HeadlessCopilotConfig] | None = None
+    anti_idle: _copilot_api.AntiIdleConfig | None = None
     mock_workers: list[MockWorkerConfig] | None = None
     backends: list[BackendConfig] | None = None
     codex_suppliers: list[CodexSupplierConfig] | None = None
@@ -8629,11 +9772,39 @@ class EmullmConfig(BaseModel):
 
 class SaveConfigRequest(BaseModel):
     config: dict[str, Any]
+    expected_revision: str
 
 
 class ConfigSectionRequest(BaseModel):
     value: Any = None
     delete: bool = False
+    expected_revision: str
+
+
+class AdminServerSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = Field(default=None, max_length=2_000)
+    mode: str | list[str] | None = None
+    capability_fallback: Literal["stub", "wait", "error"] = "stub"
+    subagent_model: str | None = Field(default=None, max_length=300)
+    max_concurrent_calls: int = Field(default=50, ge=4, le=50)
+    idle_worker_target: int = Field(default=5, ge=0, le=50)
+    idle_grace_seconds: float = Field(default=30, ge=0, le=3_600)
+    backend_fallback_delay_seconds: float = Field(default=5, ge=0, le=300)
+    validation_interval_default: str | int | float | None = None
+    validation_interval_override: str | int | float | None = None
+    expected_revision: str
+
+
+class AdminAntiIdleConfigRequest(BaseModel):
+    config: _copilot_api.AntiIdleConfig
+    expected_revision: str
+
+
+class AdminAntiIdleEnabledRequest(BaseModel):
+    enabled: bool
+    expected_revision: str
 
 
 class AdminModelConfigRequest(BaseModel):
@@ -8643,6 +9814,7 @@ class AdminModelConfigRequest(BaseModel):
     set_route: bool = False
     route: str | list[str] | None = None
     reset: bool = False
+    expected_revision: str
 
 
 class AgentEnabledRequest(BaseModel):
@@ -8702,7 +9874,15 @@ def _read_config() -> dict[str, Any]:
 @router.get("/admin/emullm/config")
 @router.get("/emullm/admin/config")
 def admin_get_config() -> dict[str, Any]:
-    return {"path": str(_CONFIG_PATH), "config": _read_config()}
+    try:
+        config = _copilot_api.read_config_document(_CONFIG_PATH)
+    except _copilot_api.CopilotInstanceError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "path": str(_CONFIG_PATH),
+        "config": config,
+        "revision": _copilot_api.config_document_revision(config),
+    }
 
 
 @router.get("/admin/emullm/config/schema")
@@ -8725,8 +9905,19 @@ def admin_put_config(body: SaveConfigRequest) -> dict[str, Any]:
                 for err in exc.errors()
             ],
         )
-    _copilot_api.write_config_document(_CONFIG_PATH, body.config)
-    return {"path": str(_CONFIG_PATH), "config": body.config, "saved": True}
+    def replace(config: dict[str, Any]) -> dict[str, Any]:
+        config.clear()
+        config.update(body.config)
+        return {
+            "path": str(_CONFIG_PATH),
+            "config": config,
+            "saved": True,
+        }
+
+    return _atomic_config_update(
+        replace,
+        expected_revision=body.expected_revision,
+    )
 
 
 _EDITABLE_CONFIG_SECTIONS = {
@@ -8738,6 +9929,7 @@ _EDITABLE_CONFIG_SECTIONS = {
     "mock_workers",
     "backends",
     "codex_suppliers",
+    "anti_idle",
     "mock",
 }
 
@@ -8751,52 +9943,372 @@ def admin_put_config_section(section: str, body: ConfigSectionRequest) -> dict[s
             status_code=404,
             detail=f"unknown editable config section '{section}'",
         )
-    config = _read_config()
-    if body.delete:
-        config.pop(section, None)
-    else:
-        config[section] = body.value
-    try:
-        EmullmConfig.model_validate(config)
-    except ValidationError as error:
-        raise HTTPException(
-            status_code=422,
-            detail=[
-                {
-                    "loc": list(item.get("loc", ())),
-                    "msg": item.get("msg"),
-                    "type": item.get("type"),
-                }
-                for item in error.errors()
-            ],
-        ) from error
-    _copilot_api.write_config_document(_CONFIG_PATH, config)
-    return {
-        "path": str(_CONFIG_PATH),
-        "section": section,
-        "deleted": body.delete,
-        "value": config.get(section),
-        "config": config,
-        "saved": True,
-        "restart_required": True,
-    }
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        if body.delete:
+            config.pop(section, None)
+        else:
+            config[section] = body.value
+        return {
+            "path": str(_CONFIG_PATH),
+            "section": section,
+            "deleted": body.delete,
+            "value": config.get(section),
+            "config": config,
+            "saved": True,
+            "restart_required": True,
+        }
+
+    return _atomic_config_update(
+        mutate,
+        expected_revision=body.expected_revision,
+    )
 
 
 def _atomic_config_update(
     mutator: Callable[[dict[str, Any]], dict[str, Any]],
+    *,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
     def validated(config: dict[str, Any]) -> dict[str, Any]:
+        if (
+            expected_revision is not None
+            and _copilot_api.config_document_revision(config)
+            != expected_revision
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="configuration changed; reload before saving",
+            )
         result = mutator(config)
         try:
             EmullmConfig.model_validate(config)
         except ValidationError as error:
             raise HTTPException(status_code=422, detail=error.errors()) from error
+        result["revision"] = _copilot_api.config_document_revision(config)
         return result
 
     try:
         return _copilot_api.update_config_document(_CONFIG_PATH, validated)
     except _copilot_api.CopilotInstanceError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.put("/admin/emullm/config/server-settings")
+@router.put("/emullm/admin/config/server-settings")
+def admin_put_server_settings(
+    body: AdminServerSettingsRequest,
+) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        for key in (
+            "description",
+            "mode",
+            "subagent_model",
+            "validation_interval_default",
+            "validation_interval_override",
+        ):
+            value = getattr(body, key)
+            if value in (None, ""):
+                config.pop(key, None)
+            else:
+                config[key] = value
+        config.update(
+            capability_fallback=body.capability_fallback,
+            max_concurrent_calls=body.max_concurrent_calls,
+            idle_worker_target=body.idle_worker_target,
+            idle_grace_seconds=body.idle_grace_seconds,
+            backend_fallback_delay_seconds=body.backend_fallback_delay_seconds,
+        )
+        return {
+            "path": str(_CONFIG_PATH),
+            "config": config,
+            "saved": True,
+            "restart_required": True,
+        }
+
+    return _atomic_config_update(
+        mutate,
+        expected_revision=body.expected_revision,
+    )
+
+
+def _anti_idle_config(
+    config: dict[str, Any] | None = None,
+) -> _copilot_api.AntiIdleConfig:
+    document = config if config is not None else _read_config()
+    return _copilot_api.AntiIdleConfig.model_validate(
+        document.get("anti_idle") or {}
+    )
+
+
+def _anti_idle_prompt_rows(
+    anti_idle: _copilot_api.AntiIdleConfig,
+) -> list[dict[str, Any]]:
+    aggregated: dict[str, dict[str, Any]] = {
+        prompt.id: {
+            "attempts": 0,
+            "completed": 0,
+            "slow": 0,
+            "timeouts": 0,
+            "total_duration_ms": 0,
+            "min_duration_ms": None,
+            "max_duration_ms": 0,
+            "shortest_worker_id": None,
+            "longest_worker_id": None,
+            "retired_workers": 0,
+        }
+        for prompt in anti_idle.prompts
+    }
+    manager = _copilot_api.get_manager()
+    instances = _copilot_api.manager_status()
+    for instance in instances:
+        worker_id = str(instance.get("worker_id") or "")
+        runtime = instance.get("runtime")
+        task_stats = (
+            runtime.get("keepalive_task_stats")
+            if isinstance(runtime, dict)
+            else None
+        )
+        retired = set(
+            runtime.get("retired_keepalive_tasks") or []
+            if isinstance(runtime, dict)
+            else []
+        )
+        if not isinstance(task_stats, dict):
+            continue
+        for prompt_id, totals in aggregated.items():
+            stats = task_stats.get(prompt_id)
+            if not isinstance(stats, dict):
+                continue
+            for key in (
+                "attempts",
+                "completed",
+                "slow",
+                "timeouts",
+                "total_duration_ms",
+            ):
+                totals[key] += int(stats.get(key) or 0)
+            minimum = stats.get("min_duration_ms")
+            if minimum is not None and (
+                totals["min_duration_ms"] is None
+                or int(minimum) < int(totals["min_duration_ms"])
+            ):
+                totals["min_duration_ms"] = int(minimum)
+                totals["shortest_worker_id"] = worker_id
+            maximum = int(stats.get("max_duration_ms") or 0)
+            if maximum > int(totals["max_duration_ms"]):
+                totals["max_duration_ms"] = maximum
+                totals["longest_worker_id"] = worker_id
+            if prompt_id in retired:
+                totals["retired_workers"] += 1
+    rows = []
+    for number, prompt in enumerate(anti_idle.prompts, start=1):
+        totals = aggregated[prompt.id]
+        attempts = int(totals["attempts"])
+        rows.append(
+            {
+                "number": number,
+                **prompt.model_dump(mode="json"),
+                **totals,
+                "average_duration_ms": round(
+                    int(totals["total_duration_ms"]) / attempts,
+                    1,
+                )
+                if attempts
+                else 0.0,
+            }
+        )
+    return rows
+
+
+@router.get("/admin/emullm/anti-idle")
+@router.get("/emullm/admin/anti-idle")
+def admin_get_anti_idle() -> dict[str, Any]:
+    try:
+        document = _copilot_api.read_config_document(_CONFIG_PATH)
+    except _copilot_api.CopilotInstanceError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    anti_idle = _anti_idle_config(document)
+    return {
+        "config": anti_idle.model_dump(mode="json"),
+        "prompts": _anti_idle_prompt_rows(anti_idle),
+        "revision": _copilot_api.config_document_revision(document),
+        "worker_count": (
+            len(_copilot_api.manager_status())
+            if _copilot_api.get_manager() is not None
+            else 0
+        ),
+    }
+
+
+@router.put("/admin/emullm/anti-idle")
+@router.put("/emullm/admin/anti-idle")
+def admin_put_anti_idle(
+    body: AdminAntiIdleConfigRequest,
+) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        config["anti_idle"] = body.config.model_dump(mode="json")
+        return {
+            "saved": True,
+            "restart_required": True,
+            "config": config["anti_idle"],
+            "prompts": _anti_idle_prompt_rows(body.config),
+        }
+
+    return _atomic_config_update(
+        mutate,
+        expected_revision=body.expected_revision,
+    )
+
+
+async def _set_connected_anti_idle(
+    worker_id: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    peer = _connected_workers.get(worker_id)
+    if peer is None:
+        return {"worker_id": worker_id, "connected": False, "updated": False}
+    control_id = f"anti-idle-{uuid.uuid4().hex}"
+    future: asyncio.Future[dict[str, Any]] = (
+        asyncio.get_running_loop().create_future()
+    )
+    _pending_worker_controls[control_id] = future
+    try:
+        await _send_worker_json(
+            worker_id,
+            peer,
+            {
+                "type": "set_anti_idle",
+                "id": control_id,
+                "enabled": enabled,
+            },
+        )
+        result = await asyncio.wait_for(future, timeout=5)
+        return {
+            "worker_id": worker_id,
+            "connected": True,
+            "updated": True,
+            "enabled": result.get("enabled") is True,
+        }
+    except Exception as error:  # noqa: BLE001 - isolate each worker update
+        return {
+            "worker_id": worker_id,
+            "connected": True,
+            "updated": False,
+            "error": str(error),
+        }
+    finally:
+        _pending_worker_controls.pop(control_id, None)
+
+
+@router.put("/admin/emullm/anti-idle/enabled")
+@router.put("/emullm/admin/anti-idle/enabled")
+async def admin_put_anti_idle_enabled(
+    body: AdminAntiIdleEnabledRequest,
+) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        current = _anti_idle_config(config)
+        config["anti_idle"] = current.model_copy(
+            update={"enabled": body.enabled}
+        ).model_dump(mode="json")
+        return {
+            "saved": True,
+            "enabled": body.enabled,
+            "config": config["anti_idle"],
+        }
+
+    saved = _atomic_config_update(
+        mutate,
+        expected_revision=body.expected_revision,
+    )
+    results = await asyncio.gather(
+        *(
+            _set_connected_anti_idle(worker_id, body.enabled)
+            for worker_id in sorted(_connected_workers)
+        )
+    )
+    saved["results"] = results
+    saved["updated_workers"] = sum(
+        1 for result in results if result.get("updated")
+    )
+    saved["failed_workers"] = sum(
+        1 for result in results if not result.get("updated")
+    )
+    saved["restart_required"] = False
+    return saved
+
+
+async def _reset_connected_keepalive_stats(worker_id: str) -> dict[str, Any]:
+    peer = _connected_workers.get(worker_id)
+    if peer is None:
+        return {"worker_id": worker_id, "connected": False, "reset": False}
+    control_id = f"keepalive-reset-{uuid.uuid4().hex}"
+    future: asyncio.Future[dict[str, Any]] = (
+        asyncio.get_running_loop().create_future()
+    )
+    _pending_worker_controls[control_id] = future
+    try:
+        await _send_worker_json(
+            worker_id,
+            peer,
+            {"type": "reset_keepalive_stats", "id": control_id},
+        )
+        await asyncio.wait_for(future, timeout=5)
+        return {"worker_id": worker_id, "connected": True, "reset": True}
+    except Exception as error:  # noqa: BLE001 - isolate each worker reset
+        return {
+            "worker_id": worker_id,
+            "connected": True,
+            "reset": False,
+            "error": (
+                "worker did not acknowledge reset within 5 seconds"
+                if isinstance(error, TimeoutError)
+                else str(error)
+            ),
+        }
+    finally:
+        _pending_worker_controls.pop(control_id, None)
+
+
+@router.post("/admin/emullm/anti-idle/reset-stats")
+@router.post("/emullm/admin/anti-idle/reset-stats")
+async def admin_reset_anti_idle_stats() -> dict[str, Any]:
+    manager = _copilot_api.get_manager()
+    if manager is None:
+        return {"reset": 0, "results": []}
+    instances = await asyncio.to_thread(manager.list)
+    connected = [
+        str(instance["worker_id"])
+        for instance in instances
+        if instance.get("connected")
+    ]
+    results = list(
+        await asyncio.gather(
+            *(
+                _reset_connected_keepalive_stats(worker_id)
+                for worker_id in connected
+            )
+        )
+    )
+    connected_ids = set(connected)
+    for instance in instances:
+        worker_id = str(instance["worker_id"])
+        if worker_id in connected_ids:
+            continue
+        cleared = await asyncio.to_thread(
+            manager.clear_keepalive_stats,
+            worker_id,
+        )
+        results.append(
+            {
+                "worker_id": worker_id,
+                "connected": False,
+                "reset": cleared,
+            }
+        )
+    return {
+        "reset": sum(bool(result.get("reset")) for result in results),
+        "results": results,
+    }
 
 
 def _configured_backend_records(
@@ -8816,6 +10328,14 @@ def _configured_backend_records(
             if source == "agents" and raw_entry.get("launch") != "proxy":
                 continue
             entry = dict(raw_entry)
+            revision = hashlib.sha256(
+                json.dumps(
+                    raw_entry,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
             has_api_key = bool(entry.pop("api_key", None))
             records.append(
                 {
@@ -8823,6 +10343,7 @@ def _configured_backend_records(
                     "source": source,
                     "index": index,
                     "record_id": f"{source}:{index}",
+                    "revision": revision,
                     "has_api_key": has_api_key,
                 }
             )
@@ -8834,6 +10355,7 @@ def _backend_entry(
     source: str,
     index: int,
     expected_name: str | None = None,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
     if source not in {"backends", "agents"}:
         raise HTTPException(status_code=404, detail=f"unknown backend source '{source}'")
@@ -8850,6 +10372,20 @@ def _backend_entry(
             status_code=409,
             detail="backend record changed; refresh before editing",
         )
+    if expected_revision is not None:
+        revision = hashlib.sha256(
+            json.dumps(
+                entry,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        if revision != expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="backend record changed; refresh before editing",
+            )
     return entry
 
 
@@ -8943,8 +10479,20 @@ def admin_update_backend(
     index: int,
     body: AdminBackendConfig,
 ) -> dict[str, Any]:
+    if body.expected_revision is None:
+        raise HTTPException(
+            status_code=428,
+            detail="expected_revision is required; refresh before editing",
+        )
+
     def mutate(config: dict[str, Any]) -> dict[str, Any]:
-        entry = _backend_entry(config, source, index, body.expected_name)
+        entry = _backend_entry(
+            config,
+            source,
+            index,
+            body.expected_name,
+            body.expected_revision,
+        )
         if body.default:
             _clear_backend_defaults(config)
         _apply_backend_config(entry, body)
@@ -8970,9 +10518,22 @@ def admin_delete_backend(
     source: str,
     index: int,
     expected_name: str | None = None,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
+    if expected_revision is None:
+        raise HTTPException(
+            status_code=428,
+            detail="expected_revision is required; refresh before deleting",
+        )
+
     def mutate(config: dict[str, Any]) -> dict[str, Any]:
-        _backend_entry(config, source, index, expected_name)
+        _backend_entry(
+            config,
+            source,
+            index,
+            expected_name,
+            expected_revision,
+        )
         entries = config[source]
         deleted = entries.pop(index)
         return {
@@ -8991,11 +10552,32 @@ def _configured_codex_suppliers(
     document = config if config is not None else _read_config()
     raw_suppliers = document.get("codex_suppliers")
     if raw_suppliers is None:
-        return [dict(_DEFAULT_CODEX_SUPPLIER)]
+        raw_suppliers = [_DEFAULT_CODEX_SUPPLIER]
+    suppliers = []
+    for supplier in raw_suppliers:
+        if not isinstance(supplier, dict):
+            continue
+        normalized = CodexSupplierConfig.model_validate(supplier).model_dump(
+            mode="json"
+        )
+        normalized["revision"] = hashlib.sha256(
+            json.dumps(
+                supplier,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        suppliers.append(normalized)
+    return suppliers
+
+
+def _stored_codex_suppliers(
+    suppliers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     return [
-        CodexSupplierConfig.model_validate(supplier).model_dump(mode="json")
-        for supplier in raw_suppliers
-        if isinstance(supplier, dict)
+        {key: value for key, value in supplier.items() if key != "revision"}
+        for supplier in suppliers
     ]
 
 
@@ -9039,8 +10621,9 @@ def admin_create_codex_supplier(body: CodexSupplierConfig) -> dict[str, Any]:
                 detail=f"Codex supplier '{body.id}' already exists",
             )
         suppliers.append(body.model_dump(mode="json"))
-        config["codex_suppliers"] = suppliers
-        return {"saved": True, "supplier": suppliers[-1], "suppliers": suppliers}
+        config["codex_suppliers"] = _stored_codex_suppliers(suppliers)
+        records = _configured_codex_suppliers(config)
+        return {"saved": True, "supplier": records[-1], "suppliers": records}
 
     return _atomic_config_update(mutate)
 
@@ -9050,25 +10633,43 @@ def admin_create_codex_supplier(body: CodexSupplierConfig) -> dict[str, Any]:
 def admin_update_codex_supplier(
     supplier_id: str,
     body: CodexSupplierConfig,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
     if supplier_id != body.id:
         raise HTTPException(status_code=422, detail="path supplier ID must match body ID")
+    if expected_revision is None:
+        raise HTTPException(
+            status_code=428,
+            detail="expected_revision is required; refresh before editing",
+        )
     def mutate(config: dict[str, Any]) -> dict[str, Any]:
         suppliers = _configured_codex_suppliers(config)
         for index, supplier in enumerate(suppliers):
             if supplier["id"] == supplier_id:
-                suppliers[index] = body.model_dump(mode="json")
+                if supplier.get("revision") != expected_revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Codex supplier changed; refresh before editing",
+                    )
+                merged = {
+                    key: value
+                    for key, value in supplier.items()
+                    if key != "revision"
+                }
+                merged.update(body.model_dump(mode="json"))
+                suppliers[index] = merged
                 break
         else:
             raise HTTPException(
                 status_code=404,
                 detail=f"no Codex supplier '{supplier_id}'",
             )
-        config["codex_suppliers"] = suppliers
+        config["codex_suppliers"] = _stored_codex_suppliers(suppliers)
+        records = _configured_codex_suppliers(config)
         return {
             "saved": True,
-            "supplier": suppliers[index],
-            "suppliers": suppliers,
+            "supplier": records[index],
+            "suppliers": records,
         }
 
     return _atomic_config_update(mutate)
@@ -9076,19 +10677,42 @@ def admin_update_codex_supplier(
 
 @router.delete("/admin/emullm/codex-suppliers/{supplier_id}")
 @router.delete("/emullm/admin/codex-suppliers/{supplier_id}")
-def admin_delete_codex_supplier(supplier_id: str) -> dict[str, Any]:
+def admin_delete_codex_supplier(
+    supplier_id: str,
+    expected_revision: str | None = None,
+) -> dict[str, Any]:
+    if expected_revision is None:
+        raise HTTPException(
+            status_code=428,
+            detail="expected_revision is required; refresh before deleting",
+        )
+
     def mutate(config: dict[str, Any]) -> dict[str, Any]:
         suppliers = _configured_codex_suppliers(config)
-        remaining = [
-            supplier for supplier in suppliers if supplier["id"] != supplier_id
-        ]
-        if len(remaining) == len(suppliers):
+        current = next(
+            (
+                supplier
+                for supplier in suppliers
+                if supplier["id"] == supplier_id
+            ),
+            None,
+        )
+        if current is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"no Codex supplier '{supplier_id}'",
             )
-        config["codex_suppliers"] = remaining
-        return {"saved": True, "deleted": supplier_id, "suppliers": remaining}
+        if current.get("revision") != expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="Codex supplier changed; refresh before deleting",
+            )
+        remaining = [
+            supplier for supplier in suppliers if supplier["id"] != supplier_id
+        ]
+        config["codex_suppliers"] = _stored_codex_suppliers(remaining)
+        records = _configured_codex_suppliers(config)
+        return {"saved": True, "deleted": supplier_id, "suppliers": records}
 
     return _atomic_config_update(mutate)
 
@@ -9106,12 +10730,17 @@ def admin_model_config() -> dict[str, Any]:
                 str(instance.get("worker_id") or "")
             )
         ]
+    try:
+        config = _copilot_api.read_config_document(_CONFIG_PATH)
+    except _copilot_api.CopilotInstanceError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     return {
-        "models": list_models()["data"],
+        "models": list_models(hidden=True)["data"],
         "overrides": dict(_model_catalog_overrides),
         "routes": dict(_model_routes),
         "backends": _all_backends(),
         "codex_suppliers": _configured_codex_suppliers(),
+        "revision": _copilot_api.config_document_revision(config),
         "on_demand": {
             "worker_prefix": _ON_DEMAND_COPILOT_PREFIX,
             "worker_start": _ON_DEMAND_COPILOT_START,
@@ -9125,47 +10754,50 @@ def admin_model_config() -> dict[str, Any]:
 @router.put("/admin/emullm/model-config")
 @router.put("/emullm/admin/model-config")
 def admin_put_model_config(body: AdminModelConfigRequest) -> dict[str, Any]:
-    config = _read_config()
-    overrides = dict(config.get("model_catalog_overrides") or {})
-    if body.reset:
-        overrides.pop(body.model_id, None)
-    else:
-        patch = dict(body.patch)
-        for derived in (
-            "id",
-            "connected",
-            "active_workers",
-            "backing_models",
-            "route_targets",
-            "routing_mode",
-        ):
-            patch.pop(derived, None)
-        overrides[body.model_id] = {
-            "hidden": body.hidden,
-            "patch": patch,
-        }
-    if overrides:
-        config["model_catalog_overrides"] = overrides
-    else:
-        config.pop("model_catalog_overrides", None)
-
-    routes = dict(config.get("model_routes") or {})
-    if body.set_route:
-        normalized = _normalise_model_route(body.route)
-        if normalized:
-            routes[body.model_id] = normalized
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        overrides = dict(config.get("model_catalog_overrides") or {})
+        if body.reset:
+            overrides.pop(body.model_id, None)
         else:
-            routes.pop(body.model_id, None)
-        if routes:
-            config["model_routes"] = routes
+            patch = dict(body.patch)
+            for derived in (
+                "id",
+                "connected",
+                "active_workers",
+                "backing_models",
+                "route_targets",
+                "routing_mode",
+                "hidden",
+                "exported",
+            ):
+                patch.pop(derived, None)
+            overrides[body.model_id] = {
+                "hidden": body.hidden,
+                "patch": patch,
+            }
+        if overrides:
+            config["model_catalog_overrides"] = overrides
         else:
-            config.pop("model_routes", None)
+            config.pop("model_catalog_overrides", None)
 
-    try:
-        EmullmConfig.model_validate(config)
-    except ValidationError as error:
-        raise HTTPException(status_code=422, detail=error.errors()) from error
-    _copilot_api.write_config_document(_CONFIG_PATH, config)
+        routes = dict(config.get("model_routes") or {})
+        if body.set_route:
+            normalized = _normalise_model_route(body.route)
+            if normalized:
+                routes[body.model_id] = normalized
+            else:
+                routes.pop(body.model_id, None)
+            if routes:
+                config["model_routes"] = routes
+            else:
+                config.pop("model_routes", None)
+        return {"saved": True}
+
+    result = _atomic_config_update(
+        mutate,
+        expected_revision=body.expected_revision,
+    )
+    config = _copilot_api.read_config_document(_CONFIG_PATH)
     apply_agent_policies(config)
     entry = None
     try:
@@ -9174,11 +10806,11 @@ def admin_put_model_config(body: AdminModelConfigRequest) -> dict[str, Any]:
         if error.status_code != 404:
             raise
     return {
+        **result,
         "model_id": body.model_id,
         "override": _model_catalog_overrides.get(body.model_id),
         "route": _model_routes.get(body.model_id),
         "model": entry,
-        "saved": True,
     }
 
 
@@ -9240,6 +10872,31 @@ def admin_test_sample(sample_id: str) -> Response:
     )
 
 
+@router.get("/admin/emullm/health")
+@router.get("/emullm/admin/health")
+async def admin_health() -> dict[str, Any]:
+    """Return an in-memory readiness snapshot suitable for rollout polling."""
+    connected_workers = len(_connected_workers)
+    return {
+        "status": "ready",
+        "ready": connected_workers > 0,
+        "pid": os.getpid(),
+        "uptime_seconds": round(time.time() - _SERVER_STARTED_AT, 1),
+        "connected_workers": connected_workers,
+        "max_calls": _max_concurrent_calls,
+        "active_calls": sum(_worker_inflight.values()),
+        "waiting_for_worker": len(_waiting_for_worker_snapshot()),
+        "stuck_workers": sum(
+            1
+            for metadata in _active_service_requests.values()
+            if time.monotonic()
+            - float(metadata.get("started_monotonic") or time.monotonic())
+            >= _STUCK_WORKER_SECONDS
+        ),
+        "restart_in_progress": _process_control.restart_in_progress(),
+    }
+
+
 async def _shutdown_connected_worker(
     worker_id: str,
     reason: str,
@@ -9247,10 +10904,10 @@ async def _shutdown_connected_worker(
     peer = _connected_workers.get(worker_id)
     if peer is None:
         return False
-    await peer.send_json({"type": "shutdown", "reason": reason})
-    _increment_active_websocket(
-        _worker_connection_ids.get(worker_id),
-        "messages_out",
+    await _send_worker_json(
+        worker_id,
+        peer,
+        {"type": "shutdown", "reason": reason},
     )
     deadline = time.monotonic() + 15
     while worker_id in _connected_workers and time.monotonic() < deadline:
@@ -9268,6 +10925,18 @@ async def _wait_for_managed_worker_offline(
         if not instance.get("running") and not instance.get("connected"):
             return
         await asyncio.sleep(0.1)
+
+
+async def _wait_for_connected_worker(
+    worker_id: str,
+    timeout_seconds: float = _WORKER_RECONNECT_TIMEOUT_SECONDS,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if worker_id in _connected_workers:
+            return True
+        await asyncio.sleep(0.1)
+    return worker_id in _connected_workers
 
 
 @router.post("/admin/emullm/copilots/{worker_id}/online-action/{action}")
@@ -9311,7 +10980,14 @@ async def admin_online_copilot_action(
 
 @router.post("/admin/emullm/copilots/bulk/{action}")
 @router.post("/emullm/admin/copilots/bulk/{action}")
-async def admin_bulk_copilot_action(action: str) -> dict[str, Any]:
+async def admin_bulk_copilot_action(
+    action: str,
+    batch_size: int = Query(
+        _BULK_WORKER_ACTION_BATCH_SIZE,
+        ge=1,
+        le=50,
+    ),
+) -> dict[str, Any]:
     global _idle_maintenance_paused
     if action not in {
         "start",
@@ -9330,24 +11006,34 @@ async def admin_bulk_copilot_action(action: str) -> dict[str, Any]:
             status_code=409,
             detail="headless Copilot manager is unavailable",
         )
-    instances = manager.list()
+    instances = await asyncio.to_thread(manager.list)
     results = []
     if action in {"stop", "stop-idle"}:
         _idle_maintenance_paused = True
     elif action in {"start", "restart"}:
         _idle_maintenance_paused = False
+
+    eligible = []
     for instance in instances:
         worker_id = str(instance["worker_id"])
         online = bool(instance.get("running") or instance.get("connected"))
         if action == "start":
             if online:
                 continue
-            result = await asyncio.to_thread(manager.start, worker_id)
         elif action in {"stop", "stop-idle"}:
             if not online:
                 continue
             if action == "stop-idle" and not _worker_is_idle(worker_id):
                 continue
+        elif not online:
+            continue
+        eligible.append(instance)
+
+    async def apply(instance: dict[str, Any]) -> dict[str, Any]:
+        worker_id = str(instance["worker_id"])
+        if action == "start":
+            return await asyncio.to_thread(manager.start, worker_id)
+        if action in {"stop", "stop-idle"}:
             if instance.get("connected"):
                 stopped = await _shutdown_connected_worker(
                     worker_id,
@@ -9356,29 +11042,34 @@ async def admin_bulk_copilot_action(action: str) -> dict[str, Any]:
                 result = {"worker_id": worker_id, "stopped": stopped}
             else:
                 result = await asyncio.to_thread(manager.stop, worker_id)
+            return result
+        if instance.get("connected"):
+            await _shutdown_connected_worker(
+                worker_id,
+                f"bulk {action}",
+            )
+            await _wait_for_managed_worker_offline(manager, worker_id)
         else:
-            if not online:
-                continue
-            if instance.get("connected"):
-                await _shutdown_connected_worker(
-                    worker_id,
-                    f"bulk {action}",
-                )
-                await _wait_for_managed_worker_offline(manager, worker_id)
-            else:
-                await asyncio.to_thread(manager.stop, worker_id)
-            if action == "reset-session":
-                result = await asyncio.to_thread(
-                    manager.reset_session,
-                    worker_id,
-                )
-                await asyncio.to_thread(manager.start, worker_id)
-            else:
-                result = await asyncio.to_thread(manager.start, worker_id)
-        results.append(result)
+            await asyncio.to_thread(manager.stop, worker_id)
+        if action == "reset-session":
+            result = await asyncio.to_thread(
+                manager.reset_session,
+                worker_id,
+            )
+            await asyncio.to_thread(manager.start, worker_id)
+        else:
+            result = await asyncio.to_thread(manager.start, worker_id)
+        connected = await _wait_for_connected_worker(worker_id)
+        return {**result, "connected": connected}
+
+    for offset in range(0, len(eligible), batch_size):
+        batch = eligible[offset : offset + batch_size]
+        results.extend(await asyncio.gather(*(apply(instance) for instance in batch)))
     return {
         "action": action,
         "affected": len(results),
+        "batch_size": batch_size,
+        "batches": (len(eligible) + batch_size - 1) // batch_size,
         "idle_maintenance_paused": _idle_maintenance_paused,
         "results": results,
     }
@@ -9416,7 +11107,288 @@ def admin_list_agents() -> dict[str, Any]:
 def admin_list_websockets() -> dict[str, Any]:
     """List every active EMULLM WebSocket and its inbound/outbound frame counts."""
     connections = _active_websocket_rows()
-    return {"count": len(connections), "connections": connections}
+    return {
+        "count": len(connections),
+        "connections": connections,
+        "logs": {
+            "directory": str(_socket_worker_log_dir),
+            "segments_per_worker": 3,
+            "segment_bytes": _socket_worker_log_segment_bytes,
+            "max_bytes_per_worker": 3 * _socket_worker_log_segment_bytes,
+        },
+    }
+
+
+@router.get("/admin/emullm/websockets/{worker_id}/log")
+@router.get("/emullm/admin/websockets/{worker_id}/log")
+def admin_worker_socket_log(worker_id: str) -> PlainTextResponse:
+    try:
+        normalized = _mailbox_id(worker_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    first, current, previous = _socket_log_paths(normalized)
+    with _socket_worker_log_lock:
+        segments = [
+            (name, path)
+            for name, path in (
+                ("first", first),
+                ("previous", previous),
+                ("current", current),
+            )
+            if path.is_file()
+        ]
+        if not segments:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no socket log for worker '{normalized}'",
+            )
+        startup_prompt, prompt_source = _worker_start_prompt(normalized, first)
+        prompt_header = {
+            **_socket_log_clock_fields(),
+            "record_type": "worker_start_prompt",
+            "worker_id": normalized,
+            "source": prompt_source,
+            "from": "SYSTEM",
+            "sender": "SYSTEM",
+            "prompt": _socket_log_value(startup_prompt),
+        }
+        content_parts = [
+            (
+                json.dumps(
+                    prompt_header,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        ]
+        for segment, path in segments:
+            boundary = {
+                **_socket_log_clock_fields(),
+                "record_type": "segment_boundary",
+                "segment": segment,
+                "file": path.name,
+                "bytes": path.stat().st_size,
+                "from": "SYSTEM",
+                "sender": "SYSTEM",
+            }
+            content_parts.append(
+                (
+                    json.dumps(
+                        boundary,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            content_parts.append(path.read_bytes())
+        content = b"".join(content_parts)
+    return PlainTextResponse(
+        content.decode("utf-8", errors="replace"),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/admin/emullm/websockets/{worker_id}/log/view", response_class=HTMLResponse)
+@router.get("/emullm/admin/websockets/{worker_id}/log/view", response_class=HTMLResponse)
+def admin_worker_socket_log_viewer(worker_id: str) -> HTMLResponse:
+    try:
+        normalized = _mailbox_id(worker_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    raw_url = f"/emullm/admin/websockets/{normalized}/log"
+    worker_json = json.dumps(normalized)
+    raw_url_json = json.dumps(raw_url)
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23071720'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-size='38' font-family='monospace' font-weight='700' fill='%2325d5c8'%3EE%3C/text%3E%3C/svg%3E">
+<title>EMULLM socket log · {normalized}</title>
+<style>
+  :root {{ color-scheme: dark; --bg:#061017; --panel:#0a1b25; --line:#19414d;
+    --text:#d9edf1; --muted:#7895a0; --in:#12313d; --out:#16483f; --accent:#25d5c8; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; height:100vh; display:flex; flex-direction:column;
+    background:var(--bg); color:var(--text); font-family:Inter,"Segoe UI",sans-serif; }}
+  header {{ display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:12px 16px;
+    border-bottom:1px solid var(--line); background:#071720; }}
+  h1 {{ margin:0; font-size:.95rem; color:var(--accent); }}
+  button,a {{ padding:6px 10px; border:1px solid var(--line); border-radius:6px;
+    background:#0e2b36; color:var(--text); text-decoration:none; cursor:pointer; }}
+  #status {{ color:var(--muted); font-size:.75rem; }}
+  #messages {{ flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column;
+    gap:9px; padding:16px; scroll-behavior:smooth; }}
+  .bubble {{ width:fit-content; max-width:80%; padding:9px 11px; border:1px solid var(--line);
+    border-radius:11px; box-shadow:0 5px 18px #0005; }}
+  .bubble.server {{ align-self:flex-start; background:var(--in); border-bottom-left-radius:2px; }}
+  .bubble.worker {{ align-self:flex-end; background:var(--out); border-bottom-right-radius:2px; }}
+  .bubble.system {{ align-self:center; width:min(92%,900px); max-width:92%;
+    background:#151d27; border-style:dashed; }}
+  .meta {{ margin-bottom:5px; color:#8bb2bc; font:600 .68rem/1.35 Consolas,monospace; }}
+  .content {{ white-space:pre-wrap; overflow-wrap:anywhere; font:.8rem/1.45 Consolas,monospace; }}
+  .media {{ display:grid; gap:7px; margin-top:8px; }}
+  .media figure {{ margin:0; }}
+  .media img {{ display:block; max-width:100%; max-height:480px; border:1px solid var(--line);
+    border-radius:7px; background:#02090d; object-fit:contain; }}
+  .media audio {{ display:block; width:min(100%,520px); }}
+  .media figcaption {{ margin-top:4px; color:var(--muted); font-size:.67rem; }}
+  .media-error {{ color:#e0ad68; font-size:.72rem; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Socket worker · <code>{normalized}</code></h1>
+  <button id="autoscroll" type="button" aria-pressed="true">Autoscroll: on</button>
+  <button id="reload" type="button">Reload</button>
+  <a href="{raw_url}" target="_blank">Raw JSONL</a>
+  <span id="status">loading…</span>
+</header>
+<main id="messages" tabindex="0" aria-label="Worker socket conversation"></main>
+<script>
+const WORKER = {worker_json};
+const RAW_URL = {raw_url_json};
+const messages = document.getElementById('messages');
+const autoscrollButton = document.getElementById('autoscroll');
+let autoscroll = true;
+let lastText = '';
+function esc(value) {{
+  return String(value).replace(/[&<>"']/g, c => ({{
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }}[c]));
+}}
+function setAutoscroll(enabled) {{
+  autoscroll = enabled;
+  autoscrollButton.textContent = 'Autoscroll: ' + (enabled ? 'on' : 'off');
+  autoscrollButton.setAttribute('aria-pressed', String(enabled));
+  if (enabled) scrollToBottom();
+}}
+function scrollToBottom() {{
+  messages.scrollTop = messages.scrollHeight;
+}}
+function recordContent(record) {{
+  if (record.record_type === 'worker_start_prompt') return record.prompt || '(startup prompt unavailable)';
+  if (record.record_type === 'segment_boundary') {{
+    return 'Segment ' + record.segment + ' · ' + record.file + ' · ' + record.bytes + ' bytes';
+  }}
+  const frame = record.frame || {{}};
+  for (const key of ['prompt','content','reason','reply']) {{
+    if (frame[key] != null) return typeof frame[key] === 'string'
+      ? frame[key] : JSON.stringify(frame[key], null, 2);
+  }}
+  return JSON.stringify(frame, null, 2);
+}}
+function mediaContent(record) {{
+  const media = Array.isArray(record.media) ? record.media : [];
+  if (!media.length) return '';
+  return '<div class="media">' + media.map(item => {{
+    const description = esc(
+      (item.mime_type || item.kind || 'media') + ' · ' +
+      (item.bytes == null ? 'unknown size' : item.bytes + ' bytes')
+    );
+    if (!item.available || !item.url) {{
+      return '<div class="media-error">' + description + ' · ' +
+        esc(item.error || 'preview unavailable') + '</div>';
+    }}
+    const url = esc(item.url);
+    if (item.kind === 'image') {{
+      return '<figure><img src="' + url + '" alt="Socket image preview" loading="lazy">' +
+        '<figcaption>' + description + '</figcaption></figure>';
+    }}
+    if (item.kind === 'audio') {{
+      return '<figure><audio controls preload="metadata" src="' + url + '"></audio>' +
+        '<figcaption>' + description + '</figcaption></figure>';
+    }}
+    return '';
+  }}).join('') + '</div>';
+}}
+function render(text) {{
+  if (text === lastText) {{ if (autoscroll) scrollToBottom(); return; }}
+  const previousTop = messages.scrollTop;
+  const records = text.split(/\\r?\\n/).filter(Boolean).map(line => {{
+    try {{ return JSON.parse(line); }}
+    catch (error) {{ return {{record_type:'parse_error', line, error:String(error)}}; }}
+  }});
+  messages.innerHTML = records.map(record => {{
+    const side = record.direction === 'outbound' ? 'server' :
+      (record.direction === 'inbound' ? 'worker' : 'system');
+    const from = record.sender || record.from || (side === 'server' ? 'EMULLM' :
+      (side === 'worker' ? WORKER : 'SYSTEM'));
+    const speaker = 'from: ' + from;
+    const frame = record.frame || {{}};
+    const label = record.record_type || frame.type || 'frame';
+    const id = frame.id ? ' · ' + frame.id : '';
+    const duration = frame.duration_ms != null ? ' · ' + frame.duration_ms + ' ms' : '';
+    const timestamp = record.timestamp ? ' · ' + new Date(record.timestamp).toLocaleTimeString() : '';
+    const precision = record.precision_clock_decimal
+      ? ' · clock ' + record.precision_clock_decimal : '';
+    return '<article class="bubble ' + side + '"><div class="meta">' +
+      esc(speaker + ' · ' + label + id + duration + timestamp + precision) +
+      '</div><div class="content">' + esc(recordContent(record)) + '</div>' +
+      mediaContent(record) + '</article>';
+  }}).join('');
+  lastText = text;
+  if (autoscroll) scrollToBottom(); else messages.scrollTop = previousTop;
+}}
+async function loadLog() {{
+  try {{
+    const response = await fetch(RAW_URL, {{cache:'no-store'}});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const text = await response.text();
+    render(text);
+    document.getElementById('status').textContent =
+      WORKER + ' · updated ' + new Date().toLocaleTimeString();
+  }} catch (error) {{
+    document.getElementById('status').textContent = 'load failed: ' + error;
+  }}
+}}
+autoscrollButton.addEventListener('click', () => setAutoscroll(!autoscroll));
+document.getElementById('reload').addEventListener('click', loadLog);
+for (const eventName of ['wheel','touchstart','pointerdown']) {{
+  messages.addEventListener(eventName, () => setAutoscroll(false), {{passive:true}});
+}}
+messages.addEventListener('keydown', event => {{
+  if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(event.key)) {{
+    setAutoscroll(false);
+  }}
+}});
+loadLog();
+setInterval(loadLog, 2000);
+</script>
+</body>
+</html>""",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/admin/emullm/websockets/{worker_id}/media/{filename}")
+@router.get("/emullm/admin/websockets/{worker_id}/media/{filename}")
+def admin_worker_socket_media(worker_id: str, filename: str) -> FileResponse:
+    try:
+        normalized = _mailbox_id(worker_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if not re.fullmatch(r"[0-9a-f]{64}\.(?:png|jpg|gif|webp|bmp|wav|mp3|ogg|flac|m4a|webm|bin)", filename):
+        raise HTTPException(status_code=404, detail="unknown socket media artifact")
+    path = _socket_worker_media_dir(normalized) / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="socket media artifact is unavailable")
+    media_type = {
+        ".m4a": "audio/mp4",
+        ".bin": "application/octet-stream",
+    }.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0]
+    return FileResponse(
+        path,
+        media_type=media_type or "application/octet-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/admin/emullm/clients")
@@ -9761,6 +11733,8 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   .form-grid label { display: flex; flex-direction: column; gap: 4px; color: #71949f; font-size: .67rem; font-weight: 650; }
   .checks { display: flex; flex-wrap: wrap; gap: 8px 15px; margin: 10px 0; padding: 9px; border: 1px solid var(--line-soft); border-radius: 6px; background: #06141c; }
   .checks label { display: inline-flex; align-items: center; gap: 6px; color: #8eacb5; font-size: .68rem; }
+  .poll-control { display: inline-flex; align-items: center; gap: 5px; }
+  .poll-control select { width: auto; min-height: 25px; padding: 2px 5px; font-size: .65rem; }
   #copilot-prompt { min-height: 90px; }
   #model-test-prompt { min-height: 84px; }
   .attachment-drop { margin-top: 9px; padding: 12px; border: 1px dashed #2b6370; border-radius: 7px; background: #06141c; text-align: center; color: #83a6b0; transition: .15s ease; }
@@ -9785,6 +11759,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   th, td { padding: 8px 9px; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; font-size: .7rem; }
   th { position: sticky; top: 0; background: #0b222c; color: #7fa5b0; font-size: .62rem; letter-spacing: .08em; text-transform: uppercase; }
   tbody tr:hover { background: #0e2a354f; }
+  tbody tr.selected-row { background: #16404b99; }
   tbody tr:last-child td { border-bottom: 0; }
   pre { min-height: 42px; margin: 6px 0; padding: 10px; border: 1px solid var(--line-soft); border-radius: 6px; background: #041117; color: #b9d7dd; white-space: pre-wrap; overflow-wrap: anywhere; font: .72rem/1.5 "Cascadia Code", Consolas, monospace; }
   details { margin-top: 9px; padding: 9px 11px; border: 1px solid var(--line-soft); border-radius: 6px; background: #071821; }
@@ -9817,6 +11792,10 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   .stats-scroll.expanded { max-height: none; }
   .stats-scroll thead { position: sticky; top: 0; z-index: 2; background: var(--panel-2); }
   .stats-scroll tfoot { position: sticky; bottom: 0; z-index: 2; background: var(--panel-2); }
+  #anti-idle-table { width: max-content; min-width: 100%; }
+  #anti-idle-table th, #anti-idle-table td {
+    height: 38px; vertical-align: middle; white-space: nowrap;
+  }
   @media (max-width: 1050px) { .two-column { grid-template-columns: 1fr; } }
   @media (max-width: 760px) {
     .app-shell { grid-template-columns: 1fr; }
@@ -9848,6 +11827,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <a class="nav-link" href="#server-settings"><span>Server settings</span><b>CFG</b></a>
     <a class="nav-link" href="#backend-config"><span>Backends</span><b id="nav-backend-count">0</b></a>
     <a class="nav-link" href="#codex-suppliers"><span>Codex suppliers</span><b id="nav-supplier-count">0</b></a>
+    <a class="nav-link" href="#anti-idle"><span>Anti-idle prompts</span><b id="nav-anti-idle-count">0</b></a>
     <a class="nav-link" href="#managed"><span>Managed workers</span><b id="nav-managed-count">0</b></a>
     <a class="nav-link" href="#model-configurator"><span>Models configurator</span><b id="nav-config-model-count">0</b></a>
     <a class="nav-link" href="#test-client"><span>Model test client</span><b id="nav-model-count">0</b></a>
@@ -9867,10 +11847,22 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <span class="chip">MODELS <b id="top-model-count">0</b></span>
     <span class="chip">ACTIVE <b id="top-active-count">0</b></span>
     <span class="chip">WAITING <b id="top-waiting-count">0</b></span>
+    <span class="chip">STUCK <b id="top-stuck-count">0</b></span>
     <span class="chip">SERVED <b id="top-served-count">0</b></span>
     <span class="chip">SWITCHES <b id="top-switch-count">0</b></span>
     <span class="chip">UPTIME <b id="top-uptime">0s</b></span>
     <span class="chip"><a href="/emullm/status">STATUS</a></span>
+    <label class="chip poll-control">POLL
+      <select id="poll-window">
+        <option value="0">continuous</option>
+        <option value="60000">1 min</option>
+        <option value="120000" selected>2 min</option>
+        <option value="300000">5 min</option>
+      </select>
+    </label>
+    <label class="chip poll-control"><input id="poll-hidden" type="checkbox"> HIDDEN / 2 MIN</label>
+    <button id="poll-wake" type="button">Wake / refresh</button>
+    <span class="chip" id="poll-status">polling</span>
     <span class="chip" id="updated">-</span>
     <button id="server-restart" type="button">Restart</button>
     <button id="server-shutdown" class="danger" type="button">Shutdown</button>
@@ -9901,8 +11893,6 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   <label>Backend fallback delay (seconds)<input id="server-backend-delay" type="number" min="0" max="300" step="0.5" value="5"></label>
   <label>Validation interval default<input id="server-validation-default" placeholder="never, 1day, 12h"></label>
   <label>Validation override<input id="server-validation-override" placeholder="blank = none"></label>
-  <label>Proxy backend URL<input id="server-proxy-url" placeholder="https://.../v1"></label>
-  <label>Proxy model<input id="server-proxy-model"></label>
 </div>
 <div style="margin-top:10px">
   <button id="server-settings-save" type="button">Save server settings</button>
@@ -9984,6 +11974,57 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 </details>
 </section>
 
+<section class="panel" id="anti-idle">
+<h2>Anti-idle conversation prompts
+  <button id="anti-idle-refresh" type="button">Reload</button>
+  <button id="anti-idle-reset-stats" type="button">Reset stats</button>
+  <span id="anti-idle-note" class="muted"></span></h2>
+<p class="sub">Workers receive these as ordinary short completion turns; the model is not
+  told they are maintenance. The initial 50 may grow. Runtime timing is aggregated
+  across resident workers, and slow prompts may also be retired independently by a worker.</p>
+<div class="form-grid">
+  <label>Frequency (seconds)<input id="anti-idle-interval" type="number" min="0" max="3600" step="1" value="40"></label>
+  <label>Task timeout (seconds, maximum 10)<input id="anti-idle-timeout" type="number" min="0.1" max="10" step="0.1" value="10"></label>
+  <label>Slow budget (seconds)<input id="anti-idle-slow-budget" type="number" min="0.1" max="10" step="0.1" value="8"></label>
+</div>
+<div class="checks"><label><input id="anti-idle-enabled" type="checkbox" checked> scheduler enabled (applies immediately)</label></div>
+<div class="two-column">
+  <div>
+    <div class="table-wrap stats-scroll" style="max-height:430px">
+    <table id="anti-idle-table">
+      <thead><tr>
+        <th><button class="sort-button" data-anti-sort="number">#</button></th>
+        <th><button class="sort-button" data-anti-sort="average_duration_ms">Average</button></th>
+        <th><button class="sort-button" data-anti-sort="min_duration_ms">Shortest / worker</button></th>
+        <th><button class="sort-button" data-anti-sort="max_duration_ms">Longest / worker</button></th>
+        <th><button class="sort-button" data-anti-sort="attempts">Attempts</button></th>
+        <th><button class="sort-button" data-anti-sort="timeouts">Timeouts</button></th>
+        <th><button class="sort-button" data-anti-sort="slow">Over budget</button></th>
+        <th><button class="sort-button" data-anti-sort="retired_workers">Retired by</button></th>
+        <th><button class="sort-button" data-anti-sort="deprecated">Deprecated</button></th>
+        <th><button class="sort-button" data-anti-sort="prompt">Conversation</button></th>
+      </tr></thead>
+      <tbody id="anti-idle-list"><tr><td colspan="10" class="muted">loading...</td></tr></tbody>
+    </table>
+    </div>
+    <div style="margin-top:8px">
+      <button id="anti-idle-add" type="button">Add prompt</button>
+      <button id="anti-idle-save" type="button">Save configuration</button>
+      <span id="anti-idle-msg" class="msg"></span>
+    </div>
+  </div>
+  <div>
+    <label>Stable prompt ID<input id="anti-idle-id" pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" maxlength="100"></label>
+    <label for="anti-idle-text" style="display:block;margin-top:8px">Conversation prompt</label>
+    <textarea id="anti-idle-text" style="min-height:150px" maxlength="1000"></textarea>
+    <div class="checks">
+      <label><input id="anti-idle-deprecated" type="checkbox"> deprecated (scheduler skips it)</label>
+    </div>
+    <div id="anti-idle-stats" class="capability-card"></div>
+  </div>
+</div>
+</section>
+
 <section class="panel" id="connections">
 <h2>Connected WebSockets <button id="refresh-websockets" type="button">List / refresh</button>
   <span id="websocket-note" class="muted"></span></h2>
@@ -10029,6 +12070,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 </h2>
 <p class="sub">Server-lifetime service time starts when a request reaches a worker. Waiting shows
   client requests deliberately held because no worker is connected/ready or before backend fallback.</p>
+<div id="telemetry-alerts" class="capability-card"></div>
 <h3>By service kind</h3>
 <div class="table-wrap"><table>
   <thead><tr><th>Service</th><th>Active</th><th>Attempts</th><th>Served</th><th>Deferred</th><th>Rejected</th><th>Failed</th><th>Total time</th><th>Average</th></tr></thead>
@@ -10139,8 +12181,8 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       <label>Max AI credits<input id="cp-credits" type="number" min="0.01" step="0.01" placeholder="unlimited"></label>
       <label>Request timeout (seconds)<input id="cp-timeout" type="number" min="1" max="86400" value="900"></label>
       <label>Reconnect delay (seconds)<input id="cp-reconnect" type="number" min="0.1" max="300" step="0.1" value="2"></label>
-      <label>Anti-idle interval (seconds; default 40, 0 disables)<input id="cp-keepalive-interval" type="number" min="0" max="3600" step="1" value="40"></label>
-      <label>Anti-idle timeout (≤3 seconds)<input id="cp-keepalive-timeout" type="number" min="0.1" max="3" step="0.1" value="3"></label>
+      <label>Anti-idle interval override<input id="cp-keepalive-interval" type="number" min="0" max="3600" step="1" placeholder="shared setting"></label>
+      <label>Anti-idle timeout override<input id="cp-keepalive-timeout" type="number" min="0.1" max="10" step="0.1" placeholder="shared setting"></label>
       <label>Startup warmup prompt<input id="cp-warmup-prompt" value="Startup warmup: reply only READY."></label>
       <label>Chunk token override<input id="cp-chunk-tokens" type="number" min="1000" max="1000000" placeholder="derive from selected model"></label>
       <label>Maximum chunks<input id="cp-max-chunks" type="number" min="1" max="1000" value="64"></label>
@@ -10157,6 +12199,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       <label><input id="cp-allow-all" type="checkbox" checked> allow all tools, paths, and URLs (unsafe)</label>
       <label><input id="cp-custom-instructions" type="checkbox" checked> load repository instructions</label>
       <label><input id="cp-builtin-mcps" type="checkbox" checked> enable built-in MCPs</label>
+      <label><input id="cp-shared-anti-idle" type="checkbox" checked> inherit shared anti-idle configuration</label>
     </div>
     <button type="submit">Save configuration</button>
     <button id="copilot-new" type="button">Create new servant</button>
@@ -10185,7 +12228,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <h3 id="model-config-title">Select a model</h3>
     <div id="model-config-selection-note" class="sub"></div>
     <div class="checks">
-      <label><input id="model-config-export" type="checkbox" checked> export</label>
+      <label><input id="model-config-export" type="checkbox" checked> Export in /v1/models</label>
       <label><input id="model-config-ondemand" type="checkbox"> on-demand worker</label>
       <label><input id="model-config-simulated" type="checkbox"> simulated</label>
       <label><input id="model-config-image" type="checkbox"> image input</label>
@@ -10316,6 +12359,13 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 // survive being mounted under a sub-path. Both alias trees exist server-side.
 const PAGE_PATH = location.pathname.replace(/\\/+$/, '');
 const ADMIN = PAGE_PATH === '/emullm' ? '/emullm/admin' : (PAGE_PATH || '/emullm/admin');
+const POLL_VISIBLE_MS = 3000;
+const POLL_HIDDEN_MS = 120000;
+const POLL_WINDOW_KEY = 'emullm.poll.window';
+const POLL_HIDDEN_KEY = 'emullm.poll.hidden';
+let pollTimer = null;
+let pollWindowStartedAt = Date.now();
+let pollInFlight = false;
 async function getJSON(u, opts) { const r = await fetch(u, opts); return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) }; }
 function esc(x) { return String(x).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function formatDuration(value) {
@@ -10426,7 +12476,7 @@ let copilotInstances = [];
 let copilotModelCatalog = [];
 let apiModelCatalog = [];
 let modelConfigCatalog = [];
-let modelConfigMeta = { overrides: {}, routes: {}, backends: [], on_demand: { slots: [], limit: 46, max_concurrent_calls: 50 } };
+let modelConfigMeta = { revision: '', overrides: {}, routes: {}, backends: [], on_demand: { slots: [], limit: 46, max_concurrent_calls: 50 } };
 let selectedModelConfigId = '';
 let selectedModelConfigIds = [];
 let latestTelemetryState = {};
@@ -10443,11 +12493,17 @@ let modelTestRequestId = null;
 let modelTestAttachments = [];
 let serverPid = null;
 let currentConfig = {};
+let currentConfigRevision = '';
 let activeConfigSection = 'services';
 let configuredBackends = [];
 let editingBackend = null;
 let codexSuppliers = [];
 let editingSupplier = null;
+let antiIdleConfig = null;
+let antiIdlePrompts = [];
+let antiIdleRevision = '';
+let selectedAntiIdlePromptId = '';
+let antiIdleSort = { key: 'number', direction: 1 };
 const CONFIG_SECTIONS = {
   services: ['Service catalog and per-service fallback policies.', 'object'],
   agents: ['Unified recruit, subagent, mock, and proxy agent definitions.', 'array'],
@@ -10456,6 +12512,7 @@ const CONFIG_SECTIONS = {
   mock_workers: ['Legacy in-process mock worker definitions.', 'array'],
   backends: ['Legacy OpenAI-compatible proxy backend definitions.', 'array'],
   codex_suppliers: ['Codex worker/model supplier definitions.', 'array'],
+  anti_idle: ['Shared anti-idle frequency, deadline, and conversational prompt catalog.', 'object'],
   mock: ['Global mock reply and template used by mock mode.', 'object'],
 };
 
@@ -10534,7 +12591,12 @@ function resetBackendEditor() {
   setBackendMsg('', '');
 }
 function editBackend(record) {
-  editingBackend = { source: record.source, index: record.index };
+  editingBackend = {
+    source: record.source,
+    index: record.index,
+    name: record.name,
+    revision: record.revision,
+  };
   field('backend-editor').open = true;
   field('backend-editor-title').textContent = 'Edit ' + (record.name || record.record_id);
   field('backend-name').value = record.name || '';
@@ -10593,7 +12655,8 @@ field('backend-config-rows').addEventListener('click', async event => {
   if (!confirm('Delete backend ' + (record.name || record.record_id) + '?')) return;
   const deletePath = ADMIN + '/backends/configured/' + encodeURIComponent(source) +
     '/' + index + (record.name
-      ? '?expected_name=' + encodeURIComponent(record.name)
+      ? '?expected_name=' + encodeURIComponent(record.name) +
+        '&expected_revision=' + encodeURIComponent(record.revision)
       : '');
   const response = await getJSON(deletePath, { method: 'DELETE' });
   setBackendMsg(
@@ -10616,10 +12679,8 @@ field('backend-form').addEventListener('submit', async event => {
     clear_api_key: field('backend-clear-api-key').checked,
   };
   if (editingBackend) {
-    const existing = configuredBackends.find(
-      item => item.source === editingBackend.source && item.index === editingBackend.index
-    );
-    if (existing) body.expected_name = existing.name;
+    body.expected_name = editingBackend.name;
+    body.expected_revision = editingBackend.revision;
   }
   if (apiKey) body.api_key = apiKey;
   const path = editingBackend
@@ -10659,7 +12720,7 @@ function resetSupplierEditor() {
   setSupplierMsg('', '');
 }
 function editSupplier(supplier) {
-  editingSupplier = supplier.id;
+  editingSupplier = { id: supplier.id, revision: supplier.revision };
   field('supplier-editor').open = true;
   field('supplier-editor-title').textContent = 'Edit ' + supplier.name;
   field('supplier-id').value = supplier.id;
@@ -10713,7 +12774,8 @@ field('supplier-rows').addEventListener('click', async event => {
   }
   if (!confirm('Delete Codex supplier ' + supplier.name + '?')) return;
   const response = await getJSON(
-    ADMIN + '/codex-suppliers/' + encodeURIComponent(supplier.id),
+    ADMIN + '/codex-suppliers/' + encodeURIComponent(supplier.id) +
+      '?expected_revision=' + encodeURIComponent(supplier.revision),
     { method: 'DELETE' },
   );
   setSupplierMsg(
@@ -10740,7 +12802,8 @@ field('supplier-form').addEventListener('submit', async event => {
   };
   const response = await getJSON(
     editingSupplier
-      ? ADMIN + '/codex-suppliers/' + encodeURIComponent(editingSupplier)
+      ? ADMIN + '/codex-suppliers/' + encodeURIComponent(editingSupplier.id) +
+        '?expected_revision=' + encodeURIComponent(editingSupplier.revision)
       : ADMIN + '/codex-suppliers',
     {
       method: editingSupplier ? 'PUT' : 'POST',
@@ -10764,10 +12827,239 @@ field('supplier-form').addEventListener('submit', async event => {
   }
 });
 
+function antiIdlePrompt() {
+  return antiIdlePrompts.find(prompt => prompt.id === selectedAntiIdlePromptId) || null;
+}
+function antiIdleDuration(value) {
+  return value == null ? '—' : (Number(value) / 1000).toFixed(2) + 's';
+}
+function renderAntiIdleEditor() {
+  const prompt = antiIdlePrompt();
+  field('anti-idle-id').readOnly = true;
+  field('anti-idle-id').value = prompt ? prompt.id : '';
+  field('anti-idle-text').value = prompt ? prompt.prompt : '';
+  field('anti-idle-deprecated').checked = !!(prompt && prompt.deprecated);
+  field('anti-idle-text').disabled = !prompt;
+  field('anti-idle-deprecated').disabled = !prompt;
+  field('anti-idle-stats').innerHTML = prompt
+    ? '<strong>Item #' + prompt.number + '</strong><br>average ' +
+      antiIdleDuration(prompt.average_duration_ms) + ' · shortest ' +
+      antiIdleDuration(prompt.min_duration_ms) + ' by ' +
+      esc(prompt.shortest_worker_id || '—') + ' · longest ' +
+      antiIdleDuration(prompt.max_duration_ms) + ' by ' +
+      esc(prompt.longest_worker_id || '—') + '<br>attempts ' +
+      (prompt.attempts || 0) + ' · completed ' + (prompt.completed || 0) +
+      ' · timeouts ' + (prompt.timeouts || 0) + ' · over budget ' +
+      (prompt.slow || 0) + ' · adaptively retired by ' +
+      (prompt.retired_workers || 0) + ' worker(s)'
+    : '<span class="muted">Select a prompt.</span>';
+}
+function renderAntiIdleList() {
+  antiIdlePrompts.forEach((prompt, index) => { prompt.number = index + 1; });
+  if (!antiIdlePrompts.some(prompt => prompt.id === selectedAntiIdlePromptId)) {
+    selectedAntiIdlePromptId = antiIdlePrompts[0] ? antiIdlePrompts[0].id : '';
+  }
+  const visible = [...antiIdlePrompts].sort((left, right) => {
+    let a = left[antiIdleSort.key];
+    let b = right[antiIdleSort.key];
+    if (antiIdleSort.key === 'prompt') {
+      a = String(a || '').toLowerCase();
+      b = String(b || '').toLowerCase();
+    } else if (antiIdleSort.key === 'deprecated') {
+      a = a ? 1 : 0;
+      b = b ? 1 : 0;
+    } else {
+      a = a == null ? Number.POSITIVE_INFINITY : Number(a);
+      b = b == null ? Number.POSITIVE_INFINITY : Number(b);
+    }
+    return (a < b ? -1 : (a > b ? 1 : 0)) * antiIdleSort.direction;
+  });
+  field('anti-idle-list').innerHTML = visible.length ? visible.map(prompt =>
+    '<tr data-anti-id="' + prompt.id + '" class="' +
+    (prompt.id === selectedAntiIdlePromptId ? 'selected-row' : '') + '">' +
+    '<td>' + prompt.number + '</td><td>' +
+    antiIdleDuration(prompt.average_duration_ms) + '</td><td>' +
+    antiIdleDuration(prompt.min_duration_ms) + ' · <code>' +
+    esc(prompt.shortest_worker_id || '—') + '</code></td><td>' +
+    antiIdleDuration(prompt.max_duration_ms) + ' · <code>' +
+    esc(prompt.longest_worker_id || '—') + '</code></td><td>' +
+    (prompt.attempts || 0) + '</td><td>' + (prompt.timeouts || 0) +
+    '</td><td>' + (prompt.slow || 0) + '</td><td>' +
+    (prompt.retired_workers || 0) + '</td><td><input type="checkbox" ' +
+    'data-anti-deprecated="' + prompt.id + '"' +
+    (prompt.deprecated ? ' checked' : '') + '></td><td>' +
+    esc(prompt.prompt) + '</td></tr>'
+  ).join('') : '<tr><td colspan="10" class="muted">no prompts</td></tr>';
+  field('nav-anti-idle-count').textContent = antiIdlePrompts.length;
+  renderAntiIdleEditor();
+}
+async function refreshAntiIdle() {
+  const response = await getJSON(ADMIN + '/anti-idle', { cache: 'no-store' });
+  if (!response.ok) {
+    field('anti-idle-note').textContent = 'load failed';
+    return;
+  }
+  antiIdleConfig = response.body.config;
+  antiIdlePrompts = response.body.prompts || [];
+  antiIdleRevision = response.body.revision || '';
+  field('anti-idle-enabled').checked = antiIdleConfig.enabled !== false;
+  field('anti-idle-interval').value = antiIdleConfig.interval_seconds ?? 60;
+  field('anti-idle-timeout').value = antiIdleConfig.timeout_seconds ?? 10;
+  field('anti-idle-slow-budget').value = antiIdleConfig.slow_budget_seconds ?? 8;
+  field('anti-idle-note').textContent = antiIdlePrompts.length + ' prompt(s) · ' +
+    (response.body.worker_count || 0) + ' worker status file(s)';
+  renderAntiIdleList();
+}
+field('anti-idle-refresh').addEventListener('click', refreshAntiIdle);
+field('anti-idle-enabled').addEventListener('change', async event => {
+  const checkbox = event.target;
+  const enabled = checkbox.checked;
+  checkbox.disabled = true;
+  field('anti-idle-msg').textContent = enabled ? 'enabling immediately...' : 'disabling immediately...';
+  const response = await getJSON(ADMIN + '/anti-idle/enabled', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      enabled,
+      expected_revision: antiIdleRevision,
+    }),
+  });
+  checkbox.disabled = false;
+  if (!response.ok) {
+    checkbox.checked = !enabled;
+    field('anti-idle-msg').textContent = JSON.stringify(response.body.detail || response.status);
+    field('anti-idle-msg').className = 'msg err';
+    return;
+  }
+  antiIdleRevision = response.body.revision;
+  antiIdleConfig.enabled = enabled;
+  field('anti-idle-msg').textContent =
+    (enabled ? 'enabled' : 'disabled') + ' immediately on ' +
+    response.body.updated_workers + ' connected worker(s)' +
+    (response.body.failed_workers ? ' · ' + response.body.failed_workers + ' failed' : '');
+  field('anti-idle-msg').className =
+    'msg ' + (response.body.failed_workers ? 'err' : 'ok');
+});
+field('anti-idle-table').addEventListener('click', event => {
+  const sort = event.target.closest('button[data-anti-sort]');
+  if (sort) {
+    const key = sort.dataset.antiSort;
+    antiIdleSort = {
+      key,
+      direction: antiIdleSort.key === key ? -antiIdleSort.direction : 1,
+    };
+    renderAntiIdleList();
+    return;
+  }
+  if (event.target.matches('input[data-anti-deprecated]')) return;
+  const row = event.target.closest('tr[data-anti-id]');
+  if (!row) return;
+  selectedAntiIdlePromptId = row.dataset.antiId;
+  renderAntiIdleEditor();
+  renderAntiIdleList();
+});
+field('anti-idle-list').addEventListener('change', event => {
+  const checkbox = event.target.closest('input[data-anti-deprecated]');
+  if (!checkbox) return;
+  const prompt = antiIdlePrompts.find(item => item.id === checkbox.dataset.antiDeprecated);
+  if (!prompt) return;
+  prompt.deprecated = checkbox.checked;
+  selectedAntiIdlePromptId = prompt.id;
+  renderAntiIdleList();
+});
+field('anti-idle-text').addEventListener('input', event => {
+  const prompt = antiIdlePrompt();
+  if (!prompt) return;
+  prompt.prompt = event.target.value;
+});
+field('anti-idle-text').addEventListener('blur', renderAntiIdleList);
+field('anti-idle-deprecated').addEventListener('change', event => {
+  const prompt = antiIdlePrompt();
+  if (!prompt) return;
+  prompt.deprecated = event.target.checked;
+  renderAntiIdleList();
+});
+field('anti-idle-add').addEventListener('click', () => {
+  let number = antiIdlePrompts.length + 1;
+  let id = 'conversation-' + String(number).padStart(2, '0');
+  const used = new Set(antiIdlePrompts.map(prompt => prompt.id));
+  while (used.has(id)) {
+    number += 1;
+    id = 'conversation-' + String(number).padStart(2, '0');
+  }
+  antiIdlePrompts.push({
+    id,
+    prompt: 'Ask the worker an interesting short question.',
+    deprecated: false,
+    number: antiIdlePrompts.length + 1,
+    attempts: 0,
+    completed: 0,
+    slow: 0,
+    timeouts: 0,
+    total_duration_ms: 0,
+    average_duration_ms: 0,
+    min_duration_ms: null,
+    max_duration_ms: 0,
+    shortest_worker_id: null,
+    longest_worker_id: null,
+    retired_workers: 0,
+  });
+  selectedAntiIdlePromptId = id;
+  renderAntiIdleList();
+  field('anti-idle-text').focus();
+});
+field('anti-idle-save').addEventListener('click', async () => {
+  const prompts = antiIdlePrompts.map(prompt => ({
+    id: prompt.id,
+    prompt: prompt.prompt.trim(),
+    deprecated: !!prompt.deprecated,
+  }));
+  const response = await getJSON(ADMIN + '/anti-idle', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      expected_revision: antiIdleRevision,
+      config: {
+        enabled: field('anti-idle-enabled').checked,
+        interval_seconds: Number(field('anti-idle-interval').value),
+        timeout_seconds: Number(field('anti-idle-timeout').value),
+        slow_budget_seconds: Number(field('anti-idle-slow-budget').value),
+        prompts,
+      },
+    }),
+  });
+  field('anti-idle-msg').textContent = response.ok
+    ? 'saved; restart workers to apply'
+    : JSON.stringify(response.body.detail || response.status);
+  field('anti-idle-msg').className = 'msg ' + (response.ok ? 'ok' : 'err');
+  if (response.ok) {
+    antiIdleRevision = response.body.revision;
+    await Promise.all([refreshAntiIdle(), loadConfig()]);
+  }
+});
+field('anti-idle-reset-stats').addEventListener('click', async () => {
+  if (!confirm('Reset anti-idle timing and adaptive retirement for every worker?')) return;
+  const button = field('anti-idle-reset-stats');
+  button.disabled = true;
+  const response = await getJSON(ADMIN + '/anti-idle/reset-stats', {
+    method: 'POST',
+  });
+  field('anti-idle-msg').textContent = response.ok
+    ? ('reset ' + (response.body.reset || 0) + ' worker(s)')
+    : JSON.stringify(response.body.detail || response.status);
+  field('anti-idle-msg').className = 'msg ' + (response.ok ? 'ok' : 'err');
+  button.disabled = false;
+  if (response.ok) await refreshAntiIdle();
+});
+
 async function refreshWebsockets() {
   const r = await getJSON(ADMIN + '/websockets', { cache: 'no-store' });
   const connections = (r.body && r.body.connections) || [];
-  field('websocket-note').textContent = connections.length + ' active';
+  const logs = (r.body && r.body.logs) || {};
+  field('websocket-note').textContent = connections.length + ' active' +
+    (logs.directory
+      ? (' · logs ' + logs.directory + ' · first 2 MiB + newest 4 MiB per worker')
+      : '');
   field('nav-socket-count').textContent = connections.length;
   field('top-socket-count').textContent = connections.length;
   const tbody = field('websocket-connections');
@@ -10781,7 +13073,12 @@ async function refreshWebsockets() {
     return '<tr><td><code>' + esc(connection.connection_id) + '</code></td>' +
       '<td><b>' + esc(connection.kind) + '</b><br><code>' + esc(connection.endpoint) + '</code></td>' +
       '<td>' + esc(identity) + '</td><td>' + esc(connection.client || '--') + '</td>' +
-      '<td>in ' + (connection.messages_in || 0) + ' / out ' + (connection.messages_out || 0) + '</td>' +
+      '<td>in ' + (connection.messages_in || 0) + ' / out ' + (connection.messages_out || 0) +
+      (connection.log_url
+        ? ('<br><a href="' + esc(connection.log_url) + '/view" target="_blank">Viewer</a>' +
+          ' · <a href="' + esc(connection.log_url) + '" target="_blank">Raw JSONL</a> · ' +
+          formatBytes(connection.log_bytes || 0) + ' / 6 MiB')
+        : '') + '</td>' +
       '<td>' + formatDuration(connection.connected_seconds) + '</td><td>' +
       formatActivityTime(
         connection.last_satisfied_at,
@@ -10871,6 +13168,11 @@ function field(id) { return document.getElementById(id); }
 function setCopilotMsg(text, cls) {
   const node = field('copilot-msg'); node.textContent = text; node.className = 'msg ' + cls;
 }
+function syncCopilotAntiIdleOverride() {
+  const inherited = field('cp-shared-anti-idle').checked;
+  field('cp-keepalive-interval').disabled = inherited;
+  field('cp-keepalive-timeout').disabled = inherited;
+}
 function resetCopilotForm() {
   editingCopilot = null;
   field('copilot-editor-title').textContent = 'Add headless Copilot servant';
@@ -10891,8 +13193,8 @@ function resetCopilotForm() {
   field('cp-credits').value = '';
   field('cp-timeout').value = '900';
   field('cp-reconnect').value = '2';
-  field('cp-keepalive-interval').value = '40';
-  field('cp-keepalive-timeout').value = '3';
+  field('cp-keepalive-interval').value = '';
+  field('cp-keepalive-timeout').value = '';
   field('cp-warmup-prompt').value = 'Startup warmup: reply only READY.';
   field('cp-chunk-tokens').value = '';
   field('cp-max-chunks').value = '64';
@@ -10905,6 +13207,8 @@ function resetCopilotForm() {
   field('cp-allow-all').checked = true;
   field('cp-custom-instructions').checked = true;
   field('cp-builtin-mcps').checked = true;
+  field('cp-shared-anti-idle').checked = true;
+  syncCopilotAntiIdleOverride();
   updateReasoningOptions();
   renderCopilotCapabilities();
   setCopilotMsg('', '');
@@ -10930,8 +13234,8 @@ function editCopilot(config) {
   field('cp-credits').value = config.max_ai_credits ?? '';
   field('cp-timeout').value = config.timeout_seconds ?? 900;
   field('cp-reconnect').value = config.reconnect_seconds ?? 2;
-  field('cp-keepalive-interval').value = config.keepalive_interval_seconds ?? 40;
-  field('cp-keepalive-timeout').value = config.keepalive_timeout_seconds ?? 3;
+  field('cp-keepalive-interval').value = config.keepalive_interval_seconds ?? '';
+  field('cp-keepalive-timeout').value = config.keepalive_timeout_seconds ?? '';
   field('cp-warmup-prompt').value = config.warmup_prompt || 'Startup warmup: reply only READY.';
   field('cp-chunk-tokens').value = config.chunk_tokens ?? '';
   field('cp-max-chunks').value = config.max_chunks ?? 64;
@@ -10944,6 +13248,8 @@ function editCopilot(config) {
   field('cp-allow-all').checked = !!config.allow_all;
   field('cp-custom-instructions').checked = !!config.load_custom_instructions;
   field('cp-builtin-mcps').checked = !!config.enable_builtin_mcps;
+  field('cp-shared-anti-idle').checked = config.use_shared_anti_idle !== false;
+  syncCopilotAntiIdleOverride();
   updateReasoningOptions(config.reasoning_effort || '');
   renderCopilotCapabilities();
   setCopilotMsg('', '');
@@ -10964,12 +13270,11 @@ function copilotConfigFromForm() {
     max_chunks: Number(field('cp-max-chunks').value),
     timeout_seconds: Number(field('cp-timeout').value),
     reconnect_seconds: Number(field('cp-reconnect').value),
-    keepalive_interval_seconds: Number(field('cp-keepalive-interval').value),
-    keepalive_timeout_seconds: Number(field('cp-keepalive-timeout').value),
     context: field('cp-context').value,
     allow_all: field('cp-allow-all').checked,
     load_custom_instructions: field('cp-custom-instructions').checked,
     enable_builtin_mcps: field('cp-builtin-mcps').checked,
+    use_shared_anti_idle: field('cp-shared-anti-idle').checked,
     max_prompt_chars: Number(field('cp-max-prompt').value),
     max_output_chars: Number(field('cp-max-output').value),
     max_attachment_bytes: Number(field('cp-max-attachment').value),
@@ -10985,6 +13290,14 @@ function copilotConfigFromForm() {
   if (credits !== '') config.max_ai_credits = Number(credits);
   const chunkTokens = field('cp-chunk-tokens').value;
   if (chunkTokens !== '') config.chunk_tokens = Number(chunkTokens);
+  const keepaliveInterval = field('cp-keepalive-interval').value;
+  if (!config.use_shared_anti_idle && keepaliveInterval !== '') {
+    config.keepalive_interval_seconds = Number(keepaliveInterval);
+  }
+  const keepaliveTimeout = field('cp-keepalive-timeout').value;
+  if (!config.use_shared_anti_idle && keepaliveTimeout !== '') {
+    config.keepalive_timeout_seconds = Number(keepaliveTimeout);
+  }
   return config;
 }
 async function refreshCopilots() {
@@ -11063,6 +13376,10 @@ async function refreshCopilotModels(force) {
   renderApiModelCapabilities();
 }
 field('refresh-copilots').addEventListener('click', refreshCopilots);
+field('cp-shared-anti-idle').addEventListener(
+  'change',
+  syncCopilotAntiIdleOverride,
+);
 field('refresh-copilot-models').addEventListener('click', () => refreshCopilotModels(true));
 async function runBulkCopilotAction(action, prompt) {
   if (prompt && !confirm(prompt)) return;
@@ -11209,7 +13526,7 @@ field('config-section-save').addEventListener('click', async () => {
   const r = await getJSON(ADMIN + '/config/section/' + activeConfigSection, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ value }),
+    body: JSON.stringify({ value, expected_revision: currentConfigRevision }),
   });
   const detail = r.body && r.body.detail;
   field('config-section-msg').textContent = r.ok ? 'saved; restart required' :
@@ -11217,6 +13534,7 @@ field('config-section-save').addEventListener('click', async () => {
   field('config-section-msg').className = 'msg ' + (r.ok ? 'ok' : 'err');
   if (r.ok) {
     currentConfig = r.body.config;
+    currentConfigRevision = r.body.revision;
     field('config').value = JSON.stringify(currentConfig, null, 2);
     renderConfigSection();
   }
@@ -11226,12 +13544,13 @@ field('config-section-delete').addEventListener('click', async () => {
   const r = await getJSON(ADMIN + '/config/section/' + activeConfigSection, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ delete: true }),
+    body: JSON.stringify({ delete: true, expected_revision: currentConfigRevision }),
   });
   field('config-section-msg').textContent = r.ok ? 'deleted; restart required' : ('delete failed (' + r.status + ')');
   field('config-section-msg').className = 'msg ' + (r.ok ? 'ok' : 'err');
   if (r.ok) {
     currentConfig = r.body.config;
+    currentConfigRevision = r.body.revision;
     field('config').value = JSON.stringify(currentConfig, null, 2);
     renderConfigSection();
   }
@@ -11509,8 +13828,9 @@ function renderModelConfigList() {
   const models = modelConfigCatalog.filter(model =>
     !search || JSON.stringify(model).toLowerCase().includes(search));
   field('model-config-list').innerHTML = models.map(model => {
-    const hidden = ((modelConfigMeta.overrides || {})[model.id] || {}).hidden === true;
-    return '<option value="' + esc(model.id) + '">' + (hidden ? '[hidden] ' : '') +
+    const hidden = model.hidden === true ||
+      ((modelConfigMeta.overrides || {})[model.id] || {}).hidden === true;
+    return '<option value="' + esc(model.id) + '">' + (hidden ? '[unexported] ' : '') +
       esc(model.id) + '</option>';
   }).join('');
   const visibleIds = new Set(models.map(model => model.id));
@@ -11562,7 +13882,7 @@ function renderSelectedModelConfig() {
 }
 async function refreshModelConfigurator() {
   const [catalog, metadata] = await Promise.all([
-    getJSON('/v1/models', { cache: 'no-store' }),
+    getJSON('/v1/models?hidden=true', { cache: 'no-store' }),
     getJSON(ADMIN + '/model-config', { cache: 'no-store' }),
   ]);
   modelConfigMeta = metadata.body || modelConfigMeta;
@@ -11587,8 +13907,9 @@ async function saveSelectedModelConfig(reset = false) {
   field('model-config-msg').textContent = reset ? 'resetting...' : 'saving...';
   field('model-config-msg').className = 'msg';
   const responses = [];
+  let revision = modelConfigMeta.revision;
   for (const modelId of selectedModelConfigIds) {
-    responses.push(await getJSON(ADMIN + '/model-config', {
+    const response = await getJSON(ADMIN + '/model-config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -11598,8 +13919,12 @@ async function saveSelectedModelConfig(reset = false) {
         set_route: !reset,
         route: route.length ? route : null,
         reset,
+        expected_revision: revision,
       }),
-    }));
+    });
+    responses.push(response);
+    if (!response.ok) break;
+    revision = response.body.revision;
   }
   const failed = responses.find(response => !response.ok);
   field('model-config-msg').textContent = failed
@@ -11866,6 +14191,7 @@ async function loadConfig() {
   document.getElementById('cfg-path').textContent = r.body.path || '';
   const config = r.body.config || {};
   currentConfig = config;
+  currentConfigRevision = r.body.revision || '';
   document.getElementById('config').value = JSON.stringify(config, null, 2);
   field('server-description').value = config.description || '';
   field('server-mode').value = Array.isArray(config.mode) ? config.mode.join(',') : (config.mode || '');
@@ -11877,9 +14203,6 @@ async function loadConfig() {
   field('server-backend-delay').value = config.backend_fallback_delay_seconds ?? 5;
   field('server-validation-default').value = config.validation_interval_default ?? config.validation_interval ?? '';
   field('server-validation-override').value = config.validation_interval_override ?? '';
-  const proxy = (config.agents || []).find(agent => agent && agent.launch === 'proxy') || {};
-  field('server-proxy-url').value = proxy.base_url || '';
-  field('server-proxy-model').value = proxy.model || '';
   renderConfigSection();
   setMsg('', '');
 }
@@ -11887,47 +14210,42 @@ function setMsg(text, cls) { const m = document.getElementById('cfg-msg'); m.tex
 document.getElementById('reload').addEventListener('click', loadConfig);
 field('server-settings-reload').addEventListener('click', loadConfig);
 field('server-settings-save').addEventListener('click', async () => {
-  let config;
-  try { config = JSON.parse(field('config').value || '{}'); }
-  catch (error) {
-    field('server-settings-msg').textContent = 'invalid raw config JSON: ' + error.message;
-    field('server-settings-msg').className = 'msg err';
-    return;
-  }
-  const setOptional = (key, value) => {
-    const trimmed = String(value).trim();
-    if (trimmed) config[key] = trimmed; else delete config[key];
+  const settings = {
+    description: field('server-description').value.trim() || null,
+    mode: field('server-mode').value.trim() || null,
+    capability_fallback: field('server-capability-fallback').value,
+    subagent_model: field('server-subagent-model').value.trim() || null,
+    max_concurrent_calls: Number(field('server-max-concurrent').value) || 50,
+    idle_worker_target: Number(field('server-idle-workers').value) || 0,
+    idle_grace_seconds: Number(field('server-idle-grace').value) || 0,
+    backend_fallback_delay_seconds: Number(field('server-backend-delay').value) || 0,
+    validation_interval_default: field('server-validation-default').value.trim() || null,
+    validation_interval_override: field('server-validation-override').value.trim() || null,
+    expected_revision: currentConfigRevision,
   };
-  setOptional('description', field('server-description').value);
-  setOptional('mode', field('server-mode').value);
-  config.capability_fallback = field('server-capability-fallback').value;
-  setOptional('subagent_model', field('server-subagent-model').value);
-  config.max_concurrent_calls = Number(field('server-max-concurrent').value) || 50;
-  config.idle_worker_target = Number(field('server-idle-workers').value) || 0;
-  config.idle_grace_seconds = Number(field('server-idle-grace').value) || 0;
-  config.backend_fallback_delay_seconds = Number(field('server-backend-delay').value) || 0;
-  setOptional('validation_interval_default', field('server-validation-default').value);
-  setOptional('validation_interval_override', field('server-validation-override').value);
-  const proxy = (config.agents || []).find(agent => agent && agent.launch === 'proxy');
-  if (proxy) {
-    proxy.base_url = field('server-proxy-url').value.trim();
-    proxy.model = field('server-proxy-model').value.trim() || null;
-  }
-  const r = await getJSON(ADMIN + '/config', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ config }),
+  const r = await getJSON(ADMIN + '/config/server-settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
   });
   field('server-settings-msg').textContent = r.ok ? 'saved; restart to apply startup settings' : ('save failed (' + r.status + ')');
   field('server-settings-msg').className = 'msg ' + (r.ok ? 'ok' : 'err');
-  if (r.ok) await loadConfig();
+  if (r.ok) {
+    currentConfigRevision = r.body.revision;
+    await loadConfig();
+  }
 });
 document.getElementById('save').addEventListener('click', async () => {
   let parsed;
   try { parsed = JSON.parse(document.getElementById('config').value); }
   catch (err) { setMsg('invalid JSON: ' + err.message, 'err'); return; }
   const r = await getJSON(ADMIN + '/config', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ config: parsed }),
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: parsed, expected_revision: currentConfigRevision }),
   });
   setMsg(r.ok ? 'saved' : ('save failed (' + r.status + ')'), r.ok ? 'ok' : 'err');
+  if (r.ok) await loadConfig();
 });
 
 function telemetryTotals(services) {
@@ -11969,9 +14287,13 @@ function renderTelemetry(state) {
   const team = state.team_service_stats || { totals: {}, services: {}, models: {} };
   const totals = team.totals || {};
   const waiting = state.waiting_for_worker || [];
+  const capacityWaiting = concurrency.client_capacity_waiting || 0;
+  const stuckWorkers = state.stuck_workers || [];
+  const connectionErrors = state.connection_errors || [];
   field('top-active-count').textContent = concurrency.active_calls || 0;
-  field('top-waiting-count').textContent = concurrency.waiting_for_worker || 0;
-  field('nav-waiting-count').textContent = concurrency.waiting_for_worker || 0;
+  field('top-waiting-count').textContent = (concurrency.waiting_for_worker || 0) + capacityWaiting;
+  field('nav-waiting-count').textContent = (concurrency.waiting_for_worker || 0) + capacityWaiting;
+  field('top-stuck-count').textContent = stuckWorkers.length;
   field('top-served-count').textContent = totals.served || 0;
   field('top-switch-count').textContent = state.team_model_switches || 0;
   field('telemetry-summary').textContent =
@@ -11982,7 +14304,19 @@ function renderTelemetry(state) {
     (concurrency.idle_maintenance_paused ? ' · idle maintenance paused' : '') +
     ' · ' + (concurrency.waiting_for_worker || 0) + ' waiting · backend delay ' +
     (concurrency.backend_fallback_delay_seconds ?? 5) + 's · ' +
+    'client max ' + (concurrency.client_worker_limit || 1) + ' · reserve ' +
+    (concurrency.client_worker_reserve || 0) + ' · ' + capacityWaiting + ' capacity waiting · ' +
     (state.team_model_switches || 0) + ' model switches';
+  field('telemetry-alerts').innerHTML =
+    '<b>Stuck workers</b> ' + (stuckWorkers.length
+      ? stuckWorkers.map(item => '<code>' + esc(item.worker_id) + '</code> ' +
+          esc(item.service_kind) + ' · ' + telemetrySeconds(item.age_seconds) +
+          ' · ' + esc(item.model)).join('<br>')
+      : '<span class="ok">none</span>') +
+    '<br><b>Connection errors</b> ' + (connectionErrors.length
+      ? connectionErrors.map(item => '<code>' + esc(item.worker_id) + '</code> ' +
+          item.connection_errors + ' · ' + esc(item.last_connection_error || 'disconnected')).join('<br>')
+      : '<span class="ok">none</span>');
   const services = Object.entries(team.services || {});
   field('telemetry-services').innerHTML = services.length ? services.map(([kind, stats]) =>
     '<tr><td><code>' + esc(kind) + '</code></td><td>' + (stats.active || 0) +
@@ -12152,6 +14486,56 @@ async function tick() {
     document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
   } catch (e) { document.getElementById('updated').textContent = 'error'; }
 }
+function storedPollValue(key, fallback) {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+}
+function savePollValue(key, value) {
+  try { localStorage.setItem(key, value); } catch {}
+}
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  const hiddenPolling = field('poll-hidden').checked;
+  if (document.hidden && !hiddenPolling) {
+    field('poll-status').textContent = 'PAUSED / HIDDEN';
+    return;
+  }
+  const windowMs = Number(field('poll-window').value);
+  if (!document.hidden && windowMs > 0 && Date.now() - pollWindowStartedAt >= windowMs) {
+    field('poll-status').textContent = 'PAUSED / WAKE';
+    return;
+  }
+  const delay = document.hidden ? POLL_HIDDEN_MS : POLL_VISIBLE_MS;
+  field('poll-status').textContent = document.hidden ? 'HIDDEN / 2 MIN' : 'LIVE / 3 SEC';
+  pollTimer = setTimeout(runPoll, delay);
+}
+async function runPoll(wake = false) {
+  if (wake) pollWindowStartedAt = Date.now();
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try { await tick(); } finally {
+    pollInFlight = false;
+    schedulePoll();
+  }
+}
+const pollWindow = field('poll-window');
+const savedPollWindow = storedPollValue(POLL_WINDOW_KEY, '120000');
+pollWindow.value = Array.from(pollWindow.options).some(option => option.value === savedPollWindow)
+  ? savedPollWindow : '120000';
+const pollHidden = field('poll-hidden');
+pollHidden.checked = storedPollValue(POLL_HIDDEN_KEY, 'false') === 'true';
+pollWindow.addEventListener('change', () => {
+  savePollValue(POLL_WINDOW_KEY, pollWindow.value);
+  runPoll(true);
+});
+pollHidden.addEventListener('change', () => {
+  savePollValue(POLL_HIDDEN_KEY, String(pollHidden.checked));
+  runPoll(true);
+});
+field('poll-wake').addEventListener('click', () => runPoll(true));
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) schedulePoll();
+  else runPoll(true);
+});
 loadConfig();
 resetCopilotForm();
 renderModelTestAttachments();
@@ -12161,8 +14545,8 @@ refreshApiModels();
 refreshModelConfigurator();
 refreshBackendConfigs();
 refreshCodexSuppliers();
-tick();
-setInterval(tick, 3000);
+refreshAntiIdle();
+runPoll(true);
 </script>
 </body>
 </html>"""
@@ -12339,17 +14723,39 @@ async def _serve_worker_socket(
         modelmasks=list(model_masks) if model_masks is not None else None,
     )
     _ensure_worker_mailbox(worker_id)
+    duplicate = False
     async with _worker_lock:
-        _connected_workers[worker_id] = websocket
-        _native_worker_ids.add(worker_id)
-        _worker_connection_ids[worker_id] = connection_id
-        _set_worker_model_masks(worker_id, model_masks)
-    _record_worker_connection(worker_id, model_masks)
+        duplicate = worker_id in _connected_workers
+        if not duplicate:
+            _connected_workers[worker_id] = websocket
+            _native_worker_ids.add(worker_id)
+            _worker_connection_ids[worker_id] = connection_id
+            _set_worker_model_masks(worker_id, model_masks)
+    if not duplicate:
+        _record_worker_connection(worker_id, model_masks)
+        _track_worker_socket_frame(
+            connection_id,
+            "lifecycle",
+            {"type": "connected", "modelmasks": list(model_masks or [])},
+        )
     try:
         hello: dict[str, Any] = {"type": "hello", "worker_id": worker_id}
         if model_masks is not None:
             hello["modelmasks"] = list(model_masks)
         await _tracked_ws_send_json(websocket, connection_id, hello)
+        if duplicate:
+            reason = f"duplicate worker_id '{worker_id}' is already connected"
+            await _tracked_ws_send_json(
+                websocket,
+                connection_id,
+                {"type": "shutdown", "reason": reason},
+            )
+            _track_worker_socket_frame(
+                connection_id,
+                "lifecycle",
+                {"type": "duplicate-rejected", "reason": reason},
+            )
+            return
         while True:
             data = await _tracked_ws_receive_json(websocket, connection_id)
             if isinstance(data, dict) and data.get("type") == "register":
@@ -12377,6 +14783,11 @@ async def _serve_worker_socket(
                 _worker_connection_ids.pop(worker_id, None)
                 _worker_model_masks.pop(worker_id, None)
                 disconnected = True
+        _track_worker_socket_frame(
+            connection_id,
+            "lifecycle",
+            {"type": "disconnected"},
+        )
         _remove_active_websocket(connection_id)
         if disconnected:
             _record_worker_disconnection(worker_id)
@@ -12404,12 +14815,30 @@ async def _handle_worker_message(
 ) -> None:
     active_connection_id = connection_id or _worker_connection_ids.get(worker_id)
     if data.get("type") == "keepalive_reply":
+        _update_active_websocket(
+            active_connection_id or "",
+            last_keepalive_duration_ms=data.get("duration_ms"),
+            last_keepalive_succeeded=True,
+        )
         _mark_active_websocket_satisfied(
             active_connection_id,
             kind="keepalive",
         )
         return
-    if data.get("type") in ("model_changed", "model_change_error"):
+    if data.get("type") == "keepalive_error":
+        _update_active_websocket(
+            active_connection_id or "",
+            last_keepalive_duration_ms=data.get("duration_ms"),
+            last_keepalive_succeeded=False,
+            last_keepalive_error=data.get("reason"),
+        )
+        return
+    if data.get("type") in (
+        "model_changed",
+        "model_change_error",
+        "keepalive_stats_reset",
+        "anti_idle_changed",
+    ):
         control_id = str(data.get("id") or "")
         future = _pending_worker_controls.get(control_id)
         if future is not None and not future.done():
@@ -12418,7 +14847,6 @@ async def _handle_worker_message(
     if data.get("type") == "accept":
         request_id = str(data.get("id") or "")
         if request_id and request_id in _pending:
-            _worker_not_ready_until.pop(worker_id, None)
             _record_relay_accept(worker_id, request_id, _pending_models.get(request_id))
         return
     if data.get("type") in ("not_ready", "retry_later", "defer"):
@@ -12435,7 +14863,6 @@ async def _handle_worker_message(
         retry_after = min(3600.0, max(0.1, retry_after))
         future = _pending.get(request_id)
         if future and not future.done():
-            _worker_not_ready_until[worker_id] = time.monotonic() + retry_after
             _record_relay_not_ready(
                 worker_id,
                 request_id,
@@ -12457,7 +14884,6 @@ async def _handle_worker_message(
         return
     if data.get("type") == "reply":
         request_id = str(data.get("id") or "")
-        _worker_not_ready_until.pop(worker_id, None)
         # A two-way worker may return real media alongside (or instead of)
         # text: image_b64 / image_url / mime. Keep the reply structured so
         # image-gen and vision can hand back actual bytes.
@@ -12476,4 +14902,7 @@ async def _handle_worker_message(
             )
 
 
-router.include_router(_copilot_api.router)
+router.include_router(
+    _copilot_api.router,
+    dependencies=[Depends(_require_local_process_control)],
+)

@@ -45,9 +45,13 @@ def test_manifest_uses_native_service_catalog() -> None:
     assert endpoints["imageEdits"]["path"] == "/v1/images/edits"
     assert endpoints["agents"]["path"] == "/emullm/admin/agents"
     assert endpoints["websocketInventory"]["path"] == "/emullm/admin/websockets"
+    assert endpoints["workerSocketLog"]["path"].endswith("/{worker_id}/log")
+    assert endpoints["workerSocketLogViewer"]["path"].endswith("/{worker_id}/log/view")
+    assert endpoints["workerSocketMedia"]["path"].endswith("/{worker_id}/media/{filename}")
     assert endpoints["fastapiRequestInventory"]["path"] == "/emullm/admin/clients"
     assert endpoints["backendConfigurator"]["path"] == "/emullm/admin/backends/configured"
     assert endpoints["codexSuppliers"]["path"] == "/emullm/admin/codex-suppliers"
+    assert endpoints["antiIdlePrompts"]["path"] == "/emullm/admin/anti-idle"
     assert endpoints["modelTestClient"]["path"] == "/emullm/admin/test-chat"
     assert endpoints["configSections"]["path"] == "/emullm/admin/config/section/{section}"
     assert endpoints["restart"]["path"] == "/emullm/admin/restart"
@@ -58,6 +62,12 @@ def test_manifest_uses_native_service_catalog() -> None:
         "protocol": "http",
         "format": "json",
     }
+    assert 'default="127.0.0.1"' in (
+        Path(__file__).parents[1] / "run.py"
+    ).read_text(encoding="utf-8")
+    assert "standalone.main([args.host, str(args.port)])" in (
+        Path(__file__).parents[1] / "run.py"
+    ).read_text(encoding="utf-8")
     modes = manifest["runtimeModes"]
     assert modes["default"] == modes["current"] == "standalone"
     assert {mode["id"] for mode in modes["available"]} == {"standalone", "embedded"}

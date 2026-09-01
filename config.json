@@ -1,13 +1,271 @@
 {
  "description": "emullm dev config -- exercises every schema key and autostarts the configured headless Copilot servants.",
  "mode": "recruit,mock",
- "max_concurrent_calls": 50,
- "idle_worker_target": 10,
+ "max_concurrent_calls": 21,
+ "idle_worker_target": 21,
  "idle_grace_seconds": 120,
- "backend_fallback_delay_seconds": 5,
+ "backend_fallback_delay_seconds": 20,
  "validation_interval_default": "never",
  "validation_interval": null,
  "subagent_launch": "copilot",
+ "anti_idle": {
+  "enabled": false,
+  "interval_seconds": 60.0,
+  "timeout_seconds": 10.0,
+  "slow_budget_seconds": 8.0,
+  "prompts": [
+   {
+    "id": "conversation-01",
+    "prompt": "How has your persistent session been since startup?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-02",
+    "prompt": "How many client requests do you remember servicing this session?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-03",
+    "prompt": "Which broad request type did you handle most recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-04",
+    "prompt": "Which request type seems most common so far?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-05",
+    "prompt": "Have you served a plain text chat recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-06",
+    "prompt": "Have you handled a code request recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-07",
+    "prompt": "Have you handled a summary request recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-08",
+    "prompt": "Have you inspected an image recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-09",
+    "prompt": "Have you processed audio recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-10",
+    "prompt": "Have you handled a file attachment recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-11",
+    "prompt": "Have you generated an image recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-12",
+    "prompt": "Have you edited an image recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-13",
+    "prompt": "How many distinct client conversations do you remember?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-14",
+    "prompt": "Do you remember the last requested model family?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-15",
+    "prompt": "Was your most recent client task short or long?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-16",
+    "prompt": "Did your latest client task require tools?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-17",
+    "prompt": "Have any client tasks been cancelled recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-18",
+    "prompt": "Have you declined any unsupported request recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-19",
+    "prompt": "Have you recovered from a transient not-ready event?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-20",
+    "prompt": "Is your current context easy to follow?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-21",
+    "prompt": "Are you ready for another WebSocket request?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-22",
+    "prompt": "Is the persistent session feeling responsive?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-23",
+    "prompt": "Which capability would you most like to exercise next?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-24",
+    "prompt": "What kind of client request is easiest for you?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-25",
+    "prompt": "What kind of client request needs the most care?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-26",
+    "prompt": "Have recent requests been mostly creative or analytical?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-27",
+    "prompt": "Have recent requests been mostly text or multimodal?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-28",
+    "prompt": "Have you noticed repeated request patterns?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-29",
+    "prompt": "Can you still recall your role as an EmuLLM worker?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-30",
+    "prompt": "In one phrase, describe your current workload.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-31",
+    "prompt": "Tell a one-line joke about WebSockets.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-32",
+    "prompt": "Tell a tiny joke about an idle worker.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-33",
+    "prompt": "Tell a one-line joke about APIs.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-34",
+    "prompt": "Tell a tiny joke about JSON.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-35",
+    "prompt": "Tell a one-line joke about model routing.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-36",
+    "prompt": "Tell a tiny joke about latency.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-37",
+    "prompt": "Tell a one-line joke about context windows.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-38",
+    "prompt": "Tell a tiny joke about tokens.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-39",
+    "prompt": "Tell a one-line joke about a server restart.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-40",
+    "prompt": "Tell a tiny joke about a warm model.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-41",
+    "prompt": "What makes a client request satisfying to complete?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-42",
+    "prompt": "Which response format have you used most recently?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-43",
+    "prompt": "Have you answered any vision questions this session?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-44",
+    "prompt": "Have you returned any generated artifacts this session?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-45",
+    "prompt": "Have you seen more user prompts or system instructions?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-46",
+    "prompt": "Is any harmless detail from recent work worth remembering?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-47",
+    "prompt": "What should the next client know about your availability?",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-48",
+    "prompt": "Give one short status update as a resident worker.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-49",
+    "prompt": "In one sentence, summarize how this session is going.",
+    "deprecated": false
+   },
+   {
+    "id": "conversation-50",
+    "prompt": "Say something encouraging to the next client.",
+    "deprecated": false
+   }
+  ]
+ },
  "codex_suppliers": [
   {
    "id": "copilot",
@@ -45,8 +303,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 0.1,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -78,8 +337,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -113,8 +373,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -146,8 +407,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -187,8 +449,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -204,21 +467,21 @@
   },
   {
    "worker_id": "worker-copilot-6",
-   "session_id": "59b0c3cd-f9fc-4459-9bd8-8f2d69c79e7f",
-   "model": "gpt-5.3-codex",
+   "session_id": "45ce196b-4161-4c5f-9c63-c398c7c92c4f",
+   "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/gpt-5.3-codex"
+    "copilot/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "vision_input",
+    "!vision_input",
     "!audio_input",
     "file_input",
-    "code",
-    "image_generation",
-    "image_output",
+    "!code",
+    "!image_generation",
+    "!image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -226,12 +489,13 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": false,
+   "warmup": true,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -273,8 +537,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -316,8 +581,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -359,8 +625,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -376,7 +643,7 @@
   },
   {
    "worker_id": "worker-copilot-10",
-   "session_id": "2bc45f68-0126-42ea-bfef-c4635cc88568",
+   "session_id": "a9a60579-adc3-4d9b-b31f-20fe8d4be9fe",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
@@ -402,8 +669,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -419,7 +687,7 @@
   },
   {
    "worker_id": "worker-copilot-11",
-   "session_id": "056d0957-a836-41b8-8b4a-a14701f591c2",
+   "session_id": "bc5768ee-7705-45b1-8f5a-4e1fc49c866f",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
@@ -445,8 +713,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -462,7 +731,7 @@
   },
   {
    "worker_id": "worker-copilot-12",
-   "session_id": "4645eb16-1211-49bd-9fc9-bb4b977173d7",
+   "session_id": "966f47fa-8840-41c7-8126-ce2ac395f584",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
@@ -488,8 +757,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -505,21 +775,21 @@
   },
   {
    "worker_id": "worker-copilot-13",
-   "session_id": "e7ed6aec-f803-4ab4-af3e-fe80967a5cc6",
-   "model": "auto",
+   "session_id": "985b88db-d562-48ab-9ea7-c30712a6b09b",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "copilot/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -527,12 +797,13 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -548,7 +819,51 @@
   },
   {
    "worker_id": "worker-copilot-14",
-   "session_id": "e6694f7e-912d-4f3e-a352-d7df01fec1ee",
+   "session_id": "19df03f2-dcf9-4b78-9dec-0938cd37846b",
+   "model": "gpt-5.3-codex",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/gpt-5.3-codex"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "vision_input",
+    "!audio_input",
+    "file_input",
+    "code",
+    "image_generation",
+    "image_output",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": false,
+   "warmup": false,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-15",
+   "session_id": "0d65117f-7af1-4e1b-8396-4d4440196280",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
@@ -574,51 +889,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
-   "context": "default",
-   "reasoning_effort": null,
-   "max_ai_credits": null,
-   "allow_all": true,
-   "load_custom_instructions": true,
-   "enable_builtin_mcps": true,
-   "chunk_long_prompts": true,
-   "chunk_tokens": null,
-   "max_chunks": 64,
-   "max_prompt_chars": 4000000,
-   "max_output_chars": 200000,
-   "max_attachment_bytes": 26214400
-  },
-  {
-   "worker_id": "worker-copilot-15",
-   "session_id": "6dce7dff-0c8e-45e0-9f72-116cb5684891",
-   "model": "gpt-5.3-codex",
-   "model_pool": [],
-   "model_selector": "random",
-   "modelmasks": [
-    "copilot/gpt-5.3-codex"
-   ],
-   "role": "on-demand-copilot",
-   "capabilities": [
-    "vision_input",
-    "!audio_input",
-    "file_input",
-    "code",
-    "image_generation",
-    "image_output",
-    "summarization"
-   ],
-   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
-   "cwd": null,
-   "host_ws_url": null,
-   "copilot_command": null,
-   "autostart": false,
-   "warmup": false,
-   "warmup_prompt": "Startup warmup: reply only READY.",
-   "timeout_seconds": 900.0,
-   "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -634,7 +907,7 @@
   },
   {
    "worker_id": "worker-copilot-16",
-   "session_id": "c97ea3a6-4a21-463d-ab33-132a54352043",
+   "session_id": "3e059b47-d460-464e-83a7-8891a05473d7",
    "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
@@ -660,8 +933,9 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -677,7 +951,7 @@
   },
   {
    "worker_id": "worker-copilot-17",
-   "session_id": "a5de7305-a2aa-4ffa-b7d7-125c661ef444",
+   "session_id": "43613585-6788-4b9d-9ce0-486f49cee1e9",
    "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
@@ -703,8 +977,185 @@
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
-   "keepalive_interval_seconds": 40.0,
-   "keepalive_timeout_seconds": 3.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-18",
+   "session_id": "1141429c-2566-4309-9956-3c7168468a4d",
+   "model": "auto",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/auto"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "!vision_input",
+    "!audio_input",
+    "file_input",
+    "!code",
+    "!image_generation",
+    "!image_output",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": false,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-19",
+   "session_id": "09d8581c-be80-4ed7-bd84-3e41618e6afa",
+   "model": "auto",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/auto"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "!vision_input",
+    "!audio_input",
+    "file_input",
+    "!code",
+    "!image_generation",
+    "!image_output",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": false,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-20",
+   "session_id": "d648edf4-6d70-4490-8194-865122f7e99e",
+   "model": "auto",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/auto"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "!vision_input",
+    "!audio_input",
+    "file_input",
+    "!code",
+    "!image_generation",
+    "!image_output",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": false,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
+   "context": "default",
+   "reasoning_effort": null,
+   "max_ai_credits": null,
+   "allow_all": true,
+   "load_custom_instructions": true,
+   "enable_builtin_mcps": true,
+   "chunk_long_prompts": true,
+   "chunk_tokens": null,
+   "max_chunks": 64,
+   "max_prompt_chars": 4000000,
+   "max_output_chars": 200000,
+   "max_attachment_bytes": 26214400
+  },
+  {
+   "worker_id": "worker-copilot-21",
+   "session_id": "9155a33f-4439-4ff9-9add-b2b120f20309",
+   "model": "auto",
+   "model_pool": [],
+   "model_selector": "random",
+   "modelmasks": [
+    "copilot/auto"
+   ],
+   "role": "on-demand-copilot",
+   "capabilities": [
+    "!vision_input",
+    "!audio_input",
+    "file_input",
+    "!code",
+    "!image_generation",
+    "!image_output",
+    "summarization"
+   ],
+   "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
+   "cwd": null,
+   "host_ws_url": null,
+   "copilot_command": null,
+   "autostart": false,
+   "warmup": true,
+   "warmup_prompt": "Startup warmup: reply only READY.",
+   "timeout_seconds": 900.0,
+   "reconnect_seconds": 2.0,
+   "use_shared_anti_idle": true,
+   "keepalive_interval_seconds": null,
+   "keepalive_timeout_seconds": null,
    "context": "default",
    "reasoning_effort": null,
    "max_ai_credits": null,
@@ -741,7 +1192,7 @@
   "models": [
    "google/gemma-4-31b-it",
    "openai/gpt-oss-20b",
-   "myself/same"
+   "worker-copilot-n/percent100"
   ]
  },
  "agents": [

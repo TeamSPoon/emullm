@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -20,72 +21,28 @@ import websockets
 from pydantic import BaseModel, ConfigDict, Field
 from websockets.exceptions import ConnectionClosed
 
-from .copilot_api import HeadlessCopilotConfig
+from .copilot_api import (
+    AntiIdlePromptConfig,
+    DEFAULT_ANTI_IDLE_CONVERSATION_PROMPTS,
+    HeadlessCopilotConfig,
+    default_anti_idle_prompts,
+)
 from .worker import worker_socket_url
 
 
-KEEPALIVE_TASKS = (
-    "Give one synonym for steady.",
-    "Give one antonym for dormant.",
-    "State the integer after twelve.",
-    "Write ready in uppercase.",
-    "State the first letter of the alphabet.",
-    "Count the letters in relay.",
-    "Name one primary color.",
-    "Name one even number below ten.",
-    "Give the plural of worker.",
-    "Give the past tense of send.",
-    "Give one word meaning durable.",
-    "Give one word meaning brief.",
-    "Name the weekday after Monday.",
-    "Name the month after June.",
-    "Name the season after spring.",
-    "State the opposite of left.",
-    "State the opposite of false.",
-    "Give one word meaning quiet.",
-    "Give one word that rhymes with light.",
-    "Name one punctuation mark.",
-    "Write the binary representation of two.",
-    "State the result of three plus four.",
-    "Write active in lowercase.",
-    "State the first word in persistent session.",
-    "Name one celestial body.",
-    "Name one ocean.",
-    "Name one programming language.",
-    "Name one structured data format.",
-    "Name one network protocol.",
-    "Name one geometric shape.",
-    "Name one metal.",
-    "Name one noble gas.",
-    "Name one mammal.",
-    "Name one bird.",
-    "Name one tree.",
-    "Name one fruit.",
-    "Name one musical instrument.",
-    "Name one unit of time.",
-    "Name one compass direction.",
-    "State one vowel.",
-    "State one consonant.",
-    "State one decimal digit.",
-    "Name one prime number below ten.",
-    "Give one word beginning with K.",
-    "Give one word ending in ing.",
-    "Give one five-letter word.",
-    "Name one non-primary color.",
-    "Give one weather term.",
-    "Give one texture adjective.",
-    "Reply with the exact words STILL HERE.",
-)
-_KEEPALIVE_SLOW_SECONDS = 2.0
+KEEPALIVE_TASKS = DEFAULT_ANTI_IDLE_CONVERSATION_PROMPTS
 _KEEPALIVE_RETIRE_SLOW_COUNT = 2
 
 
-def keepalive_prompt(index: int) -> str:
-    task_index = index % len(KEEPALIVE_TASKS)
+def keepalive_prompt(
+    index: int,
+    prompts: list[AntiIdlePromptConfig] | None = None,
+) -> str:
+    configured = prompts or default_anti_idle_prompts()
+    task_index = index % len(configured)
     return (
-        f"Persistent-session keepalive {task_index + 1}/{len(KEEPALIVE_TASKS)}. "
-        f"{KEEPALIVE_TASKS[task_index]} Reply in at most three words without "
-        "using tools, and answer immediately. Remain available for the next request."
+        f"{configured[task_index].prompt} Answer naturally in one short sentence "
+        "of at most twelve words. Do not use tools or reveal client identities."
     )
 
 
@@ -101,6 +58,15 @@ class ServantRuntimeConfig(HeadlessCopilotConfig):
     selected_model_max_prompt_tokens: int = 64_000
     selected_model_max_output_tokens: int = 0
     selected_model_supported_media_types: list[str] = Field(default_factory=list)
+    keepalive_enabled: bool = True
+    keepalive_interval_seconds: float = 60.0
+    keepalive_timeout_seconds: float = Field(default=10.0, ge=0.1, le=10.0)
+    keepalive_slow_budget_seconds: float = Field(default=8.0, ge=0.1, le=10.0)
+    keepalive_prompts: list[AntiIdlePromptConfig] = Field(
+        default_factory=default_anti_idle_prompts,
+        min_length=1,
+        max_length=1_000,
+    )
     copilot_runtime_path: str
     copilot_sdk_path: str
     node_command: str
@@ -151,8 +117,8 @@ class CopilotRunner:
         self._lock = asyncio.Lock()
         self._request_count = 0
         self._keepalive_count = 0
-        self._keepalive_task_stats: dict[int, dict[str, int | float | bool]] = {}
-        self._retired_keepalive_tasks: set[int] = set()
+        self._keepalive_task_stats: dict[str, dict[str, Any]] = {}
+        self._retired_keepalive_tasks: set[str] = set()
         self._cancellation_count = 0
         self._model_switch_count = 0
         self._bridge_request_id: str | None = None
@@ -214,16 +180,27 @@ class CopilotRunner:
         raw_stats = current.get("keepalive_task_stats")
         if not isinstance(raw_stats, dict):
             return
-        for raw_index, raw_values in raw_stats.items():
-            try:
-                index = int(raw_index)
-            except (TypeError, ValueError):
-                continue
-            if not 0 <= index < len(KEEPALIVE_TASKS) or not isinstance(
-                raw_values, dict
+        prompt_by_id = {
+            prompt.id: prompt for prompt in self.config.keepalive_prompts
+        }
+        for raw_prompt_id, raw_values in raw_stats.items():
+            prompt_id = str(raw_prompt_id)
+            if (
+                prompt_id not in prompt_by_id
+                and prompt_id.isdigit()
+                and 0 <= int(prompt_id) < len(self.config.keepalive_prompts)
             ):
+                prompt_id = self.config.keepalive_prompts[int(prompt_id)].id
+            prompt = prompt_by_id.get(prompt_id)
+            if prompt is None or not isinstance(raw_values, dict):
+                continue
+            prompt_hash = hashlib.sha256(
+                prompt.prompt.encode("utf-8")
+            ).hexdigest()[:16]
+            if raw_values.get("prompt_hash") != prompt_hash:
                 continue
             stats = {
+                "prompt_hash": prompt_hash,
                 "attempts": max(0, int(raw_values.get("attempts") or 0)),
                 "completed": max(0, int(raw_values.get("completed") or 0)),
                 "slow": max(0, int(raw_values.get("slow") or 0)),
@@ -234,6 +211,11 @@ class CopilotRunner:
                 "total_duration_ms": max(
                     0, int(raw_values.get("total_duration_ms") or 0)
                 ),
+                "min_duration_ms": (
+                    max(0, int(raw_values["min_duration_ms"]))
+                    if raw_values.get("min_duration_ms") is not None
+                    else None
+                ),
                 "average_duration_ms": max(
                     0.0, float(raw_values.get("average_duration_ms") or 0)
                 ),
@@ -242,23 +224,40 @@ class CopilotRunner:
                 ),
                 "retired": bool(raw_values.get("retired")),
             }
-            self._keepalive_task_stats[index] = stats
+            self._keepalive_task_stats[prompt_id] = stats
             if stats["retired"]:
-                self._retired_keepalive_tasks.add(index)
-        if len(self._retired_keepalive_tasks) >= len(KEEPALIVE_TASKS):
+                self._retired_keepalive_tasks.add(prompt_id)
+        active_ids = {
+            prompt.id
+            for prompt in self.config.keepalive_prompts
+            if not prompt.deprecated
+        }
+        self._retired_keepalive_tasks.intersection_update(active_ids)
+        if (
+            active_ids
+            and len(self._retired_keepalive_tasks) >= len(active_ids)
+        ):
             fallback = min(
-                self._keepalive_task_stats,
-                key=lambda index: float(
-                    self._keepalive_task_stats[index]["average_duration_ms"]
+                active_ids,
+                key=lambda prompt_id: float(
+                    self._keepalive_task_stats.get(prompt_id, {}).get(
+                        "average_duration_ms",
+                        0,
+                    )
                 ),
             )
             self._retired_keepalive_tasks.discard(fallback)
             self._keepalive_task_stats[fallback]["retired"] = False
 
     def next_keepalive_task(self, start_index: int) -> int | None:
-        for offset in range(len(KEEPALIVE_TASKS)):
-            candidate = (start_index + offset) % len(KEEPALIVE_TASKS)
-            if candidate not in self._retired_keepalive_tasks:
+        prompts = self.config.keepalive_prompts
+        for offset in range(len(prompts)):
+            candidate = (start_index + offset) % len(prompts)
+            prompt = prompts[candidate]
+            if (
+                not prompt.deprecated
+                and prompt.id not in self._retired_keepalive_tasks
+            ):
                 return candidate
         return None
 
@@ -270,16 +269,25 @@ class CopilotRunner:
         completed: bool,
         timed_out: bool = False,
     ) -> bool:
+        prompt = self.config.keepalive_prompts[
+            prompt_index % len(self.config.keepalive_prompts)
+        ]
+        prompt_id = prompt.id
+        prompt_hash = hashlib.sha256(
+            prompt.prompt.encode("utf-8")
+        ).hexdigest()[:16]
         duration_ms = max(0, round(duration_seconds * 1000))
         stats = self._keepalive_task_stats.setdefault(
-            prompt_index,
+            prompt_id,
             {
+                "prompt_hash": prompt_hash,
                 "attempts": 0,
                 "completed": 0,
                 "slow": 0,
                 "consecutive_slow": 0,
                 "timeouts": 0,
                 "total_duration_ms": 0,
+                "min_duration_ms": None,
                 "average_duration_ms": 0.0,
                 "max_duration_ms": 0,
                 "retired": False,
@@ -290,13 +298,21 @@ class CopilotRunner:
             stats["completed"] = int(stats["completed"]) + 1
         if timed_out:
             stats["timeouts"] = int(stats["timeouts"]) + 1
-        slow = timed_out or duration_seconds >= _KEEPALIVE_SLOW_SECONDS
+        slow = (
+            timed_out
+            or duration_seconds >= self.config.keepalive_slow_budget_seconds
+        )
         if slow:
             stats["slow"] = int(stats["slow"]) + 1
             stats["consecutive_slow"] = int(stats["consecutive_slow"]) + 1
         else:
             stats["consecutive_slow"] = 0
         stats["total_duration_ms"] = int(stats["total_duration_ms"]) + duration_ms
+        stats["min_duration_ms"] = (
+            duration_ms
+            if stats.get("min_duration_ms") is None
+            else min(int(stats["min_duration_ms"]), duration_ms)
+        )
         stats["average_duration_ms"] = round(
             int(stats["total_duration_ms"]) / int(stats["attempts"]),
             1,
@@ -304,23 +320,43 @@ class CopilotRunner:
         stats["max_duration_ms"] = max(int(stats["max_duration_ms"]), duration_ms)
         if (
             int(stats["consecutive_slow"]) >= _KEEPALIVE_RETIRE_SLOW_COUNT
-            and len(self._retired_keepalive_tasks) < len(KEEPALIVE_TASKS) - 1
+            and len(self._retired_keepalive_tasks)
+            < sum(
+                not configured.deprecated
+                for configured in self.config.keepalive_prompts
+            )
+            - 1
         ):
             stats["retired"] = True
-            self._retired_keepalive_tasks.add(prompt_index)
+            self._retired_keepalive_tasks.add(prompt_id)
         self._write_status(
             keepalive_stats_model=self.config.selected_model,
             keepalive_task_stats={
-                str(index): values
-                for index, values in sorted(self._keepalive_task_stats.items())
+                prompt_id: values
+                for prompt_id, values in sorted(
+                    self._keepalive_task_stats.items()
+                )
             },
             retired_keepalive_tasks=sorted(self._retired_keepalive_tasks),
         )
         return bool(stats["retired"])
 
+    def reset_keepalive_stats(self) -> None:
+        self._keepalive_count = 0
+        self._keepalive_task_stats.clear()
+        self._retired_keepalive_tasks.clear()
+        self._write_status(
+            keepalives=0,
+            keepalive_stats_model=self.config.selected_model,
+            keepalive_task_stats={},
+            retired_keepalive_tasks=[],
+            keepalive_stats_reset_at=time.time(),
+        )
+
     async def run(self, request: dict[str, Any]) -> str:
         prompt = build_prompt(self.config, request)
         request_id = str(request.get("id") or "")
+        is_keepalive = request.get("_maintenance") is True
         chunks = self._prompt_chunks(prompt)
         attachments = await self._sdk_attachments(request)
         async with self._lock:
@@ -357,16 +393,13 @@ class CopilotRunner:
                 self._cancellation_count += 1
                 active_id = self._bridge_request_id
                 if active_id:
-                    cleanup = asyncio.create_task(self._cancel_request(active_id))
-                    while not cleanup.done():
-                        try:
-                            await asyncio.shield(cleanup)
-                        except asyncio.CancelledError:
-                            continue
                     try:
-                        cleanup.result()
+                        await self._cancel_request(
+                            active_id,
+                            timeout_seconds=0.25 if is_keepalive else 10,
+                        )
                     except (CopilotInvocationError, TimeoutError):
-                        pass
+                        await self._discard_bridge()
                 self._bridge_request_id = None
                 self._write_status(cancellations=self._cancellation_count)
                 raise
@@ -389,7 +422,7 @@ class CopilotRunner:
                 "last_attachment_count": len(attachments),
                 "last_completed_at": time.time(),
             }
-            if request.get("kind") == "keepalive":
+            if is_keepalive:
                 self._keepalive_count += 1
                 status.update(
                     keepalives=self._keepalive_count,
@@ -600,6 +633,33 @@ class CopilotRunner:
         self._active = None
         self._write_status(running=False, stopped_at=time.time())
 
+    async def _discard_bridge(self) -> None:
+        process = self._active
+        if self._stdout_task is not None:
+            self._stdout_task.cancel()
+            try:
+                await self._stdout_task
+            except asyncio.CancelledError:
+                pass
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except asyncio.CancelledError:
+                pass
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        self._stdout_task = None
+        self._stderr_task = None
+        self._active = None
+        self._response_queues.clear()
+        self._bridge_request_id = None
+        self._write_status(
+            running=False,
+            bridge_discarded_at=time.time(),
+        )
+
     def _send(self, message: dict[str, Any]) -> None:
         process = self._active
         if process is None or process.stdin is None or process.returncode is not None:
@@ -682,13 +742,17 @@ class CopilotRunner:
         self,
         request_id: str,
         queue: asyncio.Queue[dict[str, Any]] | None = None,
+        timeout_seconds: float = 10,
     ) -> None:
         response_queue = queue or self._message_queue(request_id)
         owns_queue = queue is None
         try:
             self._send({"type": "cancel", "id": request_id})
             while True:
-                message = await asyncio.wait_for(response_queue.get(), timeout=10)
+                message = await asyncio.wait_for(
+                    response_queue.get(),
+                    timeout=timeout_seconds,
+                )
                 if (
                     message.get("id") == request_id
                     and message.get("type") == "cancelled"
@@ -721,9 +785,21 @@ class CopilotRunner:
             current = {}
         current.update(updates)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         temporary.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        try:
+            for attempt in range(10):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     async def _terminate(process: asyncio.subprocess.Process) -> None:
@@ -869,21 +945,36 @@ async def handle_keepalive(
     prompt_index: int,
 ) -> None:
     started = time.monotonic()
+    run_task = asyncio.create_task(
+        runner.run(
+            {
+                "id": request_id,
+                "model": runner.config.selected_model,
+                "kind": "completion",
+                "_maintenance": True,
+                "prompt": keepalive_prompt(
+                    prompt_index,
+                    runner.config.keepalive_prompts,
+                ),
+            }
+        )
+    )
     try:
-        content = await asyncio.wait_for(
-            runner.run(
-                {
-                    "id": request_id,
-                    "model": runner.config.selected_model,
-                    "kind": "keepalive",
-                    "prompt": keepalive_prompt(prompt_index),
-                }
-            ),
+        done, _ = await asyncio.wait(
+            {run_task},
             timeout=runner.config.keepalive_timeout_seconds,
         )
+        if not done:
+            run_task.cancel()
+            asyncio.create_task(_drain_cancelled_task(run_task))
+            raise TimeoutError
+        content = run_task.result()
     except asyncio.CancelledError:
+        run_task.cancel()
+        asyncio.create_task(_drain_cancelled_task(run_task))
         raise
     except TimeoutError:
+        duration_ms = round((time.monotonic() - started) * 1000)
         retired = runner.record_keepalive_result(
             prompt_index,
             time.monotonic() - started,
@@ -900,6 +991,7 @@ async def handle_keepalive(
                     "type": "keepalive_error",
                     "id": request_id,
                     "prompt_index": prompt_index,
+                    "duration_ms": duration_ms,
                     "reason": reason,
                     "retired": retired,
                 }
@@ -908,6 +1000,7 @@ async def handle_keepalive(
         print(f"KEEPALIVE_FAILED {request_id}: {reason}", flush=True)
         return
     except CopilotInvocationError as error:
+        duration_ms = round((time.monotonic() - started) * 1000)
         runner.record_keepalive_result(
             prompt_index,
             time.monotonic() - started,
@@ -919,6 +1012,7 @@ async def handle_keepalive(
                     "type": "keepalive_error",
                     "id": request_id,
                     "prompt_index": prompt_index,
+                    "duration_ms": duration_ms,
                     "reason": str(error),
                 }
             )
@@ -944,9 +1038,17 @@ async def handle_keepalive(
         )
     )
     print(
-        f"KEEPALIVE {request_id} prompt={prompt_index + 1}/{len(KEEPALIVE_TASKS)}",
+        f"KEEPALIVE {request_id} prompt={prompt_index + 1}/"
+        f"{len(runner.config.keepalive_prompts)}",
         flush=True,
     )
+
+
+async def _drain_cancelled_task(task: asyncio.Task[Any]) -> None:
+    try:
+        await task
+    except (asyncio.CancelledError, CopilotInvocationError):
+        pass
 
 
 async def _cancel_active_task(task: asyncio.Task[None] | None) -> None:
@@ -966,6 +1068,7 @@ def registration_payload(config: ServantRuntimeConfig) -> dict[str, Any]:
         "capabilities": declared_capabilities(config),
         "worker_kind": "headless-copilot",
         "runtime_model": config.selected_model,
+        "startup_prompt": config.system_prompt,
         "description": (
             f"Resident GitHub Copilot servant backed by {config.selected_model}; "
             f"session {config.session_id}."
@@ -978,7 +1081,14 @@ def registration_payload(config: ServantRuntimeConfig) -> dict[str, Any]:
 
 async def run_servant(config: ServantRuntimeConfig) -> None:
     runner = CopilotRunner(config)
-    runner._write_status(adapter_pid=os.getpid())
+    connection_errors = 0
+    runner._write_status(
+        adapter_pid=os.getpid(),
+        connected=False,
+        connection_errors=connection_errors,
+        last_connection_error=None,
+        anti_idle_enabled=config.keepalive_enabled,
+    )
     ws_url = worker_socket_url(
         config.host_ws_url, config.worker_id, ",".join(config.modelmasks)
     )
@@ -995,21 +1105,32 @@ async def run_servant(config: ServantRuntimeConfig) -> None:
                 f"{warmup_reply}",
                 flush=True,
             )
+        anti_idle_enabled = config.keepalive_enabled
         while True:
             active_task: asyncio.Task[None] | None = None
             keepalive_scheduler: asyncio.Task[None] | None = None
             try:
-                async with websockets.connect(ws_url, open_timeout=15, max_size=8 * 1024 * 1024) as websocket:
+                async with websockets.connect(
+                    ws_url,
+                    open_timeout=60,
+                    ping_interval=30,
+                    ping_timeout=60,
+                    max_size=8 * 1024 * 1024,
+                ) as websocket:
                     hello = json.loads(await websocket.recv())
                     if not isinstance(hello, dict) or hello.get("type") != "hello":
                         raise CopilotInvocationError(f"unexpected relay greeting: {hello!r}")
                     await websocket.send(json.dumps(registration_payload(config)))
                     print(f"CONNECTED worker={config.worker_id}", flush=True)
+                    runner._write_status(
+                        connected=True,
+                        connected_at=time.time(),
+                    )
                     active_request_id: str | None = None
                     active_task_kind: str | None = None
                     control_active = False
                     keepalive_index = sum(config.worker_id.encode("utf-8")) % len(
-                        KEEPALIVE_TASKS
+                        config.keepalive_prompts
                     )
 
                     async def schedule_keepalives() -> None:
@@ -1018,9 +1139,10 @@ async def run_servant(config: ServantRuntimeConfig) -> None:
                         interval = config.keepalive_interval_seconds
                         if interval <= 0:
                             return
+                        prompt_count = len(config.keepalive_prompts)
                         phase = (
-                            (keepalive_index % len(KEEPALIVE_TASKS))
-                            / max(1, len(KEEPALIVE_TASKS) - 1)
+                            (keepalive_index % prompt_count)
+                            / max(1, prompt_count - 1)
                         )
                         await asyncio.sleep(interval * (1 + phase))
                         while True:
@@ -1032,7 +1154,7 @@ async def run_servant(config: ServantRuntimeConfig) -> None:
                                 active_task = None
                                 active_request_id = None
                                 active_task_kind = None
-                            if active_task is None and not control_active:
+                            if anti_idle_enabled and active_task is None and not control_active:
                                 selected_index = runner.next_keepalive_task(
                                     keepalive_index
                                 )
@@ -1054,7 +1176,7 @@ async def run_servant(config: ServantRuntimeConfig) -> None:
                                 )
                                 keepalive_index = (
                                     keepalive_index + 1
-                                ) % len(KEEPALIVE_TASKS)
+                                ) % prompt_count
                             await asyncio.sleep(interval)
 
                     keepalive_scheduler = asyncio.create_task(schedule_keepalives())
@@ -1079,6 +1201,43 @@ async def run_servant(config: ServantRuntimeConfig) -> None:
                                 )
                             )
                             return
+                        if request.get("type") == "reset_keepalive_stats":
+                            if active_task_kind == "keepalive":
+                                await _cancel_active_task(active_task)
+                                active_task = None
+                                active_request_id = None
+                                active_task_kind = None
+                            runner.reset_keepalive_stats()
+                            await websocket.send(
+                                json.dumps(
+                                    {
+                                        "type": "keepalive_stats_reset",
+                                        "id": str(request.get("id") or ""),
+                                    }
+                                )
+                            )
+                            continue
+                        if request.get("type") == "set_anti_idle":
+                            anti_idle_enabled = request.get("enabled") is True
+                            if not anti_idle_enabled and active_task_kind == "keepalive":
+                                await _cancel_active_task(active_task)
+                                active_task = None
+                                active_request_id = None
+                                active_task_kind = None
+                            runner._write_status(
+                                anti_idle_enabled=anti_idle_enabled,
+                                anti_idle_changed_at=time.time(),
+                            )
+                            await websocket.send(
+                                json.dumps(
+                                    {
+                                        "type": "anti_idle_changed",
+                                        "id": request.get("id"),
+                                        "enabled": anti_idle_enabled,
+                                    }
+                                )
+                            )
+                            continue
                         if request.get("type") == "set_model":
                             control_id = str(request.get("id") or "")
                             if active_task_kind == "keepalive":
@@ -1202,12 +1361,20 @@ async def run_servant(config: ServantRuntimeConfig) -> None:
                     await _cancel_active_task(keepalive_scheduler)
                     await _cancel_active_task(active_task)
             except (ConnectionClosed, OSError, asyncio.TimeoutError) as error:
+                connection_errors += 1
+                runner._write_status(
+                    connected=False,
+                    connection_errors=connection_errors,
+                    last_connection_error=str(error),
+                    last_disconnected_at=time.time(),
+                )
                 print(f"DISCONNECTED worker={config.worker_id}: {error}", flush=True)
             finally:
                 await _cancel_active_task(keepalive_scheduler)
                 await _cancel_active_task(active_task)
             await asyncio.sleep(config.reconnect_seconds)
     finally:
+        runner._write_status(connected=False)
         await runner.close()
 
 

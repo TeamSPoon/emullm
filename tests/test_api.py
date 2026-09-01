@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -101,8 +102,20 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(emullm_api, "_admin_test_tasks", {})
     monkeypatch.setattr(emullm_api, "_active_websockets", {})
     monkeypatch.setattr(emullm_api, "_worker_connection_ids", {})
+    monkeypatch.setattr(emullm_api, "_copilot_client_affinity", {})
+    monkeypatch.setattr(
+        emullm_api,
+        "_socket_worker_log_dir",
+        tmp_path / "socket-worker-logs",
+    )
+    monkeypatch.setattr(
+        emullm_api,
+        "_socket_worker_log_segment_bytes",
+        2 * 1024 * 1024,
+    )
     monkeypatch.setattr(emullm_api, "_openai_clients", {})
     monkeypatch.setattr(emullm_api, "_openai_requests", {})
+    monkeypatch.setattr(emullm_api, "_client_capacity_waiters", {})
     monkeypatch.setattr(emullm_api, "_DOC_ALIASES", {})
     # No managed-worker supervisor by default (auto mode sets one).
     emullm_api._sup.set_supervisor(None)  # noqa: SLF001
@@ -126,13 +139,15 @@ def test_list_models_includes_personas(client: TestClient) -> None:
     data = client.get("/v1/models").json()["data"]
     ids = {entry["id"] for entry in data}
     assert {
-        "yourself/same",
-        "yourself/percent125",
-        "yourself/percent100",
-        "yourself/percent75",
-        "yourself/percent25",
-        "yourself/percent10",
+        "worker-copilot-n/percent125",
+        "worker-copilot-n/percent100",
+        "worker-copilot-n/percent25",
     }.issubset(ids)
+    assert not any(model_id.startswith("yourself/") for model_id in ids)
+    assert not any(
+        model_id.endswith(("/same", "/percent75", "/percent10"))
+        for model_id in ids
+    )
     assert "emullm/default" in ids
     assert any(model_id.startswith("copilot/") for model_id in ids)
 
@@ -141,7 +156,7 @@ def test_emullm_default_alias_relays_through_configured_default(
     client: TestClient,
 ) -> None:
     worker = FakeWorker(reply="default answer")
-    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
+    emullm_api._connected_workers["worker-copilot-1"] = worker  # noqa: SLF001
     emullm_api._advertised_default = "yourself/same"  # noqa: SLF001
 
     model = client.get("/v1/models/emullm/default")
@@ -154,11 +169,212 @@ def test_emullm_default_alias_relays_through_configured_default(
     )
 
     assert model.status_code == 200
-    assert model.json()["resolved_model"] == "yourself/same"
+    assert model.json()["resolved_model"] == "worker-copilot-n/percent100"
     assert response.status_code == 200
     assert response.json()["model"] == "emullm/default"
     assert response.json()["choices"][0]["message"]["content"] == "default answer"
-    assert worker.sent[0]["model"] == "yourself/same"
+    assert worker.sent[0]["model"] == "worker-copilot-n/percent100"
+
+
+def test_literal_copilot_n_is_sticky_by_client_ip_and_port_range() -> None:
+    app = FastAPI()
+    app.include_router(emullm_api.router)
+    first = FakeWorker(reply="worker one")
+    second = FakeWorker(reply="worker two")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            "worker-copilot-1": first,
+            "worker-copilot-2": second,
+        }
+    )
+
+    with TestClient(app, client=("198.51.100.20", 50001)) as client_one:
+        response_one = client_one.post(
+            "/v1/chat/completions",
+            json={
+                "model": "worker-copilot-n/percent100",
+                "messages": [{"role": "user", "content": "first"}],
+            },
+        )
+    with TestClient(app, client=("198.51.100.20", 50099)) as client_two:
+        response_two = client_two.post(
+            "/v1/chat/completions",
+            json={
+                "model": "worker-copilot-n/percent100",
+                "messages": [{"role": "user", "content": "second"}],
+            },
+        )
+
+    assigned = response_one.headers["x-emullm-worker-id"]
+    assert assigned in {"worker-copilot-1", "worker-copilot-2"}
+    assert response_two.headers["x-emullm-worker-id"] == assigned
+    expected = "worker one" if assigned.endswith("-1") else "worker two"
+    assert response_one.json()["choices"][0]["message"]["content"] == expected
+    assert response_two.json()["choices"][0]["message"]["content"] == expected
+    affinity = next(iter(emullm_api._copilot_client_affinity.values()))  # noqa: SLF001
+    assert affinity["port_start"] == 49_152
+    assert affinity["port_end"] == 50_175
+
+
+def test_best_and_worse_capability_aliases_rank_connected_workers(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {
+            "models": [
+                {"id": "fast-model", "name": "Fast", "quality_rank": 1},
+                {"id": "small-model", "name": "Small", "quality_rank": 20},
+            ],
+            "source": "test",
+        },
+    )
+    fast = FakeWorker(reply="best answer")
+    small = FakeWorker(reply="worse answer")
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {"worker-copilot-1": fast, "worker-copilot-2": small}
+    )
+    emullm_api._worker_runtime_models.update(  # noqa: SLF001
+        {"worker-copilot-1": "fast-model", "worker-copilot-2": "small-model"}
+    )
+    capabilities = {
+        "audio_input": True,
+        "vision_input": True,
+        "file_input": True,
+        "code": True,
+        "summarization": True,
+        "image_generation": True,
+        "image_output": True,
+    }
+    emullm_api._worker_capabilities.update(  # noqa: SLF001
+        {
+            "worker-copilot-1": dict(capabilities),
+            "worker-copilot-2": dict(capabilities),
+        }
+    )
+
+    model_ids = {
+        entry["id"] for entry in client.get("/v1/models").json()["data"]
+    }
+    expected_aliases = {
+        f"router/{capability}-{selector}"
+        for selector in ("best", "worse")
+        for capability in (
+            "audio",
+            "video",
+            "vision",
+            "file",
+            "code",
+            "summarization",
+            "image-generation",
+            "image-output",
+        )
+    }
+    assert expected_aliases.issubset(model_ids)
+
+    best = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "router/audio-best",
+            "messages": [{"role": "user", "content": "best"}],
+        },
+    )
+    worse = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "router/audio-worse",
+            "messages": [{"role": "user", "content": "worse"}],
+        },
+    )
+    assert best.headers["x-emullm-worker-id"] == "worker-copilot-1"
+    assert worse.headers["x-emullm-worker-id"] == "worker-copilot-2"
+    assert best.json()["choices"][0]["message"]["content"] == "best answer"
+    assert worse.json()["choices"][0]["message"]["content"] == "worse answer"
+    assert fast.sent[0]["required_capabilities"] == ["audio_input"]
+    assert small.sent[0]["required_capabilities"] == ["audio_input"]
+
+
+def test_explicit_copilot_worker_number_can_be_any_positive_integer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manager:
+        def __init__(self):
+            self.created = None
+
+        def get(self, worker_id):
+            if self.created is None:
+                raise emullm_api._copilot_api.CopilotInstanceMissing(worker_id)  # noqa: SLF001
+            return {"worker_id": worker_id, "running": True, "connected": False}
+
+        def create(self, config, start=True):
+            self.created = config
+            return {"worker_id": config.worker_id, "running": start}
+
+        def list(self):
+            return []
+
+        def start(self, _worker_id):
+            return {"started": True}
+
+    manager = Manager()
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: manager,
+    )
+
+    assert (
+        emullm_api._provision_explicit_copilot_worker(  # noqa: SLF001
+            "worker-copilot-624"
+        )
+        is manager
+    )
+    assert manager.created.worker_id == "worker-copilot-624"
+    assert manager.created.role == "client-requested-copilot"
+    assert manager.created.autostart is True
+    assert manager.created.use_shared_anti_idle is True
+    resolved_worker, suffix, persona = emullm_api._require_model(  # noqa: SLF001
+        "worker-copilot-624/custom-backing-model"
+    )
+    assert resolved_worker == "worker-copilot-624"
+    assert suffix == ""
+    assert persona["passthrough"] is True
+
+
+def test_explicit_copilot_worker_creation_respects_resource_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manager:
+        @staticmethod
+        def get(worker_id):
+            raise emullm_api._copilot_api.CopilotInstanceMissing(worker_id)  # noqa: SLF001
+
+        @staticmethod
+        def list():
+            return [
+                {
+                    "worker_id": f"worker-copilot-{index + 1000}",
+                    "role": "client-requested-copilot",
+                }
+                for index in range(3)
+            ]
+
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: Manager(),
+    )
+    monkeypatch.setattr(emullm_api, "_max_concurrent_calls", 3)
+
+    with pytest.raises(HTTPException) as error:
+        emullm_api._provision_explicit_copilot_worker(  # noqa: SLF001
+            "worker-copilot-999999"
+        )
+
+    assert error.value.status_code == 503
+    assert "quota reached" in str(error.value.detail)
 
 
 def test_list_models_exports_complete_copilot_catalog_with_provenance(
@@ -218,6 +434,7 @@ def test_model_configurator_persists_model_patch_visibility_and_route(
         "copilot_models",
         lambda **_kwargs: {"models": catalog, "source": "test"},
     )
+    revision = client.get("/emullm/admin/model-config").json()["revision"]
 
     saved = client.put(
         "/emullm/admin/model-config",
@@ -231,6 +448,7 @@ def test_model_configurator_persists_model_patch_visibility_and_route(
             },
             "set_route": True,
             "route": ["worker-copilot-*", "https://models.example/v1"],
+            "expected_revision": revision,
         },
     )
 
@@ -253,6 +471,7 @@ def test_model_configurator_persists_model_patch_visibility_and_route(
             "model_id": "copilot/demo-model",
             "hidden": True,
             "patch": {},
+            "expected_revision": saved.json()["revision"],
         },
     )
     assert hidden.status_code == 200
@@ -260,16 +479,68 @@ def test_model_configurator_persists_model_patch_visibility_and_route(
         entry["id"] for entry in client.get("/v1/models").json()["data"]
     }
     assert client.get("/v1/models/copilot/demo-model").status_code == 404
+    hidden_catalog = {
+        entry["id"]: entry
+        for entry in client.get("/v1/models?hidden=true").json()["data"]
+    }
+    assert hidden_catalog["copilot/demo-model"]["hidden"] is True
+    assert hidden_catalog["copilot/demo-model"]["exported"] is False
+    admin_catalog = {
+        entry["id"]: entry
+        for entry in client.get("/emullm/admin/model-config").json()["models"]
+    }
+    assert admin_catalog["copilot/demo-model"]["hidden"] is True
+
+    reexported = client.put(
+        "/emullm/admin/model-config",
+        json={
+            "model_id": "copilot/demo-model",
+            "hidden": False,
+            "patch": {"display_name": "Re-exported model"},
+            "expected_revision": hidden.json()["revision"],
+        },
+    )
+    assert reexported.status_code == 200
+    assert client.get("/v1/models/copilot/demo-model").json()["display_name"] == (
+        "Re-exported model"
+    )
 
     reset = client.put(
         "/emullm/admin/model-config",
         json={
             "model_id": "copilot/demo-model",
             "reset": True,
+            "expected_revision": reexported.json()["revision"],
         },
     )
     assert reset.status_code == 200
     assert client.get("/v1/models/copilot/demo-model").status_code == 200
+
+
+def test_generated_pool_and_router_aliases_honor_unexport_overrides(
+    client: TestClient,
+) -> None:
+    emullm_api._model_catalog_overrides.update(  # noqa: SLF001
+        {
+            "worker-copilot-n/percent100": {"hidden": True, "patch": {}},
+            "router/audio-best": {"hidden": True, "patch": {}},
+        }
+    )
+
+    public_ids = {
+        entry["id"] for entry in client.get("/v1/models").json()["data"]
+    }
+    hidden = {
+        entry["id"]: entry
+        for entry in client.get("/v1/models?hidden=true").json()["data"]
+    }
+
+    assert "worker-copilot-n/percent100" not in public_ids
+    assert "router/audio-best" not in public_ids
+    assert hidden["worker-copilot-n/percent100"]["hidden"] is True
+    assert hidden["router/audio-best"]["hidden"] is True
+    assert client.get("/v1/models/worker-copilot-n/percent100").status_code == 404
+    assert client.get("/v1/models/router/audio-best").status_code == 404
 
 
 def test_on_demand_copilot_provisioner_uses_four_named_slots(monkeypatch) -> None:
@@ -464,6 +735,78 @@ def test_simultaneous_call_limit_defaults_to_fifty(monkeypatch) -> None:
         emullm_api._reserve_worker("worker-51")  # noqa: SLF001
 
 
+def test_client_capacity_reserves_five_or_thirty_percent(monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api, "_max_concurrent_calls", 50)
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {f"worker-{index}": FakeWorker() for index in range(21)}
+    )
+    assert emullm_api._client_worker_capacity() == (14, 7)  # noqa: SLF001
+    emullm_api._connected_workers.clear()  # noqa: SLF001
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {f"worker-{index}": FakeWorker() for index in range(10)}
+    )
+    assert emullm_api._client_worker_capacity() == (5, 5)  # noqa: SLF001
+
+
+def test_admin_state_reports_stuck_workers_and_connection_errors(monkeypatch) -> None:
+    monkeypatch.setattr(
+        emullm_api,
+        "_active_service_requests",
+        {
+            "request-stuck": {
+                "worker_id": "worker-stuck",
+                "model": "copilot/gpt-5.3-codex",
+                "service_kind": "vision",
+                "started_at": "2026-09-01T00:00:00Z",
+                "started_monotonic": time.monotonic() - 130,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "manager_status",
+        lambda: [
+            {
+                "worker_id": "worker-disconnected",
+                "running": True,
+                "connected": False,
+                "runtime": {
+                    "connection_errors": 3,
+                    "last_connection_error": "connection reset",
+                    "last_disconnected_at": 123.0,
+                },
+            }
+        ],
+    )
+
+    state = emullm_api.admin_state()
+
+    assert state["concurrency"]["stuck_workers"] == 1
+    assert state["stuck_workers"][0]["worker_id"] == "worker-stuck"
+    assert state["stuck_workers"][0]["age_seconds"] >= 120
+    assert state["connection_errors"] == [
+        {
+            "worker_id": "worker-disconnected",
+            "connected": False,
+            "running": True,
+            "connection_errors": 3,
+            "last_connection_error": "connection reset",
+            "last_disconnected_at": 123.0,
+        }
+    ]
+
+
+def test_record_store_count_does_not_deserialize_records(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api, "_RUNTIME_DIR", tmp_path)
+    store = emullm_api._JsonRecordStore("files")  # noqa: SLF001
+    store.save({"id": "one"})
+    store.save({"id": "two"})
+    (tmp_path / "files" / "broken.json").write_text("not json", encoding="utf-8")
+    (tmp_path / "files" / "payload.bin").write_bytes(b"x")
+
+    assert store.count() == 3
+
+
 def test_concurrency_and_backend_delay_config_apply_live() -> None:
     emullm_api.apply_agent_policies(  # noqa: SLF001
         {
@@ -511,6 +854,43 @@ def test_idle_maintainer_restores_five_ready_workers(monkeypatch) -> None:
         emullm_api.maintain_idle_copilot_workers_once()
     ) == ["worker-copilot-5"]
     assert emullm_api._idle_copilot_worker_count() == 5  # noqa: SLF001
+
+
+def test_idle_maintainer_waits_for_each_new_worker_to_connect(monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api, "_max_concurrent_calls", 50)
+    monkeypatch.setattr(emullm_api, "_idle_worker_target", 5)
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {f"worker-copilot-{index}": FakeWorker() for index in range(1, 5)}
+    )
+    calls: list[str] = []
+
+    async def ensure(
+        _public_model_id,
+        _backing_model,
+        *,
+        require_new=False,
+        warmup=False,
+    ):
+        assert require_new is True
+        assert warmup is True
+        calls.append("worker-copilot-5")
+        if len(calls) > 1:
+            raise AssertionError("maintainer must wait for the first worker to connect")
+        emullm_api._reserve_worker("worker-copilot-5")  # noqa: SLF001
+        return "worker-copilot-5"
+
+    monkeypatch.setattr(emullm_api, "_ensure_on_demand_copilot", ensure)
+
+    assert asyncio.run(
+        emullm_api.maintain_idle_copilot_workers_once()
+    ) == ["worker-copilot-5"]
+    assert calls == ["worker-copilot-5"]
+
+
+def test_async_fleet_handlers_offload_manager_listing() -> None:
+    source = Path(emullm_api.__file__).read_text(encoding="utf-8")
+    assert source.count("instances = await asyncio.to_thread(manager.list)") >= 2
+    assert "instances = await asyncio.to_thread(_copilot_api.manager_status)" in source
 
 
 def test_idle_maintainer_scales_excess_elastic_workers_down(monkeypatch) -> None:
@@ -740,7 +1120,7 @@ def test_backend_wildcard_route_expands_configured_backends(
     ] == ["one"]
 
 
-def test_list_models_includes_simulated_routes_and_backing_model_alias(
+def test_list_models_hides_concrete_backing_alias_but_direct_request_works(
     client: TestClient,
 ) -> None:
     emullm_api._model_routes["vendor/simulated"] = [  # noqa: SLF001
@@ -763,12 +1143,9 @@ def test_list_models_includes_simulated_routes_and_backing_model_alias(
     assert simulated["active_workers"] == ["worker-copilot-1"]
     assert simulated["backing_models"] == {"worker-copilot-1": "gpt-5.6-sol"}
 
-    alias = models["worker-copilot-1/gpt-5.6-sol"]
-    assert alias["worker_id"] == "worker-copilot-1"
-    assert alias["worker_kind"] == "headless-copilot"
-    assert alias["backing_model"] == "gpt-5.6-sol"
-    assert "gpt-5.6-sol" in alias["display_name"]
-    assert client.get("/v1/models/worker-copilot-1/gpt-5.6-sol").json()["id"] == alias["id"]
+    alias_id = "worker-copilot-1/gpt-5.6-sol"
+    assert alias_id not in models
+    assert client.get(f"/v1/models/{alias_id}").status_code == 404
     reply = client.post(
         "/v1/chat/completions",
         json={
@@ -777,7 +1154,7 @@ def test_list_models_includes_simulated_routes_and_backing_model_alias(
         },
     )
     assert reply.status_code == 200
-    assert emullm_api._connected_workers["worker-copilot-1"].sent[-1]["model"] == alias["id"]  # noqa: SLF001
+    assert emullm_api._connected_workers["worker-copilot-1"].sent[-1]["model"] == alias_id  # noqa: SLF001
 
 
 def test_service_catalog_advertises_one_shared_worker_socket(client: TestClient) -> None:
@@ -1044,7 +1421,7 @@ def test_audio_round_robin_tries_unknown_worker_after_capable_worker_rejects(
     assert len(fallback.sent) == 1
 
 
-def test_not_ready_worker_defers_and_route_tries_it_again_later(
+def test_not_ready_worker_moves_to_next_route_without_cross_request_cooldown(
     client: TestClient,
 ) -> None:
     class NotReadyWorker:
@@ -1085,15 +1462,67 @@ def test_not_ready_worker_defers_and_route_tries_it_again_later(
 
     assert first.status_code == second.status_code == 200
     assert first.json()["choices"][0]["message"]["content"] == "fallback completed"
-    assert len(deferred.sent) == 1
+    assert len(deferred.sent) == 2
     assert len(fallback.sent) == 2
-    assert emullm_api._worker_retry_delay("worker-copilot-1") > 0  # noqa: SLF001
+    assert emullm_api._worker_retry_delay("worker-copilot-1") == 0  # noqa: SLF001
     events = client.get(
         "/emullm/websock_to_llm_user/events",
         params={"model": "audio/model", "type": "LLM_NOT_READY"},
     ).json()["events"]
-    assert len(events) == 1
-    assert events[0]["data"]["retry_after"] == 15
+    assert len(events) == 2
+    assert all(event["data"]["reported_retry_after"] == 15 for event in events)
+    assert all(event["data"]["cooldown_applied"] is False for event in events)
+
+
+def test_on_demand_model_moves_to_next_servant_when_primary_is_not_ready(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    async def ensure(_public_model_id, _backing_model):
+        emullm_api._reserve_worker("worker-copilot-6")  # noqa: SLF001
+        return "worker-copilot-6"
+
+    async def relay(worker_id, *_args, **_kwargs):
+        calls.append(worker_id)
+        if worker_id == "worker-copilot-6":
+            emullm_api._begin_worker_request(worker_id, "copilot/test")  # noqa: SLF001
+            emullm_api._end_worker_request(worker_id, "copilot/test")  # noqa: SLF001
+            raise emullm_api._WorkerNotReady(worker_id, "temporary SDK miss", 15)  # noqa: SLF001
+        return {"content": "fallback servant answered"}
+
+    monkeypatch.setattr(emullm_api, "_copilot_backing_model", lambda _model: "test")
+    monkeypatch.setattr(emullm_api, "_ensure_on_demand_copilot", ensure)
+    monkeypatch.setattr(
+        emullm_api,
+        "_route_worker_candidates",
+        lambda *_args, **_kwargs: ["worker-copilot-6", "worker-copilot-7"],
+    )
+    monkeypatch.setattr(emullm_api, "_check_and_record_usage", lambda _worker_id: None)
+    monkeypatch.setattr(emullm_api, "_relay_to_worker", relay)
+
+    result = asyncio.run(emullm_api._relay_full("copilot/test", "hello"))  # noqa: SLF001
+
+    assert result == {"content": "fallback servant answered"}
+    assert calls == ["worker-copilot-6", "worker-copilot-7"]
+    assert emullm_api._worker_retry_delay("worker-copilot-6") == 0  # noqa: SLF001
+
+
+def test_chat_completion_identifies_selected_worker(client: TestClient) -> None:
+    worker = FakeWorker(reply="identified")
+    emullm_api._connected_workers["identified-worker"] = worker  # noqa: SLF001
+    emullm_api._native_worker_ids.add("identified-worker")  # noqa: SLF001
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "identified-worker/same",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-EmuLLM-Worker-ID"] == "identified-worker"
 
 
 def test_required_task_capability_prefers_declared_worker(
@@ -1382,6 +1811,18 @@ def test_worker_websocket_without_model_masks_accepts_all_models(client: TestCli
         assert "all-model-servant" not in emullm_api._worker_model_masks  # noqa: SLF001
 
 
+def test_duplicate_worker_websocket_is_shut_down_without_replacing_first(client: TestClient) -> None:
+    with client.websocket_connect("/emullm/ws?worker_id=unique-servant") as first:
+        assert first.receive_json() == {"type": "hello", "worker_id": "unique-servant"}
+        original = emullm_api._connected_workers["unique-servant"]  # noqa: SLF001
+        with client.websocket_connect("/emullm/ws?worker_id=unique-servant") as duplicate:
+            assert duplicate.receive_json() == {"type": "hello", "worker_id": "unique-servant"}
+            shutdown = duplicate.receive_json()
+            assert shutdown["type"] == "shutdown"
+            assert "already connected" in shutdown["reason"]
+        assert emullm_api._connected_workers["unique-servant"] is original  # noqa: SLF001
+
+
 def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> None:
     with client.websocket_connect("/emullm/ws?worker_id=tracked-servant") as websocket:
         assert websocket.receive_json()["type"] == "hello"
@@ -1391,6 +1832,7 @@ def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> N
                 "role": "test",
                 "worker_kind": "headless-copilot",
                 "runtime_model": "gpt-5.6-sol",
+                "startup_prompt": "Act as a concise resident worker.",
                 "description": "Resident Copilot test servant.",
             }
         )
@@ -1416,6 +1858,53 @@ def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> N
         assert row["last_satisfied_seconds"] is None
         assert row["last_client_work_at"] is None
         assert row["last_client_work_seconds"] is None
+        assert row["log_url"] == "/emullm/admin/websockets/tracked-servant/log"
+        assert row["log_bytes"] > 0
+        assert row["log_limit_bytes"] == 6 * 1024 * 1024
+        log_response = client.get(row["log_url"])
+        assert log_response.status_code == 200
+        log_records = [
+            json.loads(line)
+            for line in log_response.text.splitlines()
+            if line
+        ]
+        assert log_records[0]["record_type"] == "worker_start_prompt"
+        assert log_records[0]["worker_id"] == "tracked-servant"
+        assert log_records[0]["source"] == "worker-registration"
+        assert log_records[0]["from"] == "SYSTEM"
+        assert log_records[0]["sender"] == "SYSTEM"
+        assert "to" not in log_records[0]
+        assert "recipient" not in log_records[0]
+        assert log_records[0]["prompt"] == "Act as a concise resident worker."
+        assert re.fullmatch(
+            r"\d+\.\d{9}",
+            log_records[0]["timestamp_epoch_decimal"],
+        )
+        assert re.fullmatch(
+            r"\d+\.\d{9}",
+            log_records[0]["precision_clock_decimal"],
+        )
+        assert isinstance(log_records[0]["precision_clock_ns"], int)
+        assert log_records[1]["record_type"] == "segment_boundary"
+        assert log_records[1]["segment"] == "first"
+        assert {"lifecycle", "outbound", "inbound"}.issubset(
+            {
+                record["direction"]
+                for record in log_records
+                if "direction" in record
+            }
+        )
+        outbound = next(
+            record for record in log_records if record.get("direction") == "outbound"
+        )
+        inbound = next(
+            record for record in log_records if record.get("direction") == "inbound"
+        )
+        assert outbound["from"] == outbound["sender"] == "EMULLM"
+        assert inbound["from"] == inbound["sender"] == "tracked-servant"
+        for record in (outbound, inbound):
+            assert "to" not in record
+            assert "recipient" not in record
 
         async def satisfy_request() -> dict:
             request_id = "satisfied-request"
@@ -1467,6 +1956,144 @@ def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> N
         assert caps["description"] == "Resident Copilot test servant."
 
     assert client.get("/emullm/admin/websockets").json()["connections"] == []
+    disconnected_log = client.get(
+        "/emullm/admin/websockets/tracked-servant/log"
+    )
+    assert json.loads(disconnected_log.text.splitlines()[-1])["frame"]["type"] == "disconnected"
+
+
+def test_worker_socket_jsonl_preserves_first_and_rotates_two_tail_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(emullm_api, "_socket_worker_log_segment_bytes", 2_048)
+    worker_id = "rotation-worker"
+    connection_id = "ws-rotation"
+    for index in range(20):
+        emullm_api._append_socket_worker_log(  # noqa: SLF001
+            worker_id,
+            connection_id,
+            "outbound",
+            {
+                "type": "request",
+                "id": f"request-{index}",
+                "prompt": f"{index}-" + ("x" * 700),
+                "image_b64": "A" * 10_000,
+            },
+        )
+
+    first, current, previous = emullm_api._socket_log_paths(worker_id)  # noqa: SLF001
+    assert first.is_file()
+    assert current.is_file()
+    assert previous.is_file()
+    assert first.stat().st_size <= 2_048
+    assert current.stat().st_size <= 2_048
+    assert previous.stat().st_size <= 2_048
+    combined = first.read_bytes() + previous.read_bytes() + current.read_bytes()
+    assert len(combined) <= 6_144
+    records = [
+        json.loads(line)
+        for line in combined.decode("utf-8").splitlines()
+        if line
+    ]
+    assert records[0]["frame"]["id"] == "request-0"
+    assert records[-1]["frame"]["id"] == "request-19"
+    assert records[-1]["frame"]["image_b64"] == {
+        "omitted_base64_characters": 10_000
+    }
+    assert re.fullmatch(
+        r"\d+\.\d{9}",
+        records[-1]["timestamp_epoch_decimal"],
+    )
+    assert re.fullmatch(
+        r"\d+\.\d{9}",
+        records[-1]["precision_clock_decimal"],
+    )
+
+
+def test_worker_socket_log_viewer_uses_chat_bubbles_and_manual_scroll(
+    client: TestClient,
+    tmp_path,
+) -> None:
+    image = b"\x89PNG\r\n\x1a\nsocket-image"
+    audio = b"RIFF\x00\x00\x00\x00WAVEsocket-audio"
+    emullm_api._append_socket_worker_log(  # noqa: SLF001
+        "viewer-worker",
+        "ws-viewer",
+        "outbound",
+        {"type": "request", "id": "one", "prompt": "hello"},
+    )
+    emullm_api._append_socket_worker_log(  # noqa: SLF001
+        "viewer-worker",
+        "ws-viewer",
+        "inbound",
+        {
+            "type": "reply",
+            "id": "one",
+            "content": "image",
+            "image_b64": base64.b64encode(image).decode("ascii"),
+            "mime": "image/png",
+        },
+    )
+    emullm_api._append_socket_worker_log(  # noqa: SLF001
+        "viewer-worker",
+        "ws-viewer",
+        "inbound",
+        {
+            "type": "reply",
+            "id": "two",
+            "content": "audio",
+            "audio_b64": base64.b64encode(audio).decode("ascii"),
+            "mime": "audio/wav",
+        },
+    )
+    raw = client.get("/emullm/admin/websockets/viewer-worker/log")
+    records = [
+        json.loads(line) for line in raw.text.splitlines() if line
+    ]
+    media = [
+        item
+        for record in records
+        for item in record.get("media", [])
+    ]
+    assert [item["kind"] for item in media] == ["image", "audio"]
+    assert all(item["available"] is True for item in media)
+    image_response = client.get(media[0]["url"])
+    audio_response = client.get(media[1]["url"])
+    assert image_response.content == image
+    assert image_response.headers["content-type"].startswith("image/png")
+    assert audio_response.content == audio
+    assert audio_response.headers["content-type"].startswith("audio/")
+
+    response = client.get(
+        "/emullm/admin/websockets/viewer-worker/log/view"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "max-width:80%" in response.text
+    assert ".bubble.server" in response.text
+    assert ".bubble.worker" in response.text
+    assert "const speaker = 'from: ' + from" in response.text
+    assert "Autoscroll: on" in response.text
+    assert "['wheel','touchstart','pointerdown']" in response.text
+    assert "setAutoscroll(false)" in response.text
+    assert "messages.addEventListener('scroll'" not in response.text
+    assert "data:image/svg+xml" in response.text
+    assert "Raw JSONL" in response.text
+    assert 'class="media"' in response.text
+    assert '<img src="' in response.text
+    assert "<audio controls preload=" in response.text
+    assert "mediaContent(record)" in response.text
+    scripts = re.findall(r"<script>(.*?)</script>", response.text, flags=re.DOTALL)
+    script_path = tmp_path / "socket-log-viewer.js"
+    script_path.write_text("\n".join(scripts), encoding="utf-8")
+    result = subprocess.run(
+        [shutil.which("node") or "node", "--check", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_unknown_worker_reply_does_not_mark_websocket_satisfied() -> None:
@@ -1782,7 +2409,9 @@ def test_text_endpoints_support_server_sent_event_streams(
     body: dict[str, object],
     expected_marker: str,
 ) -> None:
-    emullm_api._connected_workers["yourself"] = FakeWorker(reply="streamed answer")  # noqa: SLF001
+    emullm_api._connected_workers["worker-copilot-1"] = FakeWorker(  # noqa: SLF001
+        reply="streamed answer"
+    )
 
     response = client.post(path, json=body)
 
@@ -1978,8 +2607,16 @@ def test_mock_workers_simulate_a_set_of_copilots(client: TestClient, monkeypatch
 
     # both pretend copilots show up in /v1/models
     ids = {m["id"] for m in client.get("/v1/models").json()["data"]}
-    assert "alice/same" in ids
-    assert "bob/same" in ids
+    assert {
+        "alice/percent125",
+        "alice/percent100",
+        "alice/percent25",
+        "bob/percent125",
+        "bob/percent100",
+        "bob/percent25",
+    }.issubset(ids)
+    assert "alice/same" not in ids
+    assert "bob/same" not in ids
 
     # each is routed to independently
     a = client.post(
@@ -2225,11 +2862,14 @@ def test_llm_user_interaction_log_is_filterable_over_http_and_websocket(client: 
 
 def test_list_models_aggregates_every_connected_worker(client: TestClient) -> None:
     emullm_api._connected_workers["alice"] = FakeWorker()  # noqa: SLF001
-    emullm_api._worker_models["alice"] = {"same": {"display_name": "(alice)", "instruction": "Be alice."}}
+    emullm_api._worker_models["alice"] = {
+        "expert": {"display_name": "(alice)", "instruction": "Be alice."}
+    }
 
     ids = {entry["id"] for entry in client.get("/v1/models").json()["data"]}
-    assert "alice/same" in ids
-    assert "yourself/same" in ids  # the default identity is always advertised
+    assert "alice/expert" in ids
+    assert "alice/same" not in ids
+    assert not any(model_id.startswith("yourself/") for model_id in ids)
 
 
 def test_worker_caps_lookup(client: TestClient) -> None:
@@ -2386,15 +3026,22 @@ def test_specific_worker_messages_prefix_pins_worker_regardless_of_model_field(c
 
 
 def test_specific_worker_models_listing_is_scoped_to_that_worker(client: TestClient) -> None:
-    emullm_api._worker_models["alice"] = {"same": {"display_name": "(alice)", "instruction": "Be alice."}}
+    emullm_api._worker_models["alice"] = {
+        "percent100": {"display_name": "(alice)", "instruction": "Be alice."}
+    }
 
     data = client.get("/emullm/specific_worker/alice/v1/models").json()["data"]
 
-    assert {entry["id"] for entry in data} == {"alice/same"}
+    assert {entry["id"] for entry in data} == {"alice/percent100"}
 
 
 def test_specific_worker_get_model_and_404(client: TestClient) -> None:
-    assert client.get("/emullm/specific_worker/alice/v1/models/anything/same").status_code == 200
+    assert client.get(
+        "/emullm/specific_worker/alice/v1/models/anything/percent100"
+    ).status_code == 200
+    assert client.get(
+        "/emullm/specific_worker/alice/v1/models/anything/same"
+    ).status_code == 404
     assert client.get("/emullm/specific_worker/alice/v1/models/anything/no-such-suffix").status_code == 404
 
 
@@ -2442,8 +3089,8 @@ def test_embeddings_is_deterministic_without_pretend_capability(client: TestClie
 
 def test_embeddings_pretend_mode_routes_to_the_capable_worker(client: TestClient) -> None:
     worker = FakeWorker(reply="a vector about greetings")
-    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"embeddings": True}
+    emullm_api._connected_workers["worker-copilot-1"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"embeddings": True}
 
     client.post("/v1/embeddings", json={"input": "hello"})
 
@@ -2453,8 +3100,10 @@ def test_embeddings_pretend_mode_routes_to_the_capable_worker(client: TestClient
 
 def test_embeddings_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
     worker = FakeWorker(reply="should never be used")
-    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"embeddings": False}  # explicit decline
+    emullm_api._connected_workers["worker-copilot-1"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {  # explicit decline
+        "embeddings": False
+    }
 
     response = client.post("/v1/embeddings", json={"input": "hello"})
 
@@ -2645,8 +3294,8 @@ def test_moderations_never_flags_without_pretend_capability(client: TestClient) 
 
 
 def test_moderations_pretend_mode_uses_worker_verdict(client: TestClient) -> None:
-    emullm_api._connected_workers["yourself"] = FakeWorker(reply="FLAG")  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"moderations": True}
+    emullm_api._connected_workers["worker-copilot-1"] = FakeWorker(reply="FLAG")  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"moderations": True}
 
     result = client.post("/v1/moderations", json={"input": "anything"}).json()
 
@@ -2655,8 +3304,8 @@ def test_moderations_pretend_mode_uses_worker_verdict(client: TestClient) -> Non
 
 def test_moderations_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
     worker = FakeWorker(reply="should never be used")
-    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"moderations": False}
+    emullm_api._connected_workers["worker-copilot-1"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"moderations": False}
 
     response = client.post("/v1/moderations", json={"input": "anything"})
 
@@ -2678,8 +3327,10 @@ def test_images_generations_returns_stub_url(client: TestClient) -> None:
 
 
 def test_images_generations_pretend_mode_adds_description(client: TestClient) -> None:
-    emullm_api._connected_workers["yourself"] = FakeWorker(reply="a fluffy orange cat")  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"images": True}
+    emullm_api._connected_workers["worker-copilot-1"] = FakeWorker(  # noqa: SLF001
+        reply="a fluffy orange cat"
+    )
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"images": True}
 
     result = client.post("/v1/images/generations", json={"prompt": "a cat"}).json()
 
@@ -2688,8 +3339,8 @@ def test_images_generations_pretend_mode_adds_description(client: TestClient) ->
 
 def test_images_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
     worker = FakeWorker(reply="should never be used")
-    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"images": False}
+    emullm_api._connected_workers["worker-copilot-1"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"images": False}
 
     response = client.post("/v1/images/generations", json={"prompt": "a cat"})
 
@@ -2708,8 +3359,12 @@ def test_audio_transcriptions_is_stub(client: TestClient) -> None:
 
 
 def test_audio_transcriptions_pretend_mode_uses_worker_text(client: TestClient) -> None:
-    emullm_api._connected_workers["yourself"] = FakeWorker(reply="hello there")  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"audio_transcription": True}
+    emullm_api._connected_workers["worker-copilot-1"] = FakeWorker(  # noqa: SLF001
+        reply="hello there"
+    )
+    emullm_api._worker_capabilities["worker-copilot-1"] = {
+        "audio_transcription": True
+    }
 
     result = client.post(
         "/v1/audio/transcriptions",
@@ -2721,8 +3376,10 @@ def test_audio_transcriptions_pretend_mode_uses_worker_text(client: TestClient) 
 
 def test_audio_transcriptions_declined_capability_stops_before_asking_worker(client: TestClient) -> None:
     worker = FakeWorker(reply="should never be used")
-    emullm_api._connected_workers["yourself"] = worker  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"audio_transcription": False}
+    emullm_api._connected_workers["worker-copilot-1"] = worker  # noqa: SLF001
+    emullm_api._worker_capabilities["worker-copilot-1"] = {
+        "audio_transcription": False
+    }
 
     response = client.post(
         "/v1/audio/transcriptions",
@@ -2743,8 +3400,10 @@ def test_audio_speech_returns_valid_synthetic_wav(client: TestClient) -> None:
 
 
 def test_audio_speech_pretend_mode_adds_description(client: TestClient) -> None:
-    emullm_api._connected_workers["yourself"] = FakeWorker(reply="said cheerfully")  # noqa: SLF001
-    emullm_api._worker_capabilities["yourself"] = {"audio_speech": True}
+    emullm_api._connected_workers["worker-copilot-1"] = FakeWorker(  # noqa: SLF001
+        reply="said cheerfully"
+    )
+    emullm_api._worker_capabilities["worker-copilot-1"] = {"audio_speech": True}
 
     result = client.post("/v1/audio/speech", json={"input": "hi"})
 
@@ -3310,6 +3969,103 @@ def test_bulk_stop_idle_pauses_maintenance_and_skips_recently_busy_workers(
     assert "worker-copilot-2" in emullm_api._connected_workers  # noqa: SLF001
 
 
+def test_bulk_restart_runs_workers_in_concurrent_rolling_batches(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    instances = [
+        {
+            "worker_id": f"worker-copilot-{number}",
+            "running": True,
+            "connected": True,
+        }
+        for number in range(1, 10)
+    ]
+
+    class FakeManager:
+        started: list[str] = []
+
+        @staticmethod
+        def list():
+            return instances
+
+        @classmethod
+        def start(cls, worker_id: str):
+            cls.started.append(worker_id)
+            return {"worker_id": worker_id, "started": True}
+
+    active_shutdowns = 0
+    max_shutdowns = 0
+
+    async def shutdown(worker_id: str, _reason: str) -> bool:
+        nonlocal active_shutdowns, max_shutdowns
+        active_shutdowns += 1
+        max_shutdowns = max(max_shutdowns, active_shutdowns)
+        await asyncio.sleep(0.01)
+        active_shutdowns -= 1
+        return True
+
+    async def offline(_manager, _worker_id: str) -> None:
+        return None
+
+    async def connected(_worker_id: str, _timeout_seconds: float = 60.0) -> bool:
+        return True
+
+    monkeypatch.setattr(emullm_api._copilot_api, "get_manager", lambda: FakeManager())  # noqa: SLF001
+    monkeypatch.setattr(emullm_api, "_shutdown_connected_worker", shutdown)
+    monkeypatch.setattr(emullm_api, "_wait_for_managed_worker_offline", offline)
+    monkeypatch.setattr(emullm_api, "_wait_for_connected_worker", connected)
+
+    response = client.post(
+        "/emullm/admin/copilots/bulk/restart",
+        params={"batch_size": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["affected"] == 9
+    assert response.json()["batch_size"] == 4
+    assert response.json()["batches"] == 3
+    assert max_shutdowns == 4
+    assert len(FakeManager.started) == 9
+
+
+def test_admin_health_is_lightweight_and_state_avoids_full_mailbox_reads(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    health = client.get("/emullm/admin/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ready"
+    assert isinstance(health.json()["connected_workers"], int)
+
+    def fail_directory(*_args, **_kwargs):
+        raise AssertionError("admin state must not enumerate mailbox histories")
+
+    monkeypatch.setattr(emullm_api, "_mailbox_directory", fail_directory)
+    state = client.get("/emullm/admin/state")
+    assert state.status_code == 200
+    assert isinstance(state.json()["mailboxes"]["count"], int)
+
+
+def test_mailbox_summary_counts_jsonl_without_deserializing_history(
+    client: TestClient,
+) -> None:
+    path = emullm_api._mailbox_event_log_path("summary-worker")  # noqa: SLF001
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"id":"one","ts":"2026-01-01T00:00:00Z"}\n'
+        "\n"
+        '{"id":"two","ts":"2026-01-02T00:00:00Z"}\n',
+        encoding="utf-8",
+    )
+
+    assert emullm_api._mailbox_event_summary("summary-worker") == (  # noqa: SLF001
+        2,
+        "2026-01-02T00:00:00Z",
+    )
+    assert emullm_api._mailbox_event_count() >= 2  # noqa: SLF001
+
+
 @pytest.mark.parametrize("path", ["/v1/files", "/v1/assistants", "/v1/threads"])
 def test_durable_resource_list_then_create(client: TestClient, path: str) -> None:
     empty = client.get(path).json()
@@ -3592,8 +4348,17 @@ def test_status_pages_render_html(client: TestClient) -> None:
         assert "text/html" in response.headers["content-type"]
         assert "emullm status" in response.text
     # The detail view injects DETAIL = true; the overview injects false.
-    assert "const DETAIL = true" in client.get("/emullm/status/detail").text
-    assert "const DETAIL = false" in client.get("/emullm/status").text
+    detail = client.get("/emullm/status/detail").text
+    overview = client.get("/emullm/status").text
+    assert "const DETAIL = true" in detail
+    assert "const DETAIL = false" in overview
+    for html in (detail, overview):
+        assert 'id="poll-window"' in html
+        assert 'id="poll-hidden"' in html
+        assert 'id="poll-wake"' in html
+        assert "document.addEventListener('visibilitychange'" in html
+        assert "POLL_HIDDEN_MS = 120000" in html
+        assert "setInterval(refresh, 3000)" not in html
 
 
 def test_managed_workers_empty_without_supervisor(client: TestClient) -> None:
@@ -3663,7 +4428,10 @@ def test_config_get_default_is_empty(client: TestClient) -> None:
 
 
 def test_config_put_then_get_round_trip(client: TestClient) -> None:
-    payload = {"config": {"mode": "auto", "workers": [{"id": "w1", "role": "training"}]}}
+    payload = {
+        "config": {"mode": "auto", "workers": [{"id": "w1", "role": "training"}]},
+        "expected_revision": client.get("/admin/emullm/config").json()["revision"],
+    }
     saved = client.put("/admin/emullm/config", json=payload)
     assert saved.status_code == 200
     assert saved.json()["saved"] is True
@@ -3706,9 +4474,10 @@ def test_config_put_accepts_unified_agents(client: TestClient) -> None:
                         "chat": "serve",
                         "images": {"behavior": "error", "description": "not offered"},
                     },
-                }
+                },
             ],
-        }
+        },
+        "expected_revision": client.get("/admin/emullm/config").json()["revision"],
     }
     saved = client.put("/admin/emullm/config", json=payload)
     assert saved.status_code == 200, saved.text
@@ -3721,6 +4490,7 @@ def test_config_schema_endpoint(client: TestClient) -> None:
     assert "agents" in props and "services" in props and "capability_fallback" in props
     assert "headless_copilots" in props
     assert "codex_suppliers" in props
+    assert "anti_idle" in props
     # alias serves the same schema
     assert client.get("/emullm/admin/config/schema").json() == schema
 
@@ -3738,9 +4508,13 @@ def test_config_section_editor_preserves_unrelated_config_and_validates(
         ),
         encoding="utf-8",
     )
+    revision = client.get("/emullm/admin/config").json()["revision"]
     saved = client.put(
         "/emullm/admin/config/section/services",
-        json={"value": {"model": "new", "embeddings": {"fallback": "stub"}}},
+        json={
+            "value": {"model": "new", "embeddings": {"fallback": "stub"}},
+            "expected_revision": revision,
+        },
     )
     assert saved.status_code == 200, saved.text
     assert saved.json()["config"]["mode"] == "recruit,mock"
@@ -3748,18 +4522,277 @@ def test_config_section_editor_preserves_unrelated_config_and_validates(
 
     invalid = client.put(
         "/emullm/admin/config/section/agents",
-        json={"value": {"not": "a list"}},
+        json={
+            "value": {"not": "a list"},
+            "expected_revision": saved.json()["revision"],
+        },
     )
     assert invalid.status_code == 422
     assert client.get("/emullm/admin/config").json()["config"]["services"]["model"] == "new"
 
     deleted = client.put(
         "/admin/emullm/config/section/backends",
-        json={"delete": True},
+        json={"delete": True, "expected_revision": saved.json()["revision"]},
     )
     assert deleted.status_code == 200
     assert "backends" not in deleted.json()["config"]
-    assert client.put("/emullm/admin/config/section/nope", json={"value": {}}).status_code == 404
+    assert client.put(
+        "/emullm/admin/config/section/nope",
+        json={"value": {}, "expected_revision": deleted.json()["revision"]},
+    ).status_code == 404
+
+
+def test_config_section_and_server_settings_updates_are_strict_and_atomic(
+    client: TestClient,
+) -> None:
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "mode": "mock",
+                "services": {"model": "old"},
+                "codex_suppliers": [emullm_api._DEFAULT_CODEX_SUPPLIER],  # noqa: SLF001
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = client.put(
+        "/emullm/admin/config/server-settings",
+        json={
+            "description": "patched",
+            "mode": "recruit,mock",
+            "capability_fallback": "stub",
+            "subagent_model": None,
+            "max_concurrent_calls": 50,
+            "idle_worker_target": 10,
+            "idle_grace_seconds": 120,
+            "backend_fallback_delay_seconds": 5,
+            "validation_interval_default": "never",
+            "validation_interval_override": None,
+            "expected_revision": client.get("/emullm/admin/config").json()[
+                "revision"
+            ],
+        },
+    )
+    assert settings.status_code == 200, settings.text
+    assert settings.json()["config"]["services"] == {"model": "old"}
+    assert settings.json()["config"]["codex_suppliers"][0]["id"] == "copilot"
+
+    malformed = '{"mode": '
+    emullm_api._CONFIG_PATH.write_text(malformed, encoding="utf-8")  # noqa: SLF001
+    section = client.put(
+        "/emullm/admin/config/section/services",
+        json={"value": {"model": "new"}, "expected_revision": "stale"},
+    )
+    assert section.status_code == 409
+    assert emullm_api._CONFIG_PATH.read_text(encoding="utf-8") == malformed  # noqa: SLF001
+
+
+def test_anti_idle_prompt_catalog_can_grow_deprecate_and_aggregate_stats(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anti_idle = emullm_api._copilot_api.AntiIdleConfig()  # noqa: SLF001
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"anti_idle": anti_idle.model_dump(mode="json")}),
+        encoding="utf-8",
+    )
+
+    class Manager:
+        @staticmethod
+        def list():
+            return [
+                {
+                    "worker_id": "worker-fast",
+                    "runtime": {
+                        "keepalive_task_stats": {
+                            "conversation-01": {
+                                "attempts": 2,
+                                "completed": 2,
+                                "slow": 0,
+                                "timeouts": 0,
+                                "total_duration_ms": 1_000,
+                                "min_duration_ms": 400,
+                                "max_duration_ms": 600,
+                            }
+                        },
+                        "retired_keepalive_tasks": [],
+                    }
+                },
+                {
+                    "worker_id": "worker-slow",
+                    "runtime": {
+                        "keepalive_task_stats": {
+                            "conversation-01": {
+                                "attempts": 1,
+                                "completed": 0,
+                                "slow": 1,
+                                "timeouts": 1,
+                                "total_duration_ms": 2_000,
+                                "min_duration_ms": 2_000,
+                                "max_duration_ms": 2_000,
+                            }
+                        },
+                        "retired_keepalive_tasks": ["conversation-01"],
+                    }
+                },
+            ]
+
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: Manager(),
+    )
+    listing = client.get("/emullm/admin/anti-idle").json()
+    assert len(listing["prompts"]) == 50
+    first = listing["prompts"][0]
+    assert first["number"] == 1
+    assert first["attempts"] == 3
+    assert first["average_duration_ms"] == 1_000
+    assert first["min_duration_ms"] == 400
+    assert first["shortest_worker_id"] == "worker-fast"
+    assert first["max_duration_ms"] == 2_000
+    assert first["longest_worker_id"] == "worker-slow"
+    assert first["retired_workers"] == 1
+
+    prompts = listing["config"]["prompts"]
+    prompts[0]["deprecated"] = True
+    prompts.append(
+        {
+            "id": "conversation-51",
+            "prompt": "What kind of request would be fun to answer next?",
+            "deprecated": False,
+        }
+    )
+    saved = client.put(
+        "/emullm/admin/anti-idle",
+        json={
+            "expected_revision": listing["revision"],
+            "config": {
+                "enabled": True,
+                "interval_seconds": 60,
+                "timeout_seconds": 2.5,
+                "slow_budget_seconds": 2,
+                "prompts": prompts,
+            },
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert len(saved.json()["config"]["prompts"]) == 51
+    assert saved.json()["config"]["prompts"][0]["deprecated"] is True
+    assert saved.json()["config"]["interval_seconds"] == 60
+    assert saved.json()["config"]["slow_budget_seconds"] == 2
+
+    stale = client.put(
+        "/emullm/admin/anti-idle",
+        json={
+            "expected_revision": listing["revision"],
+            "config": saved.json()["config"],
+        },
+    )
+    assert stale.status_code == 409
+
+
+def test_anti_idle_enabled_toggle_persists_and_updates_connected_workers(
+    client: TestClient,
+) -> None:
+    class ToggleWorker:
+        messages: list[dict] = []
+
+        async def send_json(self, payload):
+            self.messages.append(payload)
+            await emullm_api._handle_worker_message(  # noqa: SLF001
+                "toggle-worker",
+                {
+                    "type": "anti_idle_changed",
+                    "id": payload["id"],
+                    "enabled": payload["enabled"],
+                },
+            )
+
+    worker = ToggleWorker()
+    emullm_api._connected_workers["toggle-worker"] = worker  # noqa: SLF001
+    listing = client.get("/emullm/admin/anti-idle").json()
+
+    response = client.put(
+        "/emullm/admin/anti-idle/enabled",
+        json={
+            "enabled": False,
+            "expected_revision": listing["revision"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["restart_required"] is False
+    assert response.json()["updated_workers"] == 1
+    assert response.json()["failed_workers"] == 0
+    assert worker.messages[0]["type"] == "set_anti_idle"
+    assert worker.messages[0]["enabled"] is False
+    assert client.get("/emullm/admin/anti-idle").json()["config"]["enabled"] is False
+
+
+def test_reset_anti_idle_stats_clears_offline_worker_files(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manager:
+        cleared: list[str] = []
+
+        @staticmethod
+        def list():
+            return [{"worker_id": "offline-worker", "connected": False}]
+
+        @classmethod
+        def clear_keepalive_stats(cls, worker_id):
+            cls.cleared.append(worker_id)
+            return True
+
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: Manager(),
+    )
+    response = client.post("/emullm/admin/anti-idle/reset-stats")
+    assert response.status_code == 200
+    assert response.json()["reset"] == 1
+    assert Manager.cleared == ["offline-worker"]
+
+
+def test_reset_anti_idle_stats_continues_after_connected_worker_error(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manager:
+        cleared: list[str] = []
+
+        @staticmethod
+        def list():
+            return [
+                {"worker_id": "broken-worker", "connected": True},
+                {"worker_id": "offline-worker", "connected": False},
+            ]
+
+        @classmethod
+        def clear_keepalive_stats(cls, worker_id):
+            cls.cleared.append(worker_id)
+            return True
+
+    async def fail_send(*_args, **_kwargs):
+        raise OSError("disconnected")
+
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: Manager(),
+    )
+    monkeypatch.setattr(emullm_api, "_send_worker_json", fail_send)
+    emullm_api._connected_workers["broken-worker"] = object()  # noqa: SLF001
+
+    response = client.post("/emullm/admin/anti-idle/reset-stats")
+
+    assert response.status_code == 200
+    assert response.json()["reset"] == 1
+    assert response.json()["results"][0]["error"] == "disconnected"
+    assert Manager.cleared == ["offline-worker"]
 
 
 def test_backend_config_page_crud_preserves_proxy_agent_metadata(
@@ -3802,6 +4835,7 @@ def test_backend_config_page_crud_preserves_proxy_agent_metadata(
             "model": "vendor/model",
             "default": True,
             "validation_interval": "1day",
+            "expected_revision": listing["backends"][0]["revision"],
         },
     )
     assert updated.status_code == 200, updated.text
@@ -3832,8 +4866,17 @@ def test_backend_config_page_crud_preserves_proxy_agent_metadata(
         json={"name": "backup", "base_url": "https://duplicate.example/v1"},
     )
     assert duplicate.status_code == 409
+    backup = next(
+        backend
+        for backend in created.json()["backends"]
+        if backend["name"] == "backup"
+    )
     assert client.delete(
-        "/emullm/admin/backends/configured/backends/0"
+        "/emullm/admin/backends/configured/backends/0",
+        params={
+            "expected_name": "backup",
+            "expected_revision": backup["revision"],
+        },
     ).status_code == 200
     assert client.get("/emullm/admin/backends/configured").json()["count"] == 1
 
@@ -3857,6 +4900,9 @@ def test_backend_config_rejects_stale_edits_and_preserves_malformed_file(
         json={
             "name": "renamed",
             "expected_name": "second",
+            "expected_revision": client.get(
+                "/emullm/admin/backends/configured"
+            ).json()["backends"][0]["revision"],
             "base_url": "https://renamed.example/v1",
         },
     )
@@ -3864,6 +4910,22 @@ def test_backend_config_rejects_stale_edits_and_preserves_malformed_file(
     assert json.loads(emullm_api._CONFIG_PATH.read_text(encoding="utf-8"))[  # noqa: SLF001
         "backends"
     ][0]["name"] == "first"
+
+    listing = client.get("/emullm/admin/backends/configured").json()
+    first = listing["backends"][0]
+    persisted = json.loads(emullm_api._CONFIG_PATH.read_text(encoding="utf-8"))  # noqa: SLF001
+    persisted["backends"][0]["model"] = "changed/model"
+    emullm_api._CONFIG_PATH.write_text(json.dumps(persisted), encoding="utf-8")  # noqa: SLF001
+    same_name_stale = client.put(
+        "/emullm/admin/backends/configured/backends/0",
+        json={
+            "name": "first",
+            "expected_name": "first",
+            "expected_revision": first["revision"],
+            "base_url": "https://replacement.example/v1",
+        },
+    )
+    assert same_name_stale.status_code == 409
 
     malformed = '{"backends": ['
     emullm_api._CONFIG_PATH.write_text(malformed, encoding="utf-8")  # noqa: SLF001
@@ -3879,7 +4941,9 @@ def test_codex_supplier_page_defaults_to_copilot_and_supports_crud(
     client: TestClient,
 ) -> None:
     initial = client.get("/emullm/admin/codex-suppliers").json()
-    assert initial["suppliers"] == [emullm_api._DEFAULT_CODEX_SUPPLIER]  # noqa: SLF001
+    assert initial["count"] == 1
+    assert initial["suppliers"][0]["id"] == "copilot"
+    assert initial["suppliers"][0]["revision"]
 
     created = client.post(
         "/emullm/admin/codex-suppliers",
@@ -3893,6 +4957,7 @@ def test_codex_supplier_page_defaults_to_copilot_and_supports_crud(
             "model_patterns": ["codex-*"],
             "base_url": "https://codex.example/v1",
             "api_key_env": "CODEX_API_KEY",
+            "provider_extension": {"region": "test"},
         },
     )
     assert created.status_code == 201, created.text
@@ -3906,11 +4971,34 @@ def test_codex_supplier_page_defaults_to_copilot_and_supports_crud(
     updated = client.put(
         "/emullm/admin/codex-suppliers/copilot",
         json=copilot,
+        params={"expected_revision": initial["suppliers"][0]["revision"]},
     )
     assert updated.status_code == 200
     assert updated.json()["supplier"]["enabled"] is False
+    remote = next(
+        supplier
+        for supplier in updated.json()["suppliers"]
+        if supplier["id"] == "remote-codex"
+    )
+    assert remote["provider_extension"] == {"region": "test"}
+    edited_remote = {
+        key: value
+        for key, value in remote.items()
+        if key not in {"revision", "provider_extension"}
+    }
+    edited_remote["description"] = "edited in known-fields UI"
+    preserved = client.put(
+        "/emullm/admin/codex-suppliers/remote-codex",
+        json=edited_remote,
+        params={"expected_revision": remote["revision"]},
+    )
+    assert preserved.status_code == 200
+    assert preserved.json()["supplier"]["provider_extension"] == {"region": "test"}
     assert client.delete(
-        "/emullm/admin/codex-suppliers/remote-codex"
+        "/emullm/admin/codex-suppliers/remote-codex",
+        params={
+            "expected_revision": preserved.json()["supplier"]["revision"],
+        },
     ).status_code == 200
     assert client.get("/emullm/admin/codex-suppliers").json()["count"] == 1
 
@@ -3986,6 +5074,19 @@ def test_process_controls_reject_embedded_mode(client: TestClient, monkeypatch) 
     assert client.post("/emullm/admin/restart").status_code == 409
 
 
+def test_admin_routes_reject_non_loopback_clients() -> None:
+    app = FastAPI()
+    app.include_router(emullm_api.router)
+    remote = TestClient(app, client=("203.0.113.10", 50000))
+
+    assert remote.get("/emullm/admin/config").status_code == 403
+    assert remote.get("/admin/emullm/backends/configured").status_code == 403
+    assert remote.get("/emullm/admin/copilots").status_code == 403
+    assert remote.put(
+        "/emullm/admin/anti-idle",
+        json={"config": {}, "expected_revision": "irrelevant"},
+    ).status_code == 403
+    assert remote.get("/v1/models").status_code == 200
 def test_carol_enabled_checkbox_api_persists_and_toggles_mock_live(
     client: TestClient,
 ) -> None:
@@ -4038,7 +5139,7 @@ def test_backends_probe_reports_models(client: TestClient, monkeypatch: pytest.M
         json={"config": {"agents": [
             {"kind": "agent", "id": "openai", "launch": "proxy",
              "base_url": "http://backend.test/v1", "model": "gpt-4o-mini", "default": True}
-        ]}},
+        ]}, "expected_revision": client.get("/admin/emullm/config").json()["revision"]},
     )
     result = client.get("/admin/emullm/backends/probe").json()["backends"]
     assert result[0]["ok"] is True
@@ -4050,7 +5151,13 @@ def test_backends_probe_survives_unreachable_backend(client: TestClient, monkeyp
         raise OSError("unreachable")
 
     monkeypatch.setattr(emullm_api, "_http_get_json", boom)
-    client.put("/admin/emullm/config", json={"config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]}})
+    client.put(
+        "/admin/emullm/config",
+        json={
+            "config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]},
+            "expected_revision": client.get("/admin/emullm/config").json()["revision"],
+        },
+    )
     result = client.get("/admin/emullm/backends/probe").json()["backends"]
     assert result[0]["ok"] is False
     assert "error" in result[0]
@@ -4078,7 +5185,13 @@ def test_backends_probe_verify_flags_falsely_advertised(client: TestClient, monk
 
     monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
     monkeypatch.setattr(emullm_api, "_http_post_raw", fake_raw)
-    client.put("/admin/emullm/config", json={"config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]}})
+    client.put(
+        "/admin/emullm/config",
+        json={
+            "config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]},
+            "expected_revision": client.get("/admin/emullm/config").json()["revision"],
+        },
+    )
     b = client.get("/admin/emullm/backends/probe?verify=true").json()["backends"][0]
     assert b["live"] == ["live-model"]
     assert b["falsely_advertised"] == ["dead-model"]
@@ -4100,7 +5213,13 @@ def test_backends_probe_verify_429_is_inconclusive_not_false(client: TestClient,
 
     monkeypatch.setattr(emullm_api, "_http_post_json", always_429)
     monkeypatch.setattr(emullm_api, "_http_post_raw", always_429)
-    client.put("/admin/emullm/config", json={"config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]}})
+    client.put(
+        "/admin/emullm/config",
+        json={
+            "config": {"backends": [{"name": "x", "base_url": "http://x/v1"}]},
+            "expected_revision": client.get("/admin/emullm/config").json()["revision"],
+        },
+    )
     b = client.get("/admin/emullm/backends/probe?verify=true&limit=1").json()["backends"][0]
     # rate-limited is inconclusive, never counted as falsely advertised
     assert b["falsely_advertised"] == []
@@ -4506,6 +5625,12 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     # The page resolves its REST calls relative to wherever it's served.
     html = client.get("/emullm/admin").text
     assert "location.pathname" in html
+    assert 'id="poll-window"' in html
+    assert 'id="poll-hidden"' in html
+    assert 'id="poll-wake"' in html
+    assert "document.addEventListener('visibilitychange'" in html
+    assert "POLL_HIDDEN_MS = 120000" in html
+    assert "setInterval(tick, 3000)" not in html
     assert "PAGE_PATH === '/emullm'" in html
     assert "Headless Copilot servants" in html
     assert 'id="copilot-form"' in html
@@ -4545,6 +5670,9 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     assert "model.display_name || model.name || model.id" in html
     assert "<strong>Native audio:</strong>" in html
     assert 'id="model-configurator"' in html
+    assert "Export in /v1/models" in html
+    assert "getJSON('/v1/models?hidden=true'" in html
+    assert "[unexported]" in html
     assert 'id="model-config-list" size="18" multiple' in html
     assert 'id="model-config-json"' in html
     assert 'id="model-config-route"' in html
@@ -4573,6 +5701,29 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     assert 'id="supplier-rows"' in html
     assert "refreshBackendConfigs" in html
     assert "refreshCodexSuppliers" in html
+    assert "revision: record.revision" in html
+    assert "body.expected_revision = editingBackend.revision" in html
+    assert "editingSupplier = { id: supplier.id, revision: supplier.revision }" in html
+    assert "if (r.ok) await loadConfig();" in html
+    assert 'href="#anti-idle"' in html
+    assert 'id="anti-idle-list"' in html
+    assert 'id="anti-idle-interval"' in html
+    assert 'id="anti-idle-timeout"' in html
+    assert 'id="anti-idle-slow-budget"' in html
+    assert 'id="anti-idle-reset-stats"' in html
+    assert "/anti-idle/enabled" in html
+    assert "applies immediately" in html
+    assert html.count("data-anti-sort=") == 10
+    assert "Shortest / worker" in html
+    assert "Longest / worker" in html
+    assert "Over budget" in html
+    assert "data-anti-deprecated" in html
+    assert "#anti-idle-table { width: max-content; min-width: 100%; }" in html
+    assert "white-space: nowrap" in html
+    assert "antiIdleDuration(prompt.min_duration_ms) + ' · <code>'" in html
+    assert "average_duration_ms" in html
+    assert "deprecated (scheduler skips it)" in html
+    assert "refreshAntiIdle" in html
 
 
 def test_admin_page_javascript_has_valid_syntax(
@@ -4600,7 +5751,8 @@ def test_admin_page_javascript_has_valid_syntax(
     assert 'id="carol-enabled"' in html
     assert 'id="server-settings"' in html
     assert 'id="server-settings-save"' in html
-    assert 'id="server-proxy-url"' in html
+    assert 'id="server-proxy-url"' not in html
+    assert "'/config/server-settings'" in html
     assert 'id="server-max-concurrent"' in html
     assert 'id="server-idle-workers"' in html
     assert 'id="server-idle-grace"' in html
@@ -4608,7 +5760,10 @@ def test_admin_page_javascript_has_valid_syntax(
     assert 'id="top-uptime"' in html
     assert 'id="top-active-count"' in html
     assert 'id="top-waiting-count"' in html
+    assert 'id="top-stuck-count"' in html
     assert 'id="top-served-count"' in html
+    assert 'id="telemetry-alerts"' in html
+    assert "client max " in html
     assert 'id="telemetry-services"' in html
     assert 'id="telemetry-workers"' in html
     assert 'id="telemetry-models"' in html
@@ -4633,9 +5788,20 @@ def test_admin_page_javascript_has_valid_syntax(
 
 def test_admin_rest_works_under_both_prefixes(client: TestClient) -> None:
     # config PUT/GET reachable under both admin namespaces
-    assert client.put("/emullm/admin/config", json={"config": {"mode": "mock"}}).status_code == 200
+    revision = client.get("/emullm/admin/config").json()["revision"]
+    first = client.put(
+        "/emullm/admin/config",
+        json={"config": {"mode": "mock"}, "expected_revision": revision},
+    )
+    assert first.status_code == 200
     assert client.get("/admin/emullm/config").json()["config"] == {"mode": "mock"}
-    assert client.put("/admin/emullm/config", json={"config": {"mode": "auto"}}).status_code == 200
+    assert client.put(
+        "/admin/emullm/config",
+        json={
+            "config": {"mode": "auto"},
+            "expected_revision": first.json()["revision"],
+        },
+    ).status_code == 200
     assert client.get("/emullm/admin/config").json()["config"] == {"mode": "auto"}
     # workers listing reachable under both
     assert client.get("/emullm/admin/workers").status_code == 200

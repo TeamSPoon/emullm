@@ -6,6 +6,7 @@ with a stable session ID. Requests reuse both the process and conversation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -22,7 +23,7 @@ from typing import Any, Callable, Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .supervisor import Supervisor, WorkerSpec
 
@@ -90,6 +91,119 @@ _MODEL_QUALITY_INDEX = {
 }
 _REASONING_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
+DEFAULT_ANTI_IDLE_CONVERSATION_PROMPTS = (
+    "How has your persistent session been since startup?",
+    "How many client requests do you remember servicing this session?",
+    "Which broad request type did you handle most recently?",
+    "Which request type seems most common so far?",
+    "Have you served a plain text chat recently?",
+    "Have you handled a code request recently?",
+    "Have you handled a summary request recently?",
+    "Have you inspected an image recently?",
+    "Have you processed audio recently?",
+    "Have you handled a file attachment recently?",
+    "Have you generated an image recently?",
+    "Have you edited an image recently?",
+    "How many distinct client conversations do you remember?",
+    "Do you remember the last requested model family?",
+    "Was your most recent client task short or long?",
+    "Did your latest client task require tools?",
+    "Have any client tasks been cancelled recently?",
+    "Have you declined any unsupported request recently?",
+    "Have you recovered from a transient not-ready event?",
+    "Is your current context easy to follow?",
+    "Are you ready for another WebSocket request?",
+    "Is the persistent session feeling responsive?",
+    "Which capability would you most like to exercise next?",
+    "What kind of client request is easiest for you?",
+    "What kind of client request needs the most care?",
+    "Have recent requests been mostly creative or analytical?",
+    "Have recent requests been mostly text or multimodal?",
+    "Have you noticed repeated request patterns?",
+    "Can you still recall your role as an EmuLLM worker?",
+    "In one phrase, describe your current workload.",
+    "Tell a one-line joke about WebSockets.",
+    "Tell a tiny joke about an idle worker.",
+    "Tell a one-line joke about APIs.",
+    "Tell a tiny joke about JSON.",
+    "Tell a one-line joke about model routing.",
+    "Tell a tiny joke about latency.",
+    "Tell a one-line joke about context windows.",
+    "Tell a tiny joke about tokens.",
+    "Tell a one-line joke about a server restart.",
+    "Tell a tiny joke about a warm model.",
+    "What makes a client request satisfying to complete?",
+    "Which response format have you used most recently?",
+    "Have you answered any vision questions this session?",
+    "Have you returned any generated artifacts this session?",
+    "Have you seen more user prompts or system instructions?",
+    "Is any harmless detail from recent work worth remembering?",
+    "What should the next client know about your availability?",
+    "Give one short status update as a resident worker.",
+    "In one sentence, summarize how this session is going.",
+    "Say something encouraging to the next client.",
+)
+
+
+class AntiIdlePromptConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    id: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    prompt: str = Field(min_length=1, max_length=1_000)
+    deprecated: bool = False
+
+
+def default_anti_idle_prompts() -> list[AntiIdlePromptConfig]:
+    return [
+        AntiIdlePromptConfig(
+            id=f"conversation-{index:02d}",
+            prompt=prompt,
+        )
+        for index, prompt in enumerate(
+            DEFAULT_ANTI_IDLE_CONVERSATION_PROMPTS,
+            start=1,
+        )
+    ]
+
+
+class AntiIdleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    interval_seconds: float = Field(default=60.0, ge=0.0, le=3_600.0)
+    timeout_seconds: float = Field(default=10.0, ge=0.1, le=10.0)
+    slow_budget_seconds: float = Field(default=8.0, ge=0.1, le=10.0)
+    prompts: list[AntiIdlePromptConfig] = Field(
+        default_factory=default_anti_idle_prompts,
+        min_length=1,
+        max_length=1_000,
+    )
+
+    @field_validator("prompts")
+    @classmethod
+    def _validate_prompts(
+        cls,
+        prompts: list[AntiIdlePromptConfig],
+    ) -> list[AntiIdlePromptConfig]:
+        ids = [prompt.id for prompt in prompts]
+        if len(ids) != len(set(ids)):
+            raise ValueError("anti-idle prompt IDs must be unique")
+        if not any(not prompt.deprecated for prompt in prompts):
+            raise ValueError("at least one anti-idle prompt must remain active")
+        return prompts
+
+    @model_validator(mode="after")
+    def _validate_slow_budget(self) -> "AntiIdleConfig":
+        if self.slow_budget_seconds > self.timeout_seconds:
+            raise ValueError(
+                "slow_budget_seconds cannot exceed timeout_seconds"
+            )
+        return self
+
 
 class HeadlessCopilotConfig(BaseModel):
     """Configuration for one persistent headless Copilot servant."""
@@ -145,20 +259,20 @@ class HeadlessCopilotConfig(BaseModel):
     )
     timeout_seconds: float = Field(default=900.0, ge=1.0, le=86_400.0)
     reconnect_seconds: float = Field(default=2.0, ge=0.1, le=300.0)
-    keepalive_interval_seconds: float = Field(
-        default=40.0,
+    use_shared_anti_idle: bool = True
+    keepalive_interval_seconds: float | None = Field(
+        default=None,
         ge=0.0,
         le=3_600.0,
         description=(
-            "Idle seconds between real text-only Copilot keepalive tasks; "
-            "zero disables anti-idle work."
+            "Optional per-worker anti-idle interval override; zero disables it."
         ),
     )
-    keepalive_timeout_seconds: float = Field(
-        default=3.0,
+    keepalive_timeout_seconds: float | None = Field(
+        default=None,
         ge=0.1,
-        le=3.0,
-        description="Hard maximum duration for one anti-idle model task.",
+        le=10.0,
+        description="Optional per-worker anti-idle task timeout override.",
     )
     context: Literal["default", "long_context"] = "default"
     reasoning_effort: str | None = Field(
@@ -249,6 +363,22 @@ def _read_config_document(path: Path) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise CopilotInstanceError(f"config document '{path}' is not a JSON object")
     return document
+
+
+def read_config_document(path: Path) -> dict[str, Any]:
+    with _CONFIG_IO_LOCK:
+        return _read_config_document(path)
+
+
+def config_document_revision(document: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
 
 
 def write_config_document(path: Path, document: dict[str, Any]) -> None:
@@ -584,6 +714,7 @@ class CopilotInstanceManager:
         self._configs: dict[str, HeadlessCopilotConfig] = {}
         self._supervisor = Supervisor([], spawn=self._spawn)
         generated_session = False
+        migrated_shared_anti_idle = False
 
         for raw_definition in definitions or []:
             if isinstance(raw_definition, HeadlessCopilotConfig):
@@ -591,12 +722,42 @@ class CopilotInstanceManager:
             else:
                 generated_session = generated_session or "session_id" not in raw_definition
                 config = HeadlessCopilotConfig.model_validate(raw_definition)
+                interval = config.keepalive_interval_seconds
+                timeout = config.keepalive_timeout_seconds
+                has_legacy_values = interval is not None or timeout is not None
+                explicitly_shared = "use_shared_anti_idle" in raw_definition
+                known_legacy_defaults = (
+                    interval in (None, 40, 40.0)
+                    and timeout in (None, 3, 3.0)
+                )
+                if has_legacy_values and not explicitly_shared:
+                    if known_legacy_defaults:
+                        config = config.model_copy(
+                            update={
+                                "use_shared_anti_idle": True,
+                                "keepalive_interval_seconds": None,
+                                "keepalive_timeout_seconds": None,
+                            }
+                        )
+                    else:
+                        config = config.model_copy(
+                            update={"use_shared_anti_idle": False}
+                        )
+                    migrated_shared_anti_idle = True
+                elif config.use_shared_anti_idle and has_legacy_values:
+                    config = config.model_copy(
+                        update={
+                            "keepalive_interval_seconds": None,
+                            "keepalive_timeout_seconds": None,
+                        }
+                    )
+                    migrated_shared_anti_idle = True
             if config.worker_id in self._configs:
                 raise ValueError(f"duplicate headless Copilot worker_id '{config.worker_id}'")
             self._configs[config.worker_id] = config
             self._supervisor.add_spec(self._spec_for(config))
 
-        if generated_session:
+        if generated_session or migrated_shared_anti_idle:
             self._persist_locked()
 
     def _instance_dir(self, worker_id: str) -> Path:
@@ -639,6 +800,10 @@ class CopilotInstanceManager:
     def _write_runtime_config(self, config: HeadlessCopilotConfig) -> None:
         instance_dir = self._instance_dir(config.worker_id)
         instance_dir.mkdir(parents=True, exist_ok=True)
+        document = read_config_document(self.config_path)
+        anti_idle = AntiIdleConfig.model_validate(
+            document.get("anti_idle") or {}
+        )
         catalog = list(copilot_models()["models"])
         selected_model = select_copilot_model(config, catalog)
         selected_metadata = next(
@@ -687,6 +852,34 @@ class CopilotInstanceManager:
                     if isinstance(supported_media_types, list)
                     else []
                 ),
+                "keepalive_enabled": (
+                    anti_idle.enabled
+                    if config.use_shared_anti_idle
+                    else bool(config.keepalive_interval_seconds)
+                ),
+                "keepalive_interval_seconds": (
+                    config.keepalive_interval_seconds
+                    if (
+                        not config.use_shared_anti_idle
+                        and config.keepalive_interval_seconds is not None
+                    )
+                    else anti_idle.interval_seconds
+                ),
+                "keepalive_timeout_seconds": (
+                    config.keepalive_timeout_seconds
+                    if (
+                        not config.use_shared_anti_idle
+                        and config.keepalive_timeout_seconds is not None
+                    )
+                    else anti_idle.timeout_seconds
+                ),
+                "keepalive_slow_budget_seconds": (
+                    anti_idle.slow_budget_seconds
+                ),
+                "keepalive_prompts": [
+                    prompt.model_dump(mode="json")
+                    for prompt in anti_idle.prompts
+                ],
                 "host_ws_url": config.host_ws_url or self.default_host_ws_url,
                 "copilot_command": copilot_command,
                 "copilot_runtime_path": resolve_copilot_runtime(config.copilot_command),
@@ -966,6 +1159,22 @@ class CopilotInstanceManager:
             return {}
         return value if isinstance(value, dict) else {}
 
+    def clear_keepalive_stats(self, worker_id: str) -> bool:
+        with self._lock:
+            self._require(worker_id)
+            path = self._runtime_status_path(worker_id)
+            if not path.is_file():
+                return False
+            runtime = self._runtime_status(worker_id)
+            runtime.update(
+                keepalives=0,
+                keepalive_task_stats={},
+                retired_keepalive_tasks=[],
+                keepalive_stats_reset_at=time.time(),
+            )
+            write_config_document(path, runtime)
+            return True
+
     def tail_log(self, worker_id: str, lines: int) -> str:
         with self._lock:
             self._require(worker_id)
@@ -979,11 +1188,20 @@ class CopilotInstanceManager:
 
 
 _manager: CopilotInstanceManager | None = None
+_manager_status_lock = threading.RLock()
+_manager_status_source: object | None = None
+_manager_status_at = 0.0
+_manager_status_cache: list[dict[str, Any]] = []
+_MANAGER_STATUS_CACHE_SECONDS = 0.5
 
 
 def set_manager(manager: CopilotInstanceManager | None) -> None:
-    global _manager
+    global _manager, _manager_status_source, _manager_status_at, _manager_status_cache
     _manager = manager
+    with _manager_status_lock:
+        _manager_status_source = None
+        _manager_status_at = 0.0
+        _manager_status_cache = []
 
 
 def get_manager() -> CopilotInstanceManager | None:
@@ -991,7 +1209,18 @@ def get_manager() -> CopilotInstanceManager | None:
 
 
 def manager_status() -> list[dict[str, Any]]:
-    return _manager.list() if _manager is not None else []
+    global _manager_status_source, _manager_status_at, _manager_status_cache
+    manager = get_manager()
+    if manager is None:
+        return []
+    now = time.monotonic()
+    with _manager_status_lock:
+        if manager is _manager_status_source and now - _manager_status_at < _MANAGER_STATUS_CACHE_SECONDS:
+            return _manager_status_cache
+        _manager_status_cache = manager.list()
+        _manager_status_source = manager
+        _manager_status_at = time.monotonic()
+        return _manager_status_cache
 
 
 def _require_manager() -> CopilotInstanceManager:
@@ -1027,7 +1256,7 @@ def list_copilots() -> dict[str, Any]:
         "copilot_available": command is not None,
         "copilot_command": command,
         "next_worker_id": manager.next_worker_id() if manager else "worker-copilot-1",
-        "instances": manager.list() if manager else [],
+        "instances": manager_status(),
     }
 
 
