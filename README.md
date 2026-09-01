@@ -136,6 +136,8 @@ servant:
 - starts one resident Copilot SDK/CLI runtime and reuses it for every request;
 - reuses one stable session, preserving that servant's conversation across
   OpenAI-compatible API calls;
+- schedules a real text-only anti-idle interaction every 40 seconds by default,
+  rotating 50 bounded micro-tasks so the resident model session stays available;
 - persists its configuration under `headless_copilots` in `config.json`;
 - converts admin-uploaded images, audio, and arbitrary files into native
   Copilot SDK blob attachments;
@@ -149,18 +151,26 @@ API metadata.
 
 Standalone process controls are loopback-only:
 
-- `POST /emullm/admin/restart` gracefully replaces the server and warms all
-  configured servants before they reconnect.
+- `POST /emullm/admin/restart` gracefully replaces the server while preserving
+  connected servant processes when possible; they reconnect to the replacement
+  and only missing autostart workers are launched.
 - `POST /emullm/admin/shutdown` gracefully stops servants and the server.
 
 Embedded mode returns `409` because a plugin must not terminate its host
 Workbench process.
 
-The resident runtime starts before its worker WebSocket is advertised. With
-`warmup: true` (the default), it sends `warmup_prompt` once and waits for the
-answer before connecting, so client traffic does not pay the first-inference
-cost. The admin table shows adapter, SDK bridge, and owned CLI PIDs plus warmup
-and last model-call durations.
+The resident runtime starts before its worker WebSocket is advertised. Warmup is
+role-driven rather than a GUI checkbox: baseline/manual and idle-reserve workers
+send `warmup_prompt` once before connecting; demand replicas skip warmup to
+serve immediately. The admin table shows adapter, SDK bridge, and owned CLI PIDs
+plus warmup and last model-call durations.
+
+Anti-idle tasks never use tools, have a hard maximum of three seconds, and are
+immediately preempted by client work. Each worker/model tracks per-task attempts,
+average/max duration, and timeouts in its runtime status. A task is retired after
+two outcomes at or above two seconds (including timeouts), and model switching
+starts a fresh task ranking. `keepalive_interval_seconds` defaults to `40` and
+accepts any nonnegative interval; `0` disables the scheduler.
 
 The GUI's **Refresh models** button queries the authenticated account through
 Copilot's bundled SDK `models.list` API. When `model` is blank, each servant
@@ -192,11 +202,12 @@ selected model's SDK context metadata and the servant's `default` versus
 `long_context` setting; `chunk_tokens` overrides it, `max_chunks` bounds the
 work, and `max_prompt_chars` remains the absolute request safety limit.
 
-The default **answer-only** security profile gives Copilot an empty tool set,
-disables built-in MCPs, ignores repository instructions, and disables remote
-session access. The GUI's **allow all tools, paths, and URLs** option is
-deliberately marked unsafe because `/v1/*` callers can supply arbitrary
-prompts.
+Servants now default to the explicitly requested **full-access** profile:
+long-prompt chunking, all tools/paths/URLs, repository instructions, and
+built-in MCPs are enabled. Remote session access remains disabled. This is
+deliberately unsafe because `/v1/*` callers can supply arbitrary prompts; edit a
+servant configuration through the API/raw JSON if a restricted profile is
+required.
 
 The same controls are available through REST:
 
@@ -215,6 +226,7 @@ GET    /emullm/admin/copilots/schema
 GET    /emullm/admin/copilots/models
 POST   /emullm/admin/test-chat
 DELETE /emullm/admin/test-chat/{request_id}
+POST   /emullm/admin/copilots/bulk/{start|stop|stop-idle|restart|reset-session}
 ```
 
 For example:
@@ -261,10 +273,13 @@ stable direct alias such as `worker-copilot-1/gpt-5.6-sol`, with worker kind,
 active backing model, description, and backing-model capability metadata.
 It additionally exports every model returned by the authenticated Copilot SDK
 catalog as `copilot/<model-id>` (for example `copilot/gpt-5.6-sol`). Requesting
-one lazily creates or reuses one of four `worker-copilot-5..8` servants pinned to
-that exact backing model. The slots are a bounded cache: a stopped slot may be
-reassigned, while a fifth model returns a clear capacity error if all four are
-running.
+one lazily creates or reuses an elastic `worker-copilot-N` servant pinned to
+that exact backing model. `max_concurrent_calls` defaults to 50 (configurable
+from 4–50), so the four baseline servants can expand through
+`worker-copilot-5..50`. Busy matching models get replicas; idle elastic sessions
+may switch models in place through the SDK's `session.setModel()` while
+preserving conversation history. EMULLM also attempts to keep
+`idle_worker_target` workers idle and connected (default 5).
 
 `emullm/default` is always exported as a stable alias to the current
 `services.model` default (or `yourself/same` when no default is configured).
@@ -295,7 +310,8 @@ Vision input is also inferred from the selected Copilot model's SDK media list.
 The configurator's route shortcuts map literally to `worker-in-name`,
 `worker-copilot-*`, `worker-codex-*`, `worker-unknown-*`, and `backend-*`.
 The first resolves the worker prefix embedded in a model ID; `backend-*`
-round-robins configured named backends. Every worker glob still applies
+round-robins configured named backends, while dynamically rendered checkboxes
+such as `backend-snet` select one named backend. Every worker glob still applies
 capability ordering and excludes explicit opt-outs.
 Capabilities are extensible task tags as well as media flags. Chat requests may
 send `required_capabilities` such as `["code"]` or `["summarization"]`; the
@@ -311,6 +327,14 @@ The same admin page also provides:
   `route_targets`, choose common servant/backend targets, reset the override,
   or proactively load a `copilot/<model-id>` into an on-demand slot. Overrides
   persist in `model_catalog_overrides`, while routes persist in `model_routes`;
+- **Request telemetry** shows active and waiting calls, served/deferred/rejected
+  totals, worker/relayed-backend and team average client time, service-kind timing, and request
+  counts/timing by model. Worker/model tables are sortable, show four rows by
+  default, and have selectable cumulative-total/weighted-average footers.
+  Per-worker and team model-switch counts are included. Backend targets are delayed by
+  `backend_fallback_delay_seconds` (default 5) and used only as a last resort;
+  configured backends such as `backend-snet` remain visible with zero-valued
+  statistics before their first relay.
 - a **Model test client** that combines live, advertised, and explicitly
   routed model IDs while still accepting any free-form model ID; its separate
   dropdown overwrites the text field when selected, it displays live elapsed
@@ -326,11 +350,28 @@ The same admin page also provides:
   resident Copilot runtime ready for the next request;
   the attachment area also includes one-click American-flag, ascending-tone,
   Twinkle melody, and spoken-phrase WAV samples;
+  it also includes an **Image generation test** targeting
+  `copilot/gpt-5.3-codex`. Codex/code-family catalog entries declare the
+  distinct `image_output` capability and can use enabled tools to create a
+  workspace PNG; the test labels worker-generated output separately from the
+  simulated placeholder.
 - an **Enable Carol mock worker** checkbox, persisted immediately to
   `agents[].enabled`;
 - **Connected WebSockets → List / refresh**, covering worker, mailbox, and
   aggregate interaction sockets with endpoint, identity/subscriptions, client
-  address, age, and successful JSON messages in/out.
+  address, connection age, successful JSON messages in/out, and the exact time
+  plus elapsed age of each worker socket's last satisfied interaction and last
+  real client completion;
+- **FastAPI requests**, listing active/recent `/v1/*` requests and logical HTTP
+  client sessions. Clients may send `X-EmuLLM-Client-ID`; otherwise identity is
+  grouped by remote host and User-Agent.
+- **Backends**, a dedicated add/edit/delete page for both direct `backends[]`
+  records and existing `launch: proxy` agents such as `snet`. Editing a proxy
+  preserves its service catalogs and other advanced metadata; inline API keys
+  are write-only on this page.
+- **Codex suppliers**, a dedicated supplier catalog seeded with the enabled
+  `copilot` supplier. Supplier model patterns annotate matching exported Codex
+  models with their configured supplier ID.
 - a validated **Configuration sections** editor for `services`, `agents`,
   `model_routes`, `workers`, `mock_workers`, `backends`, and `mock`. Each
   section saves independently through
@@ -705,9 +746,34 @@ types and per-service fallbacks offline.
 | `services` | object | Server-level catalog: `model` (default) + `models` (advertised list) + per-service `{ fallback, description }` entries overriding `capability_fallback`. |
 | `agents` | list | The unified answerer list (below); set `enabled: false` to retain but disable an entry. |
 | `headless_copilots` | list | Persistent-session Copilot CLI servants managed live through the admin GUI/API. |
+| `codex_suppliers` | list | Codex model/worker provider declarations. The working config enables GitHub Copilot with `worker-copilot-*`, `copilot/`, and `*codex*` mappings. |
 | `subagent_launch` | string / argv | Worker type for discovered subagents (`copilot`/`worker`/`recruit`/argv). |
 | `model_routes` | object | Model ID to one worker ID or an ordered list of worker-ID globs and OpenAI-compatible backend URLs. |
 | `model_catalog_overrides` | object | Per-exported-model `{ hidden, patch }` merge overrides written by the Models configurator. |
+| `max_concurrent_calls` | integer | Maximum simultaneous worker/backend calls, 4–50 (default 50). |
+| `idle_worker_target` | integer | Desired number of connected zero-load Copilot workers (default 5). |
+| `idle_grace_seconds` | number | A zero-load worker remains recently busy and cannot be stopped/model-switched until this many seconds elapse (default 30). |
+| `backend_fallback_delay_seconds` | number | Intentional delay before the first last-resort backend target (default 5 seconds). |
+
+Each `headless_copilots` entry also accepts
+`keepalive_interval_seconds` (default `40`, `0` disables) and
+`keepalive_timeout_seconds` (default and hard maximum `3`). Keepalive results do
+not enter client request telemetry; they only refresh the socket's satisfied
+interaction clock.
+
+Backend CRUD is available at `GET/POST
+/emullm/admin/backends/configured` and `PUT/DELETE
+/emullm/admin/backends/configured/{source}/{index}`. Codex supplier CRUD is
+available at `GET/POST /emullm/admin/codex-suppliers` and `PUT/DELETE
+/emullm/admin/codex-suppliers/{supplier_id}`.
+
+Image generation uses `POST /v1/images/generations` with JSON
+`{model,prompt,n,size,response_format}`. Masked edits use multipart
+`POST /v1/images/edits` with required `image` and `prompt`, optional `mask`,
+plus `model`, `n`, `size`, and `response_format`. Both return
+`data[].artifact = {source,file_id,url,mime_type,bytes}` alongside the
+OpenAI-compatible `url`/`b64_json`; edits also return neutralized
+`inputs.image`, optional `inputs.mask`, and `inputs.size` provenance.
 
 **Agents.** Each entry is one answerer -- `kind: "agent"` with a `launch`
 type. It carries a user-facing `description`, an optional `observe` (what

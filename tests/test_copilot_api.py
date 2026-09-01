@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import sys
+import time
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -16,9 +17,12 @@ from fastapi.testclient import TestClient
 from emullm import copilot_api, copilot_servant
 from emullm.copilot_servant import (
     CopilotInvocationError,
+    KEEPALIVE_TASKS,
     ServantRuntimeConfig,
     build_prompt,
+    handle_keepalive,
     handle_request,
+    keepalive_prompt,
     registration_payload,
 )
 
@@ -90,6 +94,7 @@ def test_resident_bridge_maps_session_and_security_configuration(tmp_path) -> No
     assert str(config.session_id)
     assert "client.resumeSession(config.session_id" in bridge
     assert "session.sendAndWait" in bridge
+    assert "session.setModel" in bridge
     assert "attachments: Array.isArray(message.attachments)" in bridge
     assert "availableTools: config.allow_all ? undefined : []" in bridge
     assert "onPermissionRequest: config.allow_all ? approveAll : undefined" in bridge
@@ -116,6 +121,26 @@ def test_build_prompt_rejects_oversized_input(tmp_path) -> None:
     config = runtime_config(tmp_path, max_prompt_chars=1000)
     with pytest.raises(CopilotInvocationError, match="configured maximum"):
         build_prompt(config, {"prompt": "x" * 2000})
+
+
+def test_image_file_reply_reads_only_workspace_images(tmp_path) -> None:
+    config = runtime_config(tmp_path)
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nworker-image")
+
+    reply = copilot_servant.image_file_reply(
+        config,
+        "EMULLM_IMAGE_FILE: generated.png",
+    )
+
+    assert reply is not None
+    assert reply["mime"] == "image/png"
+    assert base64.b64decode(reply["image_b64"]) == image_path.read_bytes()
+    with pytest.raises(CopilotInvocationError, match="outside"):
+        copilot_servant.image_file_reply(
+            config,
+            "EMULLM_IMAGE_FILE: ../outside.png",
+        )
 
 
 def test_empty_model_masks_are_omitted_from_registration_to_mean_all_models(tmp_path) -> None:
@@ -155,7 +180,11 @@ def test_manager_persists_and_controls_instances(tmp_path) -> None:
         runtime_dir=tmp_path / "runtime",
         base_dir=tmp_path,
         default_host_ws_url="ws://127.0.0.1:8801",
-        connected=lambda worker_id: worker_id == "copilot-one",
+        connected=lambda worker_id: (
+            worker_id == "copilot-one"
+            and bool(processes)
+            and processes[-1]._alive
+        ),
         spawn=spawn,
     )
     config = copilot_api.HeadlessCopilotConfig(
@@ -250,6 +279,19 @@ def test_app_lifespan_autostarts_configured_headless_copilot(tmp_path, monkeypat
     monkeypatch.setattr(api_module, "_CONFIG_PATH", config_path)
     monkeypatch.setattr(api_module, "_RUNTIME_DIR", tmp_path / "runtime")
     monkeypatch.setattr(copilot_api.subprocess, "Popen", lambda *args, **kwargs: FakeProc(8181))
+    monkeypatch.setattr(
+        copilot_api,
+        "copilot_models",
+        lambda **_kwargs: {
+            "models": [
+                {
+                    "id": "gpt-5-mini",
+                    "name": "GPT-5 mini",
+                    "capabilities": {},
+                }
+            ]
+        },
+    )
 
     with TestClient(app_module.app) as client:
         listing = client.get("/emullm/admin/copilots").json()
@@ -273,11 +315,32 @@ class FakeRunner:
     def __init__(self, config: ServantRuntimeConfig, result: str | Exception) -> None:
         self.config = config
         self.result = result
+        self.requests: list[dict] = []
+        self.keepalive_results: list[dict] = []
 
-    async def run(self, _request):
+    async def run(self, request):
+        self.requests.append(request)
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+    def record_keepalive_result(
+        self,
+        prompt_index,
+        duration_seconds,
+        *,
+        completed,
+        timed_out=False,
+    ):
+        self.keepalive_results.append(
+            {
+                "prompt_index": prompt_index,
+                "duration_seconds": duration_seconds,
+                "completed": completed,
+                "timed_out": timed_out,
+            }
+        )
+        return False
 
 
 def test_request_handler_accepts_then_replies_or_rejects(tmp_path) -> None:
@@ -354,6 +417,114 @@ def test_request_handler_accepts_then_replies_or_rejects(tmp_path) -> None:
     ]
 
 
+def test_keepalive_pool_has_fifty_unique_bounded_text_tasks() -> None:
+    assert len(KEEPALIVE_TASKS) == 50
+    assert len(set(KEEPALIVE_TASKS)) == 50
+    assert keepalive_prompt(50) == keepalive_prompt(0)
+    assert all("tool" not in task.lower() for task in KEEPALIVE_TASKS)
+    assert all(len(task) < 100 for task in KEEPALIVE_TASKS)
+
+
+def test_keepalive_handler_reports_success_without_client_reply(tmp_path) -> None:
+    runner = FakeRunner(runtime_config(tmp_path), "steady")
+    websocket = FakeWebSocket()
+
+    asyncio.run(handle_keepalive(websocket, runner, "keepalive-1", 0))
+
+    assert runner.requests[0]["kind"] == "keepalive"
+    assert "Persistent-session keepalive 1/50" in runner.requests[0]["prompt"]
+    assert runner.keepalive_results[0]["completed"] is True
+    assert websocket.messages[0]["type"] == "keepalive_reply"
+    assert websocket.messages[0]["content"] == "steady"
+    assert websocket.messages[0]["prompt_index"] == 0
+    assert websocket.messages[0]["retired"] is False
+    assert websocket.messages[0]["duration_ms"] < 3_000
+
+
+def test_keepalive_handler_aborts_at_configured_timeout(tmp_path) -> None:
+    class SlowRunner(FakeRunner):
+        async def run(self, request):
+            self.requests.append(request)
+            await asyncio.sleep(10)
+            return "late"
+
+    runner = SlowRunner(
+        runtime_config(tmp_path, keepalive_timeout_seconds=0.1),
+        "late",
+    )
+    websocket = FakeWebSocket()
+
+    started = time.monotonic()
+    asyncio.run(handle_keepalive(websocket, runner, "keepalive-slow", 1))
+
+    assert time.monotonic() - started < 1
+    assert runner.keepalive_results[0]["timed_out"] is True
+    assert websocket.messages[0]["type"] == "keepalive_error"
+    assert websocket.messages[0]["retired"] is False
+
+
+def test_slow_keepalive_task_is_retired_and_persisted(tmp_path) -> None:
+    config = runtime_config(tmp_path)
+    runner = copilot_servant.CopilotRunner(config)
+
+    assert runner.record_keepalive_result(0, 2.1, completed=True) is False
+    assert runner.record_keepalive_result(
+        0,
+        3.0,
+        completed=False,
+        timed_out=True,
+    ) is True
+    assert runner.next_keepalive_task(0) == 1
+
+    restored = copilot_servant.CopilotRunner(config)
+    assert restored.next_keepalive_task(0) == 1
+    status = json.loads(Path(config.runtime_status_path).read_text(encoding="utf-8"))
+    assert status["retired_keepalive_tasks"] == [0]
+    assert status["keepalive_task_stats"]["0"]["slow"] == 2
+
+
+def test_fast_keepalive_resets_slow_streak_and_pool_never_exhausts(tmp_path) -> None:
+    runner = copilot_servant.CopilotRunner(runtime_config(tmp_path))
+
+    runner.record_keepalive_result(0, 2.1, completed=True)
+    runner.record_keepalive_result(0, 0.1, completed=True)
+    assert runner.record_keepalive_result(0, 2.2, completed=True) is False
+    assert runner.next_keepalive_task(0) == 0
+
+    for prompt_index in range(len(KEEPALIVE_TASKS)):
+        runner.record_keepalive_result(prompt_index, 2.1, completed=True)
+        runner.record_keepalive_result(prompt_index, 2.2, completed=True)
+
+    assert len(runner._retired_keepalive_tasks) == len(KEEPALIVE_TASKS) - 1  # noqa: SLF001
+    assert runner.next_keepalive_task(0) is not None
+
+
+def test_request_handler_returns_generated_image_for_edits(tmp_path) -> None:
+    image = b"\x89PNG\r\n\x1a\nEDITED"
+    (tmp_path / "emullm-generated-image.png").write_bytes(image)
+    websocket = FakeWebSocket()
+    asyncio.run(
+        handle_request(
+            websocket,
+            FakeRunner(
+                runtime_config(tmp_path),
+                "EMULLM_IMAGE_FILE: emullm-generated-image.png",
+            ),
+            {
+                "type": "request",
+                "id": "image-edit",
+                "kind": "image_edit",
+                "prompt": "edit",
+            },
+        )
+    )
+    assert websocket.messages[0] == {"type": "accept", "id": "image-edit"}
+    reply = websocket.messages[1]
+    assert reply["type"] == "reply"
+    assert base64.b64decode(reply["image_b64"]) == image
+    assert reply["mime"] == "image/png"
+
+
 class FakeBridgeProcess:
     def __init__(self, *, hold_requests: bool = False) -> None:
         self.pid = 9191
@@ -428,6 +599,17 @@ class _FakeBridgeStdin:
                     ).encode()
                     + b"\n"
                 )
+            elif message["type"] == "set_model":
+                self.process.output.put_nowait(
+                    json.dumps(
+                        {
+                            "type": "model_changed",
+                            "id": message["id"],
+                            "model": message["model"],
+                        }
+                    ).encode()
+                    + b"\n"
+                )
             elif message["type"] == "shutdown":
                 self.process.returncode = 0
                 self.process.done.set()
@@ -439,6 +621,40 @@ class _AttachmentResponse(BytesIO):
 
     def __exit__(self, *args):
         self.close()
+
+
+def test_runner_switches_models_without_restarting_bridge(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    process = None
+
+    async def create_process(*args, **kwargs):
+        nonlocal process
+        process = FakeBridgeProcess()
+        return process
+
+    monkeypatch.setattr(copilot_servant.asyncio, "create_subprocess_exec", create_process)
+
+    async def scenario() -> None:
+        runner = copilot_servant.CopilotRunner(runtime_config(tmp_path))
+        assert await runner.set_model("claude-sonnet-5") is True
+        assert await runner.set_model("claude-sonnet-5") is False
+        assert runner.config.selected_model == "claude-sonnet-5"
+        assert process is not None
+        switches = [
+            message for message in process.messages if message["type"] == "set_model"
+        ]
+        assert len(switches) == 1
+        assert switches[0]["model"] == "claude-sonnet-5"
+        status = json.loads(
+            (tmp_path / "runtime-status.json").read_text(encoding="utf-8")
+        )
+        assert status["model"] == "claude-sonnet-5"
+        assert status["model_switches"] == 1
+        await runner.close()
+
+    asyncio.run(scenario())
 
 
 def test_runner_fetches_cloud_attachment_as_native_sdk_blob(
@@ -644,9 +860,38 @@ def test_cancelling_runner_aborts_request_but_keeps_bridge_alive(tmp_path, monke
         assert process is not None
         assert process.terminated is False
         assert [message["type"] for message in process.messages] == ["request", "cancel"]
+        process.hold_requests = False
+        assert await runner.run(
+            {
+                "id": "after-cancel",
+                "model": "demo/model",
+                "kind": "chat",
+                "prompt": "next",
+            }
+        ) == "answer-after-cancel"
         await runner.close()
 
     asyncio.run(scenario())
+
+
+def test_atomic_config_updates_do_not_lose_concurrent_writes(tmp_path) -> None:
+    import concurrent.futures
+
+    path = tmp_path / "config.json"
+    path.write_text('{"values":[]}', encoding="utf-8")
+
+    def append_value(value: int) -> None:
+        copilot_api.update_config_document(
+            path,
+            lambda document: document["values"].append(value),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(append_value, range(50)))
+
+    assert sorted(json.loads(path.read_text(encoding="utf-8"))["values"]) == list(
+        range(50)
+    )
 
 
 def test_model_catalog_is_cached_and_refreshable(monkeypatch) -> None:
@@ -796,6 +1041,46 @@ def test_next_worker_id_fills_first_available_number(tmp_path) -> None:
     assert manager.next_worker_id() == "worker-copilot-2"
 
 
+def test_next_worker_id_skips_reserved_elastic_range(tmp_path) -> None:
+    manager = copilot_api.CopilotInstanceManager(
+        config_path=tmp_path / "config.json",
+        runtime_dir=tmp_path / "runtime",
+        base_dir=tmp_path,
+        default_host_ws_url="ws://127.0.0.1:8801",
+        definitions=[
+            {"worker_id": f"worker-copilot-{index}", "model": "gpt-5-mini"}
+            for index in range(1, 5)
+        ],
+        spawn=lambda _spec: FakeProc(),
+    )
+    assert manager.next_worker_id() == "worker-copilot-51"
+
+
+def test_manager_adopts_reconnected_worker_without_duplicate_spawn(tmp_path) -> None:
+    manager = copilot_api.CopilotInstanceManager(
+        config_path=tmp_path / "config.json",
+        runtime_dir=tmp_path / "runtime",
+        base_dir=tmp_path,
+        default_host_ws_url="ws://127.0.0.1:8801",
+        definitions=[
+            {
+                "worker_id": "worker-copilot-1",
+                "model": "gpt-5-mini",
+                "autostart": True,
+            }
+        ],
+        connected=lambda worker_id: worker_id == "worker-copilot-1",
+        spawn=lambda _spec: (_ for _ in ()).throw(
+            AssertionError("reconnected worker must not be spawned again")
+        ),
+    )
+    assert manager.start_autostart() == []
+    status = manager.get("worker-copilot-1")
+    assert status["running"] is True
+    assert status["connected"] is True
+    assert status["external"] is True
+
+
 def test_spawn_strips_host_agent_session_from_servant_environment(tmp_path, monkeypatch) -> None:
     captured = {}
 
@@ -836,6 +1121,10 @@ def test_windows_copilot_shim_resolves_to_sdk_runtime_entrypoint(tmp_path) -> No
 
 def test_default_config_includes_random_model_headless_copilot_one() -> None:
     config = json.loads((Path(__file__).parents[1] / "config.json").read_text(encoding="utf-8"))
+    assert config["max_concurrent_calls"] == 50
+    assert 0 <= config["idle_worker_target"] <= config["max_concurrent_calls"]
+    assert 0 <= config["idle_grace_seconds"] <= 3_600
+    assert config["backend_fallback_delay_seconds"] == 5
     instances = config["headless_copilots"]
     assert instances
     instance = next(item for item in instances if item["worker_id"] == "worker-copilot-1")
@@ -846,7 +1135,12 @@ def test_default_config_includes_random_model_headless_copilot_one() -> None:
     assert all(item["warmup_prompt"] for item in instances)
     assert all(item["model_selector"] == "random" for item in instances)
     assert all(item["chunk_long_prompts"] is True for item in instances)
+    assert all(item["allow_all"] is True for item in instances)
+    assert all(item["load_custom_instructions"] is True for item in instances)
+    assert all(item["enable_builtin_mcps"] is True for item in instances)
     assert all(item["max_prompt_chars"] == 4_000_000 for item in instances)
+    assert all(item.get("keepalive_interval_seconds", 40) == 40 for item in instances)
+    assert all(item.get("keepalive_timeout_seconds", 3) <= 3 for item in instances)
     assert isinstance(instance["allow_all"], bool)
     assert instance["modelmasks"] == []
     assert not instance.get("model")

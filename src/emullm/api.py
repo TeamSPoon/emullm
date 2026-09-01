@@ -153,12 +153,14 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.datastructures import UploadFile
 
 from . import copilot_api as _copilot_api
@@ -166,7 +168,39 @@ from . import process_control as _process_control
 from .test_media import test_media_samples
 from . import supervisor as _sup
 
-router = APIRouter()
+
+class _ClientTrackingRoute(APIRoute):
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def tracked(request: Request) -> Response:
+            if not request.url.path.startswith("/v1/"):
+                return await original(request)
+            request_token = _begin_openai_client_request(request)
+            try:
+                response = await original(request)
+            except BaseException as error:
+                _finish_openai_client_request(
+                    request_token,
+                    int(getattr(error, "status_code", 500)),
+                )
+                raise
+            finalize = BackgroundTask(
+                _finish_openai_client_request,
+                request_token,
+                response.status_code,
+            )
+            response.background = (
+                BackgroundTasks([finalize, response.background])
+                if response.background is not None
+                else finalize
+            )
+            return response
+
+        return tracked
+
+
+router = APIRouter(route_class=_ClientTrackingRoute)
 
 _REQUEST_TIMEOUT_SECONDS = 900  # generous -- a human/agent may take a while to reply
 
@@ -705,15 +739,51 @@ _native_worker_ids: set[str] = set()
 _worker_lock = asyncio.Lock()
 _pending: dict[str, "asyncio.Future[Any]"] = {}
 _pending_models: dict[str, str] = {}
+_pending_worker_controls: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
 _worker_not_ready_until: dict[str, float] = {}
+_worker_inflight: dict[str, int] = {}
+_worker_reservations: dict[str, int] = {}
+_model_inflight: dict[str, int] = {}
+_worker_last_busy_at: dict[str, float] = {}
+_worker_load_lock = threading.RLock()
+_worker_service_stats: dict[str, dict[str, dict[str, float | int]]] = {}
+_model_service_stats: dict[str, dict[str, dict[str, float | int]]] = {}
+_active_service_requests: dict[str, dict[str, str]] = {}
+_waiting_for_worker: dict[str, dict[str, Any]] = {}
+_waiting_for_worker_lock = threading.RLock()
 _admin_test_tasks: dict[str, "asyncio.Task[Any]"] = {}
 _active_websockets: dict[str, dict[str, Any]] = {}
 _active_websockets_lock = threading.RLock()
 _worker_connection_ids: dict[str, str] = {}
+_openai_clients: dict[str, dict[str, Any]] = {}
+_openai_requests: dict[str, dict[str, Any]] = {}
+_openai_clients_lock = threading.RLock()
+_MAX_OPENAI_CLIENTS = 500
+_MAX_OPENAI_REQUESTS = 500
 _ON_DEMAND_COPILOT_PREFIX = "worker-copilot-"
 _ON_DEMAND_COPILOT_START = 5
-_MAX_ON_DEMAND_COPILOTS = 4
+_BASELINE_COPILOT_WORKERS = 4
+_MAX_CONCURRENT_CALLS_LIMIT = 50
+_DEFAULT_MAX_CONCURRENT_CALLS = max(
+    _BASELINE_COPILOT_WORKERS,
+    min(
+        _MAX_CONCURRENT_CALLS_LIMIT,
+        int(os.environ.get("EMULLM_MAX_CONCURRENT_CALLS", "50")),
+    ),
+)
+_max_concurrent_calls = _DEFAULT_MAX_CONCURRENT_CALLS
+_DEFAULT_IDLE_WORKER_TARGET = 5
+_idle_worker_target = _DEFAULT_IDLE_WORKER_TARGET
+_DEFAULT_IDLE_GRACE_SECONDS = 30.0
+_idle_grace_seconds = _DEFAULT_IDLE_GRACE_SECONDS
+_DEFAULT_BACKEND_FALLBACK_DELAY_SECONDS = 5.0
+_backend_fallback_delay_seconds = _DEFAULT_BACKEND_FALLBACK_DELAY_SECONDS
+_idle_maintenance_paused = False
 _on_demand_copilot_lock = threading.RLock()
+
+
+def _on_demand_copilot_limit() -> int:
+    return max(0, _max_concurrent_calls - _BASELINE_COPILOT_WORKERS)
 
 
 def _on_demand_copilot_ids() -> list[str]:
@@ -721,13 +791,20 @@ def _on_demand_copilot_ids() -> list[str]:
         f"{_ON_DEMAND_COPILOT_PREFIX}{index}"
         for index in range(
             _ON_DEMAND_COPILOT_START,
-            _ON_DEMAND_COPILOT_START + _MAX_ON_DEMAND_COPILOTS,
+            _ON_DEMAND_COPILOT_START + _on_demand_copilot_limit(),
         )
     ]
 
 
 def _is_on_demand_copilot(worker_id: str) -> bool:
     return worker_id in _on_demand_copilot_ids()
+
+
+def _is_elastic_copilot(worker_id: str) -> bool:
+    if not worker_id.startswith(_ON_DEMAND_COPILOT_PREFIX):
+        return False
+    suffix = worker_id[len(_ON_DEMAND_COPILOT_PREFIX) :]
+    return suffix.isdigit() and int(suffix) >= _ON_DEMAND_COPILOT_START
 
 
 def _register_active_websocket(
@@ -747,6 +824,11 @@ def _register_active_websocket(
             ),
             "connected_at": _now_iso(),
             "connected_at_epoch": time.time(),
+            "last_satisfied_at": None,
+            "last_satisfied_at_epoch": None,
+            "last_satisfied_kind": None,
+            "last_client_work_at": None,
+            "last_client_work_at_epoch": None,
             "messages_in": 0,
             "messages_out": 0,
             **metadata,
@@ -773,6 +855,31 @@ def _increment_active_websocket(connection_id: str | None, field: str) -> None:
             _active_websockets[connection_id][field] += 1
 
 
+def _mark_active_websocket_satisfied(
+    connection_id: str | None,
+    *,
+    kind: str,
+    client_work: bool = False,
+) -> None:
+    if connection_id is None:
+        return
+    now = time.time()
+    updates = {
+        "last_satisfied_at": _now_iso(),
+        "last_satisfied_at_epoch": now,
+        "last_satisfied_kind": kind,
+    }
+    if client_work:
+        updates.update(
+            last_client_work_at=updates["last_satisfied_at"],
+            last_client_work_at_epoch=now,
+        )
+    _update_active_websocket(
+        connection_id,
+        **updates,
+    )
+
+
 async def _tracked_ws_send_json(
     websocket: WebSocket, connection_id: str, payload: Any
 ) -> None:
@@ -793,10 +900,229 @@ def _active_websocket_rows() -> list[dict[str, Any]]:
     with _active_websockets_lock:
         rows = []
         for value in _active_websockets.values():
-            row = {key: item for key, item in value.items() if key != "connected_at_epoch"}
+            row = {
+                key: item
+                for key, item in value.items()
+                if not key.endswith("_epoch")
+            }
             row["connected_seconds"] = round(now - float(value["connected_at_epoch"]), 1)
+            satisfied_at = value.get("last_satisfied_at_epoch")
+            row["last_satisfied_seconds"] = (
+                round(max(0.0, now - float(satisfied_at)), 1)
+                if satisfied_at is not None
+                else None
+            )
+            client_work_at = value.get("last_client_work_at_epoch")
+            row["last_client_work_seconds"] = (
+                round(max(0.0, now - float(client_work_at)), 1)
+                if client_work_at is not None
+                else None
+            )
             rows.append(row)
     return sorted(rows, key=lambda row: (row["kind"], row["endpoint"], row["connection_id"]))
+
+
+def _openai_client_key(request: Request) -> tuple[str, str, str | None, str]:
+    client = request.client
+    host = client.host if client is not None else "unknown"
+    declared_id = (
+        request.headers.get("x-emullm-client-id")
+        or request.headers.get("x-client-id")
+        or request.headers.get("x-session-id")
+    )
+    declared_id = declared_id.strip()[:200] if declared_id else None
+    user_agent = (request.headers.get("user-agent") or "unknown").strip()[:500]
+    identity = f"id:{declared_id}" if declared_id else f"agent:{user_agent}"
+    digest = hashlib.sha256(f"{host}\0{identity}".encode("utf-8")).hexdigest()[:16]
+    return f"client-{digest}", host, declared_id, user_agent
+
+
+def _begin_openai_client_request(
+    request: Request,
+) -> tuple[str | None, str | None]:
+    now = time.time()
+    timestamp = _now_iso()
+    client_id, host, declared_id, user_agent = _openai_client_key(request)
+    client = request.client
+    with _openai_clients_lock:
+        if client_id not in _openai_clients and len(_openai_clients) >= _MAX_OPENAI_CLIENTS:
+            inactive = [
+                (key, value)
+                for key, value in _openai_clients.items()
+                if not value["active_requests"]
+            ]
+            if inactive:
+                oldest, _ = min(
+                    inactive,
+                    key=lambda item: float(item[1]["last_seen_at_epoch"]),
+                )
+                _openai_clients.pop(oldest, None)
+            else:
+                return None, None
+        row = _openai_clients.setdefault(
+            client_id,
+            {
+                "client_id": client_id,
+                "host": host,
+                "declared_id": declared_id,
+                "user_agent": user_agent,
+                "first_seen_at": timestamp,
+                "first_seen_at_epoch": now,
+                "last_seen_at": timestamp,
+                "last_seen_at_epoch": now,
+                "last_completed_at": None,
+                "last_completed_at_epoch": None,
+                "active_requests": 0,
+                "requests": 0,
+                "last_status": None,
+                "last_endpoint": request.url.path,
+                "last_method": request.method,
+                "last_port": client.port if client is not None else None,
+            },
+        )
+        row.update(
+            host=host,
+            declared_id=declared_id,
+            user_agent=user_agent,
+            last_seen_at=timestamp,
+            last_seen_at_epoch=now,
+            last_endpoint=request.url.path,
+            last_method=request.method,
+            last_port=client.port if client is not None else None,
+        )
+        row["active_requests"] += 1
+        row["requests"] += 1
+        request_id: str | None = None
+        if len(_openai_requests) >= _MAX_OPENAI_REQUESTS:
+            completed = [
+                (key, value)
+                for key, value in _openai_requests.items()
+                if not value["active"]
+            ]
+            if completed:
+                oldest, _ = min(
+                    completed,
+                    key=lambda item: float(item[1]["started_at_epoch"]),
+                )
+                _openai_requests.pop(oldest, None)
+        if len(_openai_requests) < _MAX_OPENAI_REQUESTS:
+            request_id = f"http-{uuid.uuid4().hex[:16]}"
+            _openai_requests[request_id] = {
+                "request_id": request_id,
+                "external_request_id": (
+                    request.headers.get("x-request-id")
+                    or request.headers.get("openai-request-id")
+                ),
+                "client_id": client_id,
+                "declared_client_id": declared_id,
+                "host": host,
+                "user_agent": user_agent,
+                "method": request.method,
+                "endpoint": request.url.path,
+                "started_at": timestamp,
+                "started_at_epoch": now,
+                "completed_at": None,
+                "completed_at_epoch": None,
+                "duration_seconds": None,
+                "status": None,
+                "active": True,
+            }
+    return client_id, request_id
+
+
+def _finish_openai_client_request(
+    request_token: tuple[str | None, str | None],
+    status_code: int,
+) -> None:
+    client_id, request_id = request_token
+    if client_id is None:
+        return
+    now = time.time()
+    with _openai_clients_lock:
+        row = _openai_clients.get(client_id)
+        if row is None:
+            return
+        row["active_requests"] = max(0, int(row["active_requests"]) - 1)
+        row["last_completed_at"] = _now_iso()
+        row["last_completed_at_epoch"] = now
+        row["last_status"] = status_code
+        request_row = (
+            _openai_requests.get(request_id)
+            if request_id is not None
+            else None
+        )
+        if request_row is not None:
+            request_row["completed_at"] = _now_iso()
+            request_row["completed_at_epoch"] = now
+            request_row["duration_seconds"] = round(
+                max(0.0, now - float(request_row["started_at_epoch"])),
+                3,
+            )
+            request_row["status"] = status_code
+            request_row["active"] = False
+
+
+def _openai_client_rows() -> list[dict[str, Any]]:
+    now = time.time()
+    with _openai_clients_lock:
+        rows = []
+        for value in _openai_clients.values():
+            row = {
+                key: item
+                for key, item in value.items()
+                if not key.endswith("_epoch")
+            }
+            row["first_seen_seconds"] = round(
+                max(0.0, now - float(value["first_seen_at_epoch"])),
+                1,
+            )
+            row["last_seen_seconds"] = round(
+                max(0.0, now - float(value["last_seen_at_epoch"])),
+                1,
+            )
+            completed_at = value.get("last_completed_at_epoch")
+            row["last_completed_seconds"] = (
+                round(max(0.0, now - float(completed_at)), 1)
+                if completed_at is not None
+                else None
+            )
+            row["connected"] = bool(row["active_requests"])
+            rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (
+            not row["connected"],
+            float(row["last_seen_seconds"]),
+            row["client_id"],
+        ),
+    )
+
+
+def _openai_request_rows() -> list[dict[str, Any]]:
+    now = time.time()
+    with _openai_clients_lock:
+        sortable_rows = []
+        for value in _openai_requests.values():
+            row = {
+                key: item
+                for key, item in value.items()
+                if not key.endswith("_epoch")
+            }
+            row["age_seconds"] = round(
+                max(0.0, now - float(value["started_at_epoch"])),
+                1,
+            )
+            if row["active"]:
+                row["duration_seconds"] = row["age_seconds"]
+            sortable_rows.append((float(value["started_at_epoch"]), row))
+    sortable_rows.sort(
+        key=lambda item: (
+            not item[1]["active"],
+            -item[0],
+            item[1]["request_id"],
+        )
+    )
+    return [row for _, row in sortable_rows]
 
 # Each worker declares its OWN model list on connect (see the websocket
 # handshake below): a dict of suffix -> {"display_name", "instruction"}.
@@ -808,6 +1134,7 @@ _worker_models: dict[str, dict[str, dict[str, Any]]] = {}
 _worker_kinds: dict[str, str] = {}
 _worker_runtime_models: dict[str, str] = {}
 _worker_descriptions: dict[str, str] = {}
+_worker_model_switch_stats: dict[str, dict[str, Any]] = {}
 
 # A worker can ALSO opt in, at register time, to "pretending" for the
 # non-text stub surfaces below (embeddings/moderations/images/audio) --
@@ -915,6 +1242,361 @@ def _new_automatic_worker_id() -> str:
             return worker_id
 
 
+def _worker_load(worker_id: str) -> int:
+    with _worker_load_lock:
+        return (
+            _worker_inflight.get(worker_id, 0)
+            + _worker_reservations.get(worker_id, 0)
+        )
+
+
+def _reserve_worker(worker_id: str) -> None:
+    with _worker_load_lock:
+        total = sum(_worker_inflight.values()) + sum(_worker_reservations.values())
+        if total >= _max_concurrent_calls:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"maximum simultaneous call limit "
+                    f"({_max_concurrent_calls}) reached"
+                ),
+                headers={"Retry-After": "1"},
+            )
+        _worker_reservations[worker_id] = (
+            _worker_reservations.get(worker_id, 0) + 1
+        )
+
+
+def _begin_worker_request(worker_id: str, model: str) -> None:
+    with _worker_load_lock:
+        reservations = _worker_reservations.get(worker_id, 0)
+        if reservations > 0:
+            if reservations == 1:
+                _worker_reservations.pop(worker_id, None)
+            else:
+                _worker_reservations[worker_id] = reservations - 1
+        else:
+            total = sum(_worker_inflight.values()) + sum(
+                _worker_reservations.values()
+            )
+            if total >= _max_concurrent_calls:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"maximum simultaneous call limit "
+                        f"({_max_concurrent_calls}) reached"
+                    ),
+                    headers={"Retry-After": "1"},
+                )
+        _worker_inflight[worker_id] = _worker_inflight.get(worker_id, 0) + 1
+        _model_inflight[model] = _model_inflight.get(model, 0) + 1
+
+
+def _end_worker_request(worker_id: str, model: str) -> None:
+    with _worker_load_lock:
+        inflight = _worker_inflight.get(worker_id, 0)
+        if inflight <= 1:
+            _worker_inflight.pop(worker_id, None)
+        else:
+            _worker_inflight[worker_id] = inflight - 1
+        model_inflight = _model_inflight.get(model, 0)
+        if model_inflight <= 1:
+            _model_inflight.pop(model, None)
+        else:
+            _model_inflight[model] = model_inflight - 1
+        _worker_last_busy_at[worker_id] = time.monotonic()
+
+
+def _release_worker_reservation(worker_id: str) -> None:
+    with _worker_load_lock:
+        reservations = _worker_reservations.get(worker_id, 0)
+        if reservations <= 1:
+            _worker_reservations.pop(worker_id, None)
+        else:
+            _worker_reservations[worker_id] = reservations - 1
+
+
+def _worker_is_idle(worker_id: str) -> bool:
+    if _worker_load(worker_id) > 0:
+        return False
+    last_busy = _worker_last_busy_at.get(worker_id)
+    return (
+        last_busy is None
+        or time.monotonic() - last_busy >= _idle_grace_seconds
+    )
+
+
+def _mark_waiting_for_worker(
+    wait_id: str,
+    worker_id: str,
+    model: str,
+    reason: str,
+) -> None:
+    with _waiting_for_worker_lock:
+        _waiting_for_worker.setdefault(
+            wait_id,
+            {
+                "id": wait_id,
+                "worker_id": worker_id,
+                "model": model,
+                "reason": reason,
+                "started_at": time.time(),
+            },
+        )
+
+
+def _clear_waiting_for_worker(wait_id: str) -> None:
+    with _waiting_for_worker_lock:
+        _waiting_for_worker.pop(wait_id, None)
+
+
+def _waiting_for_worker_snapshot() -> list[dict[str, Any]]:
+    now = time.time()
+    with _waiting_for_worker_lock:
+        return [
+            {
+                **entry,
+                "waiting_seconds": round(
+                    max(0.0, now - float(entry["started_at"])),
+                    3,
+                ),
+            }
+            for entry in _waiting_for_worker.values()
+        ]
+
+
+def _record_worker_service(
+    worker_id: str,
+    model: str,
+    service_kind: str,
+    duration_seconds: float,
+    outcome: str,
+) -> None:
+    with _worker_load_lock:
+        worker = _worker_service_stats.setdefault(worker_id, {})
+        stats = worker.setdefault(
+            service_kind,
+            {
+                "attempts": 0,
+                "served": 0,
+                "failed": 0,
+                "rejected": 0,
+                "deferred": 0,
+                "cancelled": 0,
+                "total_seconds": 0.0,
+            },
+        )
+        stats["attempts"] = int(stats["attempts"]) + 1
+        key = outcome if outcome in stats else "failed"
+        stats[key] = int(stats[key]) + 1
+        stats["total_seconds"] = (
+            float(stats["total_seconds"]) + duration_seconds
+        )
+        model_services = _model_service_stats.setdefault(model, {})
+        model_stats = model_services.setdefault(
+            service_kind,
+            {
+                "attempts": 0,
+                "served": 0,
+                "failed": 0,
+                "rejected": 0,
+                "deferred": 0,
+                "cancelled": 0,
+                "total_seconds": 0.0,
+            },
+        )
+        model_stats["attempts"] = int(model_stats["attempts"]) + 1
+        model_stats[key] = int(model_stats[key]) + 1
+        model_stats["total_seconds"] = (
+            float(model_stats["total_seconds"]) + duration_seconds
+        )
+
+
+def _service_stats_snapshot() -> tuple[dict[str, Any], dict[str, Any]]:
+    workers: dict[str, Any] = {}
+    team_services: dict[str, dict[str, float | int]] = {}
+    with _worker_load_lock:
+        for worker_id, service_map in _worker_service_stats.items():
+            worker_services: dict[str, Any] = {}
+            for service_kind, values in service_map.items():
+                stats = dict(values)
+                attempts = int(stats["attempts"])
+                stats["average_seconds"] = round(
+                    float(stats["total_seconds"]) / attempts,
+                    3,
+                ) if attempts else 0.0
+                stats["total_seconds"] = round(
+                    float(stats["total_seconds"]),
+                    3,
+                )
+                worker_services[service_kind] = stats
+                team = team_services.setdefault(
+                    service_kind,
+                    {
+                        "attempts": 0,
+                        "served": 0,
+                        "failed": 0,
+                        "rejected": 0,
+                        "deferred": 0,
+                        "cancelled": 0,
+                        "total_seconds": 0.0,
+                    },
+                )
+                for key in (
+                    "attempts",
+                    "served",
+                    "failed",
+                    "rejected",
+                    "deferred",
+                    "cancelled",
+                ):
+                    team[key] = int(team[key]) + int(stats[key])
+                team["total_seconds"] = (
+                    float(team["total_seconds"])
+                    + float(stats["total_seconds"])
+                )
+            workers[worker_id] = {
+                "kind": (
+                    "backend"
+                    if worker_id.startswith("backend-")
+                    else _worker_kinds.get(worker_id, "worker")
+                ),
+                "active": _worker_inflight.get(worker_id, 0),
+                "reserved": _worker_reservations.get(worker_id, 0),
+                "services": worker_services,
+            }
+        for worker_id in (
+            set(_worker_inflight)
+            | set(_worker_reservations)
+            | set(_worker_model_switch_stats)
+        ):
+            workers.setdefault(
+                worker_id,
+                {
+                    "kind": (
+                        "backend"
+                        if worker_id.startswith("backend-")
+                        else _worker_kinds.get(worker_id, "worker")
+                    ),
+                    "active": _worker_inflight.get(worker_id, 0),
+                    "reserved": _worker_reservations.get(worker_id, 0),
+                    "services": {},
+                },
+            )
+        for service_kind, stats in team_services.items():
+            attempts = int(stats["attempts"])
+            stats["average_seconds"] = round(
+                float(stats["total_seconds"]) / attempts,
+                3,
+            ) if attempts else 0.0
+            stats["total_seconds"] = round(
+                float(stats["total_seconds"]),
+                3,
+            )
+        for metadata in _active_service_requests.values():
+            service_kind = metadata["service_kind"]
+            stats = team_services.setdefault(
+                service_kind,
+                {
+                    "attempts": 0,
+                    "served": 0,
+                    "failed": 0,
+                    "rejected": 0,
+                    "deferred": 0,
+                    "cancelled": 0,
+                    "total_seconds": 0.0,
+                    "average_seconds": 0.0,
+                },
+            )
+            stats["active"] = int(stats.get("active", 0)) + 1
+        for stats in team_services.values():
+            stats.setdefault("active", 0)
+    models: dict[str, Any] = {}
+    with _worker_load_lock:
+        for model, service_map in _model_service_stats.items():
+            model_services: dict[str, Any] = {}
+            totals = {
+                key: 0
+                for key in (
+                    "attempts",
+                    "served",
+                    "failed",
+                    "rejected",
+                    "deferred",
+                    "cancelled",
+                )
+            }
+            total_seconds = 0.0
+            for service_kind, values in service_map.items():
+                stats = dict(values)
+                attempts = int(stats["attempts"])
+                stats["average_seconds"] = round(
+                    float(stats["total_seconds"]) / attempts,
+                    3,
+                ) if attempts else 0.0
+                stats["total_seconds"] = round(
+                    float(stats["total_seconds"]),
+                    3,
+                )
+                model_services[service_kind] = stats
+                for key in totals:
+                    totals[key] += int(stats[key])
+                total_seconds += float(stats["total_seconds"])
+            totals["total_seconds"] = round(total_seconds, 3)
+            totals["average_seconds"] = round(
+                total_seconds / totals["attempts"],
+                3,
+            ) if totals["attempts"] else 0.0
+            models[model] = {
+                "active": _model_inflight.get(model, 0),
+                "totals": totals,
+                "services": model_services,
+            }
+        for model, active in _model_inflight.items():
+            models.setdefault(
+                model,
+                {
+                    "active": active,
+                    "totals": {
+                        "attempts": 0,
+                        "served": 0,
+                        "failed": 0,
+                        "rejected": 0,
+                        "deferred": 0,
+                        "cancelled": 0,
+                        "total_seconds": 0.0,
+                        "average_seconds": 0.0,
+                    },
+                    "services": {},
+                },
+            )
+
+    team_totals = {
+        key: sum(int(stats[key]) for stats in team_services.values())
+        for key in (
+            "attempts",
+            "served",
+            "failed",
+            "rejected",
+            "deferred",
+            "cancelled",
+        )
+    }
+    team_total_seconds = sum(
+        float(stats["total_seconds"]) for stats in team_services.values()
+    )
+    team_totals["total_seconds"] = round(team_total_seconds, 3)
+    team_totals["average_seconds"] = round(
+        team_total_seconds / team_totals["attempts"],
+        3,
+    ) if team_totals["attempts"] else 0.0
+    return workers, {
+        "totals": team_totals,
+        "services": team_services,
+        "models": models,
+    }
+
+
 def _worker_retry_delay(worker_id: str) -> float:
     retry_at = _worker_not_ready_until.get(worker_id)
     if retry_at is None:
@@ -940,7 +1622,7 @@ def _capability_ordered_workers(
         if _worker_ready_for_offer(worker_id)
     ]
     if not required_capabilities:
-        return worker_ids
+        return sorted(worker_ids, key=_worker_load)
     capable: list[str] = []
     unknown: list[str] = []
     for worker_id in worker_ids:
@@ -952,6 +1634,8 @@ def _capability_ordered_workers(
             capable.append(worker_id)
         else:
             unknown.append(worker_id)
+    capable.sort(key=_worker_load)
+    unknown.sort(key=_worker_load)
     return capable + unknown
 
 
@@ -1162,7 +1846,10 @@ def _agent_model_list(agent: dict[str, Any]) -> list[Any]:
 
 def clear_agent_policies() -> None:
     """Reset all config-derived per-agent/service policy (used on shutdown)."""
-    global _server_description, _advertised_default, _validation_interval, _validation_interval_override
+    global _server_description, _advertised_default, _validation_interval
+    global _validation_interval_override, _max_concurrent_calls
+    global _idle_worker_target, _idle_grace_seconds
+    global _backend_fallback_delay_seconds
     _worker_service_behavior.clear()
     _service_fallback.clear()
     _observers.clear()
@@ -1176,6 +1863,10 @@ def clear_agent_policies() -> None:
     _model_catalog_overrides.clear()
     _validation_interval = _DEFAULT_VALIDATION_INTERVAL
     _validation_interval_override = None
+    _max_concurrent_calls = _DEFAULT_MAX_CONCURRENT_CALLS
+    _idle_worker_target = _DEFAULT_IDLE_WORKER_TARGET
+    _idle_grace_seconds = _DEFAULT_IDLE_GRACE_SECONDS
+    _backend_fallback_delay_seconds = _DEFAULT_BACKEND_FALLBACK_DELAY_SECONDS
     # note: _model_fetch_cache intentionally NOT cleared -- it's a daily cache
     # that should survive config reloads.
 
@@ -1184,7 +1875,10 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
     """Populate per-agent service behaviors, observers, and user-facing
     descriptions from a config's ``agents`` list and server-level
     ``services`` / ``description``. Clears any prior policy first."""
-    global _server_description, _advertised_default, _validation_interval, _validation_interval_override
+    global _server_description, _advertised_default, _validation_interval
+    global _validation_interval_override, _max_concurrent_calls
+    global _idle_worker_target, _idle_grace_seconds
+    global _backend_fallback_delay_seconds
     clear_agent_policies()
     if not isinstance(config, dict):
         return
@@ -1193,6 +1887,29 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
             _validation_interval = config[_k]
             break
     _validation_interval_override = config.get("validation_interval_override")
+    if config.get("max_concurrent_calls") is not None:
+        _max_concurrent_calls = max(
+            _BASELINE_COPILOT_WORKERS,
+            min(
+                _MAX_CONCURRENT_CALLS_LIMIT,
+                int(config["max_concurrent_calls"]),
+            ),
+        )
+    if config.get("idle_worker_target") is not None:
+        _idle_worker_target = max(
+            0,
+            min(_max_concurrent_calls, int(config["idle_worker_target"])),
+        )
+    if config.get("idle_grace_seconds") is not None:
+        _idle_grace_seconds = max(
+            0.0,
+            min(3600.0, float(config["idle_grace_seconds"])),
+        )
+    if config.get("backend_fallback_delay_seconds") is not None:
+        _backend_fallback_delay_seconds = max(
+            0.0,
+            min(300.0, float(config["backend_fallback_delay_seconds"])),
+        )
     if isinstance(config.get("description"), str):
         _server_description = config["description"]
     model_overrides = config.get("model_catalog_overrides")
@@ -2367,6 +3084,14 @@ def _copilot_task_capabilities(
             "enabled": code_implied,
             "status": "model_name_implied" if code_implied else "not_advertised",
         },
+        "image_generation": {
+            "enabled": code_implied,
+            "status": "tool_generated" if code_implied else "not_advertised",
+        },
+        "image_output": {
+            "enabled": code_implied,
+            "status": "tool_generated" if code_implied else "not_advertised",
+        },
         "summarization": {
             "enabled": model_type in (None, "chat"),
             "status": "general_chat_capability",
@@ -2376,9 +3101,19 @@ def _copilot_task_capabilities(
 
 def _copilot_catalog_model_entry(metadata: dict[str, Any]) -> dict[str, Any]:
     backing_model = str(metadata["id"])
+    task_capabilities = _copilot_task_capabilities(
+        backing_model,
+        metadata,
+    )
+    codex_supplier = _codex_supplier_for_model(backing_model)
+    image_output = bool(
+        task_capabilities["image_output"]["enabled"]
+    )
     public_model_id = _copilot_public_model_id(backing_model)
     route = _model_routes.get(public_model_id)
     route_targets = [route] if isinstance(route, str) else list(route or [])
+    elastic_limit = _on_demand_copilot_limit()
+    elastic_end = _ON_DEMAND_COPILOT_START + elastic_limit - 1
     active_workers = sorted(
         worker_id
         for worker_id, runtime_model in _worker_runtime_models.items()
@@ -2393,9 +3128,9 @@ def _copilot_catalog_model_entry(metadata: dict[str, Any]) -> dict[str, Any]:
         "description": (
             f"Authenticated GitHub Copilot backing model '{backing_model}'. "
             f"Requesting this ID lazily starts or reuses one of "
-            f"{_MAX_ON_DEMAND_COPILOTS} workers "
+            f"{elastic_limit} elastic workers "
             f"({_ON_DEMAND_COPILOT_PREFIX}{_ON_DEMAND_COPILOT_START}.."
-            f"{_ON_DEMAND_COPILOT_START + _MAX_ON_DEMAND_COPILOTS - 1})."
+            f"{elastic_end})."
         ),
         "context_length": (
             limits.get("max_context_window_tokens", 200000)
@@ -2405,6 +3140,9 @@ def _copilot_catalog_model_entry(metadata: dict[str, Any]) -> dict[str, Any]:
         "supported_parameters": ["messages", "temperature", "stream"],
         "owned_by": "github-copilot",
         "provider": "github-copilot",
+        "codex_supplier": (
+            codex_supplier.get("id") if codex_supplier is not None else None
+        ),
         "backing_model": backing_model,
         "connected": bool(active_workers),
         "active_workers": active_workers,
@@ -2413,7 +3151,8 @@ def _copilot_catalog_model_entry(metadata: dict[str, Any]) -> dict[str, Any]:
         "on_demand": True,
         "on_demand_worker_prefix": _ON_DEMAND_COPILOT_PREFIX,
         "on_demand_worker_start": _ON_DEMAND_COPILOT_START,
-        "on_demand_worker_limit": _MAX_ON_DEMAND_COPILOTS,
+        "on_demand_worker_limit": elastic_limit,
+        "max_concurrent_calls": _max_concurrent_calls,
         "simulated": False,
         "capabilities": capabilities or {},
         "billing": metadata.get("billing", {}),
@@ -2425,10 +3164,15 @@ def _copilot_catalog_model_entry(metadata: dict[str, Any]) -> dict[str, Any]:
             metadata,
             active_workers,
         ),
-        "task_capabilities": _copilot_task_capabilities(
-            backing_model,
-            metadata,
-        ),
+        "task_capabilities": task_capabilities,
+        "output_modalities": {
+            "image": {
+                "enabled": image_output,
+                "capability": "image_output",
+                "status": "tool_generated" if image_output else "not_advertised",
+                "media_types": ["image/png"] if image_output else [],
+            }
+        },
     }
 
 
@@ -2742,6 +3486,40 @@ def _route_backend_candidates(target: str) -> list[dict[str, Any]]:
     return [by_name[name] for name in rotated_names]
 
 
+async def _proxy_chat_with_stats(
+    backend: dict[str, Any],
+    model: str,
+    prompt_text: str,
+    instruction: str | None,
+    service_kind: str,
+) -> str:
+    backend_id = f"backend-{backend.get('name') or 'proxy'}"
+    _begin_worker_request(backend_id, model)
+    started = time.monotonic()
+    outcome = "failed"
+    try:
+        reply = await _proxy_chat(
+            backend,
+            model,
+            prompt_text,
+            instruction,
+        )
+        outcome = "served"
+        return reply
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    finally:
+        _record_worker_service(
+            backend_id,
+            model,
+            service_kind,
+            max(0.0, time.monotonic() - started),
+            outcome,
+        )
+        _end_worker_request(backend_id, model)
+
+
 def _required_input_capabilities(extra: dict[str, Any] | None) -> set[str]:
     required: set[str] = set()
     explicit = extra.get("required_capabilities") if extra else None
@@ -2777,7 +3555,7 @@ def _route_worker_candidates(
         for worker_id in _connected_workers
         if fnmatchcase(worker_id, target)
         if _worker_ready_for_offer(worker_id)
-        if not _is_on_demand_copilot(worker_id)
+        if not _is_elastic_copilot(worker_id)
         or requested_backing is None
         or _worker_runtime_models.get(worker_id) == requested_backing
     )
@@ -2789,6 +3567,22 @@ def _route_worker_candidates(
     return _capability_ordered_workers(rotated, required_capabilities)
 
 
+async def _wait_before_backend_fallback(model: str, target: str) -> None:
+    if _backend_fallback_delay_seconds <= 0:
+        return
+    wait_id = f"backend-delay-{uuid.uuid4().hex}"
+    _mark_waiting_for_worker(
+        wait_id,
+        target,
+        model,
+        "waiting before last-resort backend fallback",
+    )
+    try:
+        await asyncio.sleep(_backend_fallback_delay_seconds)
+    finally:
+        _clear_waiting_for_worker(wait_id)
+
+
 async def _relay_model_route_chain(
     model: str,
     targets: list[str],
@@ -2798,9 +3592,17 @@ async def _relay_model_route_chain(
     """Try worker-ID globs and OpenAI-compatible backend URLs in order."""
     instruction = f"You are serving model id '{model}'. Emulate that model faithfully."
     required_capabilities = _required_input_capabilities(extra)
+    service_kind = str((extra or {}).get("kind") or "chat")
     failures: list[str] = []
     retry_delays: list[float] = []
+    backend_delay_complete = False
     for target in targets:
+        is_backend = target.startswith(
+            ("http://", "https://", "backend-")
+        )
+        if is_backend and not backend_delay_complete:
+            await _wait_before_backend_fallback(model, target)
+            backend_delay_complete = True
         if target.startswith("backend-"):
             backend_candidates = _route_backend_candidates(target)
             if not backend_candidates:
@@ -2809,11 +3611,12 @@ async def _relay_model_route_chain(
             for backend in backend_candidates:
                 backend_name = str(backend.get("name") or target)
                 try:
-                    reply = await _proxy_chat(
+                    reply = await _proxy_chat_with_stats(
                         backend,
                         model,
                         prompt_text,
                         instruction,
+                        service_kind,
                     )
                 except HTTPException as error:
                     failures.append(f"backend-{backend_name}: {error.detail}")
@@ -2828,7 +3631,13 @@ async def _relay_model_route_chain(
             continue
         if target.startswith(("http://", "https://")):
             try:
-                reply = await _proxy_chat(_route_backend(target), model, prompt_text, instruction)
+                reply = await _proxy_chat_with_stats(
+                    _route_backend(target),
+                    model,
+                    prompt_text,
+                    instruction,
+                    service_kind,
+                )
             except HTTPException as error:
                 failures.append(f"{target}: {error.detail}")
                 continue
@@ -2836,6 +3645,14 @@ async def _relay_model_route_chain(
             return reply
 
         candidates = _route_worker_candidates(model, target, required_capabilities)
+        if target == "worker-copilot-*":
+            replica = await _elastic_replica_for_busy_workers(
+                model,
+                candidates,
+                required_capabilities,
+            )
+            if replica is not None:
+                candidates = [replica, *candidates]
         if not candidates:
             failures.append(f"{target}: no connected worker matched")
             continue
@@ -2860,6 +3677,7 @@ async def _relay_model_route_chain(
                 failures.append(f"{worker_id}: {error.reason}")
                 continue
             except HTTPException as error:
+                _release_worker_reservation(worker_id)
                 failures.append(f"{worker_id}: {error.detail}")
                 continue
             if result is _PASS:
@@ -2916,6 +3734,8 @@ def _new_on_demand_copilot_config(
     worker_id: str,
     backing_model: str,
     model_entry: dict[str, Any],
+    *,
+    warmup: bool = False,
 ) -> _copilot_api.HeadlessCopilotConfig:
     return _copilot_api.HeadlessCopilotConfig(
         worker_id=worker_id,
@@ -2924,14 +3744,17 @@ def _new_on_demand_copilot_config(
         role="on-demand-copilot",
         capabilities=_on_demand_copilot_capabilities(model_entry),
         autostart=False,
-        warmup=False,
+        warmup=warmup,
     )
 
 
 def _provision_on_demand_copilot(
     backing_model: str,
     model_entry: dict[str, Any],
-) -> tuple[str, Any]:
+    *,
+    require_new: bool = False,
+    warmup: bool = False,
+) -> tuple[str, Any, bool]:
     if model_entry.get("on_demand") is False:
         raise HTTPException(
             status_code=409,
@@ -2950,32 +3773,33 @@ def _provision_on_demand_copilot(
             for instance in instances
             if _is_on_demand_copilot(str(instance.get("worker_id") or ""))
         }
-        matching = next(
+        matching = sorted(
             (
                 instance
                 for instance in dynamic.values()
-                if (instance.get("config") or {}).get("model") == backing_model
+                if (
+                    _worker_runtime_models.get(str(instance["worker_id"]))
+                    or instance.get("selected_model")
+                    or (instance.get("config") or {}).get("model")
+                ) == backing_model
+            ),
+            key=lambda instance: _worker_load(str(instance["worker_id"])),
+        )
+        available_matching = next(
+            (
+                instance
+                for instance in matching
+                if _worker_load(str(instance["worker_id"])) == 0
             ),
             None,
         )
-        if matching is not None:
+        if available_matching is not None and not require_new:
+            matching = available_matching
             worker_id = str(matching["worker_id"])
             if not matching.get("running"):
                 manager.start(worker_id)
-            return worker_id, manager
-
-        for worker_id in _on_demand_copilot_ids():
-            if worker_id in dynamic:
-                continue
-            manager.create(
-                _new_on_demand_copilot_config(
-                    worker_id,
-                    backing_model,
-                    model_entry,
-                ),
-                start=True,
-            )
-            return worker_id, manager
+            _reserve_worker(worker_id)
+            return worker_id, manager, False
 
         reusable = next(
             (
@@ -2996,16 +3820,51 @@ def _provision_on_demand_copilot(
                     worker_id,
                     backing_model,
                     model_entry,
+                    warmup=warmup,
                 ),
                 restart=False,
             )
             manager.start(worker_id)
-            return worker_id, manager
+            _reserve_worker(worker_id)
+            return worker_id, manager, False
+
+        for worker_id in _on_demand_copilot_ids():
+            if worker_id in dynamic:
+                continue
+            manager.create(
+                _new_on_demand_copilot_config(
+                    worker_id,
+                    backing_model,
+                    model_entry,
+                    warmup=warmup,
+                ),
+                start=True,
+            )
+            _reserve_worker(worker_id)
+            return worker_id, manager, False
+
+        switchable = next(
+            (
+                instance
+                for instance in sorted(
+                    dynamic.values(),
+                    key=lambda item: str(item.get("worker_id") or ""),
+                )
+                if instance.get("running")
+                and instance.get("connected")
+                and _worker_is_idle(str(instance["worker_id"]))
+            ),
+            None,
+        )
+        if switchable is not None and not require_new:
+            worker_id = str(switchable["worker_id"])
+            _reserve_worker(worker_id)
+            return worker_id, manager, True
 
     raise HTTPException(
         status_code=503,
         detail=(
-            f"all {_MAX_ON_DEMAND_COPILOTS} on-demand Copilot workers are busy; "
+            f"all {_on_demand_copilot_limit()} elastic Copilot workers are busy; "
             "stop one in the admin UI before loading another model"
         ),
     )
@@ -3014,6 +3873,9 @@ def _provision_on_demand_copilot(
 async def _ensure_on_demand_copilot(
     public_model_id: str,
     backing_model: str,
+    *,
+    require_new: bool = False,
+    warmup: bool = False,
 ) -> str:
     metadata = _copilot_model_metadata(backing_model)
     if metadata is None:
@@ -3029,29 +3891,178 @@ async def _ensure_on_demand_copilot(
             status_code=404,
             detail=f"model '{public_model_id}' is hidden",
         )
-    worker_id, manager = await asyncio.to_thread(
+    worker_id, manager, switch_model = await asyncio.to_thread(
         _provision_on_demand_copilot,
         backing_model,
         entry,
+        require_new=require_new,
+        warmup=warmup,
     )
-    deadline = time.monotonic() + min(90.0, _REQUEST_TIMEOUT_SECONDS)
-    while time.monotonic() < deadline:
-        instance = await asyncio.to_thread(manager.get, worker_id)
-        if instance.get("connected"):
-            return worker_id
-        if not instance.get("running") and instance.get("returncode") is not None:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"on-demand worker '{worker_id}' exited with "
-                    f"code {instance['returncode']}"
-                ),
+    wait_id = f"provision-{uuid.uuid4().hex}"
+    try:
+        deadline = time.monotonic() + min(90.0, _REQUEST_TIMEOUT_SECONDS)
+        while time.monotonic() < deadline:
+            instance = await asyncio.to_thread(manager.get, worker_id)
+            if instance.get("connected"):
+                if switch_model:
+                    await _set_worker_runtime_model(
+                        worker_id,
+                        backing_model,
+                        model_entry,
+                    )
+                return worker_id
+            _mark_waiting_for_worker(
+                wait_id,
+                worker_id,
+                public_model_id,
+                "waiting for elastic Copilot worker to connect",
             )
-        await asyncio.sleep(0.2)
-    raise HTTPException(
-        status_code=504,
-        detail=f"on-demand worker '{worker_id}' did not connect in time",
+            if not instance.get("running") and instance.get("returncode") is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"on-demand worker '{worker_id}' exited with "
+                        f"code {instance['returncode']}"
+                    ),
+                )
+            await asyncio.sleep(0.2)
+        raise HTTPException(
+            status_code=504,
+            detail=f"on-demand worker '{worker_id}' did not connect in time",
+        )
+    except BaseException:
+        _release_worker_reservation(worker_id)
+        raise
+    finally:
+        _clear_waiting_for_worker(wait_id)
+
+
+def _idle_copilot_worker_count() -> int:
+    return sum(
+        1
+        for worker_id in _connected_workers
+        if worker_id.startswith(_ON_DEMAND_COPILOT_PREFIX)
+        if not _is_elastic_copilot(worker_id)
+        or _is_on_demand_copilot(worker_id)
+        if _worker_is_idle(worker_id)
+        if _worker_ready_for_offer(worker_id)
     )
+
+
+async def maintain_idle_copilot_workers_once() -> list[str]:
+    """Start enough elastic workers to restore the configured idle reserve."""
+    started: list[str] = []
+    if _idle_maintenance_paused:
+        return started
+    manager = _copilot_api.get_manager()
+    if manager is not None:
+        instances = manager.list()
+        if any(
+            instance.get("running") and not instance.get("connected")
+            for instance in instances
+        ):
+            return started
+        for instance in instances:
+            worker_id = str(instance.get("worker_id") or "")
+            if (
+                _is_elastic_copilot(worker_id)
+                and not _is_on_demand_copilot(worker_id)
+                and instance.get("running")
+                and _worker_load(worker_id) == 0
+            ):
+                if worker_id in _connected_workers:
+                    await _shutdown_connected_worker(
+                        worker_id,
+                        "outside configured elastic capacity",
+                    )
+                else:
+                    await asyncio.to_thread(manager.stop, worker_id)
+        idle_workers = [
+            worker_id
+            for worker_id in _connected_workers
+            if _is_on_demand_copilot(worker_id)
+            and _worker_is_idle(worker_id)
+            and _worker_ready_for_offer(worker_id)
+        ]
+        total_idle = _idle_copilot_worker_count()
+        excess = max(0, total_idle - min(_idle_worker_target, _max_concurrent_calls))
+        for worker_id in sorted(
+            idle_workers,
+            key=lambda value: int(value.rsplit("-", 1)[1]),
+            reverse=True,
+        )[:excess]:
+            if worker_id in _connected_workers:
+                await _shutdown_connected_worker(
+                    worker_id,
+                    "idle reserve scale-down",
+                )
+            else:
+                await asyncio.to_thread(manager.stop, worker_id)
+    target = min(_idle_worker_target, _max_concurrent_calls)
+    while _idle_copilot_worker_count() < target:
+        worker_id = await _ensure_on_demand_copilot(
+            _copilot_public_model_id("auto"),
+            "auto",
+            require_new=True,
+            warmup=True,
+        )
+        _release_worker_reservation(worker_id)
+        started.append(worker_id)
+    return started
+
+
+async def maintain_idle_copilot_workers(
+    initial_delay_seconds: float = 1,
+) -> None:
+    """Keep the configured number of zero-load Copilot workers connected."""
+    await asyncio.sleep(initial_delay_seconds)
+    while True:
+        try:
+            await maintain_idle_copilot_workers_once()
+        except HTTPException:
+            pass
+        except Exception as error:
+            print(f"[emullm] idle worker maintainer: {error}", flush=True)
+        await asyncio.sleep(1)
+
+
+async def _elastic_replica_for_busy_workers(
+    model: str,
+    worker_ids: list[str],
+    required_capabilities: set[str] | None,
+) -> str | None:
+    candidates = [
+        worker_id
+        for worker_id in worker_ids
+        if worker_id.startswith(_ON_DEMAND_COPILOT_PREFIX)
+        and _worker_runtime_models.get(worker_id)
+    ]
+    if not candidates or any(_worker_load(worker_id) == 0 for worker_id in candidates):
+        return None
+    source = min(candidates, key=_worker_load)
+    backing_model = _worker_runtime_models[source]
+    metadata = _copilot_model_metadata(backing_model)
+    if metadata is None:
+        return None
+    entry = _apply_model_catalog_override(
+        _copilot_catalog_model_entry(metadata)
+    )
+    if entry is None:
+        return None
+    modalities = entry.setdefault("input_modalities", {})
+    if required_capabilities:
+        if "vision_input" in required_capabilities:
+            modalities.setdefault("image", {})["enabled"] = True
+        if "audio_input" in required_capabilities:
+            modalities.setdefault("audio", {})["enabled"] = True
+    try:
+        return await _ensure_on_demand_copilot(
+            _copilot_public_model_id(backing_model),
+            backing_model,
+            require_new=True,
+        )
+    except HTTPException:
+        return None
 
 
 async def _relay_full(
@@ -3130,12 +4141,17 @@ async def _relay_full(
         worker_id = await _ensure_on_demand_copilot(model, backing_model)
         retry_delay = _worker_retry_delay(worker_id)
         if retry_delay > 0:
+            _release_worker_reservation(worker_id)
             raise HTTPException(
                 status_code=503,
                 detail=f"on-demand worker '{worker_id}' is temporarily not ready",
                 headers={"Retry-After": str(max(1, round(retry_delay)))},
             )
-        _check_and_record_usage(worker_id)
+        try:
+            _check_and_record_usage(worker_id)
+        except BaseException:
+            _release_worker_reservation(worker_id)
+            raise
         try:
             result = await _relay_to_worker(
                 worker_id,
@@ -3182,13 +4198,26 @@ async def _relay_full(
         resolved_worker_id,
         resolved_capabilities,
     )
+    requested_worker_id, _ = _split_model_id(model)
+    if requested_worker_id not in _connected_workers:
+        replica = await _elastic_replica_for_busy_workers(
+            model,
+            worker_ids,
+            resolved_capabilities,
+        )
+        if replica is not None:
+            worker_ids = [replica, *worker_ids]
     instruction = persona.get("instruction")
 
     modes = _current_modes()
     rejections: list[_WorkerRejected] = []
     not_ready: list[_WorkerNotReady] = []
     for worker_id in worker_ids:
-        _check_and_record_usage(worker_id)
+        try:
+            _check_and_record_usage(worker_id)
+        except BaseException:
+            _release_worker_reservation(worker_id)
+            raise
         for mode in modes:
             try:
                 result = await _relay_step(mode, worker_id, model, prompt_text, instruction, extra or None)
@@ -3272,7 +4301,17 @@ async def _relay_step(
                 status_code=502,
                 detail="proxy mode: no backend configured (set config.json 'backends' or EMULLM_PROXY_BASE_URL)",
             )
-        reply = await _proxy_chat(backend, model, prompt_text, instruction)
+        await _wait_before_backend_fallback(
+            model,
+            f"backend-{backend.get('name') or 'proxy'}",
+        )
+        reply = await _proxy_chat_with_stats(
+            backend,
+            model,
+            prompt_text,
+            instruction,
+            str((extra or {}).get("kind") or "chat"),
+        )
         if mode == "proxy-observe":
             await _observe(worker_id, model, prompt_text, reply)
         return reply
@@ -3291,6 +4330,63 @@ async def _relay_step(
 
     # wait / wait-then-serve / relay / unknown -> the classic wait-for-a-worker path.
     return await _relay_to_worker(worker_id, model, prompt_text, instruction, wait=True, extra=extra)
+
+
+async def _set_worker_runtime_model(
+    worker_id: str,
+    backing_model: str,
+    model_entry: dict[str, Any],
+) -> None:
+    peer = _connected_workers.get(worker_id)
+    if peer is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"worker '{worker_id}' disconnected before model switch",
+        )
+    control_id = f"model-switch-{uuid.uuid4().hex}"
+    future: "asyncio.Future[dict[str, Any]]" = (
+        asyncio.get_running_loop().create_future()
+    )
+    _pending_worker_controls[control_id] = future
+    capabilities = model_entry.get("capabilities")
+    limits = capabilities.get("limits") if isinstance(capabilities, dict) else {}
+    vision = limits.get("vision") if isinstance(limits, dict) else {}
+    media_types = (
+        vision.get("supported_media_types", [])
+        if isinstance(vision, dict)
+        else []
+    )
+    try:
+        await peer.send_json(
+            {
+                "type": "set_model",
+                "id": control_id,
+                "model": backing_model,
+                "modelmasks": [_copilot_public_model_id(backing_model)],
+                "capabilities": _on_demand_copilot_capabilities(model_entry),
+                "supported_media_types": media_types,
+            }
+        )
+        _increment_active_websocket(
+            _worker_connection_ids.get(worker_id),
+            "messages_out",
+        )
+        response = await asyncio.wait_for(future, timeout=60)
+        if response.get("type") == "model_change_error":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"worker '{worker_id}' could not switch to "
+                    f"'{backing_model}': {response.get('error')}"
+                ),
+            )
+    except asyncio.TimeoutError as error:
+        raise HTTPException(
+            status_code=504,
+            detail=f"worker '{worker_id}' model switch timed out",
+        ) from error
+    finally:
+        _pending_worker_controls.pop(control_id, None)
 
 
 async def _relay_to_worker(
@@ -3314,6 +4410,7 @@ async def _relay_to_worker(
     _REQUEST_TIMEOUT_SECONDS (the classic "slow API" behavior, 504 on
     timeout). If ``wait`` is False and no peer is available, it returns
     _PASS so the caller can fall through to the next mode in the chain."""
+    _begin_worker_request(worker_id, model)
     request_id = uuid.uuid4().hex
     loop = asyncio.get_running_loop()
     future: "asyncio.Future[Any]" = loop.create_future()
@@ -3338,12 +4435,21 @@ async def _relay_to_worker(
 
     deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
     sent_peer: Any = None
+    service_started: float | None = None
+    service_kind = str((extra or {}).get("kind") or "chat")
+    outcome = "failed"
     try:
         while True:
             peer = peer_override if peer_override is not None else _connected_workers.get(worker_id)
             if peer is None:
                 if not wait:
                     return _PASS
+                _mark_waiting_for_worker(
+                    request_id,
+                    worker_id,
+                    model,
+                    "no worker is connected and ready",
+                )
                 if time.monotonic() >= deadline:
                     raise HTTPException(
                         status_code=504,
@@ -3351,6 +4457,7 @@ async def _relay_to_worker(
                     )
                 await asyncio.sleep(0.5)
                 continue
+            _clear_waiting_for_worker(request_id)
             try:
                 await peer.send_json(payload)
                 if peer_override is None:
@@ -3358,6 +4465,13 @@ async def _relay_to_worker(
                         _worker_connection_ids.get(worker_id), "messages_out"
                     )
                 sent_peer = peer
+                service_started = time.monotonic()
+                with _worker_load_lock:
+                    _active_service_requests[request_id] = {
+                        "worker_id": worker_id,
+                        "model": model,
+                        "service_kind": service_kind,
+                    }
             except Exception:
                 if not wait:
                     return _PASS
@@ -3374,10 +4488,18 @@ async def _relay_to_worker(
             # this idempotent call also covers test/mock peers that resolve
             # the Future directly without passing through that handler.
             _record_relay_reply(worker_id, request_id, result, model)
+            outcome = "served"
             return result
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="emullm worker did not reply in time")
+    except _WorkerNotReady:
+        outcome = "deferred"
+        raise
+    except _WorkerRejected:
+        outcome = "rejected"
+        raise
     except asyncio.CancelledError:
+        outcome = "cancelled"
         if sent_peer is not None and peer_override is None:
             try:
                 await asyncio.shield(
@@ -3392,6 +4514,18 @@ async def _relay_to_worker(
     finally:
         _pending.pop(request_id, None)
         _pending_models.pop(request_id, None)
+        _clear_waiting_for_worker(request_id)
+        with _worker_load_lock:
+            _active_service_requests.pop(request_id, None)
+        if service_started is not None:
+            _record_worker_service(
+                worker_id,
+                model,
+                service_kind,
+                max(0.0, time.monotonic() - service_started),
+                outcome,
+            )
+        _end_worker_request(worker_id, model)
 
 
 @router.get("/v1/models")
@@ -4093,6 +5227,95 @@ _STUB_PIXEL_PNG_DATA_URL = (
 )
 
 
+def _materialize_image_result(
+    result: Any,
+    *,
+    prompt: str,
+    model: str,
+    operation: str,
+    response_format: Literal["url", "b64_json"],
+    inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    worker_b64, worker_url, worker_mime = _reply_image(result)
+    entry: dict[str, Any] = {
+        "revised_prompt": prompt,
+        "model": model,
+        "operation": operation,
+    }
+    if inputs:
+        entry["inputs"] = inputs
+    if worker_b64 or worker_url:
+        data, mime = _decode_media(worker_b64, worker_url)
+        if data is not None:
+            resolved_mime = mime or worker_mime or "image/png"
+            record = _store_cloud_bytes(
+                data,
+                f"image{_ext_for_mime(resolved_mime)}",
+                purpose="output",
+                mime_type=resolved_mime,
+            )
+            artifact_url = _cloud_file_url(record["id"])
+            entry.update(
+                {
+                    "file_id": record["id"],
+                    "source": "worker",
+                    "mime_type": resolved_mime,
+                    "artifact": {
+                        "source": "worker",
+                        "file_id": record["id"],
+                        "url": artifact_url,
+                        "mime_type": resolved_mime,
+                        "bytes": len(data),
+                    },
+                }
+            )
+            if response_format == "b64_json":
+                entry["b64_json"] = (
+                    worker_b64
+                    or base64.b64encode(data).decode("ascii")
+                )
+            else:
+                entry["url"] = artifact_url
+            return entry
+        entry.update(
+            {
+                "url": worker_url,
+                "source": "worker",
+                "mime_type": worker_mime,
+                "artifact": {
+                    "source": "worker",
+                    "url": worker_url,
+                    "mime_type": worker_mime,
+                },
+            }
+        )
+        return entry
+
+    if response_format == "b64_json":
+        entry["b64_json"] = _STUB_PIXEL_PNG_DATA_URL.split(",", 1)[1]
+    else:
+        entry["url"] = _STUB_PIXEL_PNG_DATA_URL
+    description = _reply_content(result) if result is not None else ""
+    if description:
+        entry["pretend_description"] = description
+    stub_data = base64.b64decode(
+        _STUB_PIXEL_PNG_DATA_URL.split(",", 1)[1]
+    )
+    entry.update(
+        {
+            "source": "simulated",
+            "mime_type": "image/png",
+            "artifact": {
+                "source": "simulated",
+                "url": _STUB_PIXEL_PNG_DATA_URL,
+                "mime_type": "image/png",
+                "bytes": len(stub_data),
+            },
+        }
+    )
+    return entry
+
+
 @router.post("/v1/images/generations")
 async def images_generations(body: ImagesRequest) -> dict[str, Any]:
     """Two-way image pass-through. If the target worker declared images
@@ -4103,45 +5326,196 @@ async def images_generations(body: ImagesRequest) -> dict[str, Any]:
     worker EXPLICITLY declared it won't do images, this stops with 501 instead
     -- the worker is never asked."""
     worker_id, _, _ = _require_model(body.model)
-    can_pretend = await _capable_or_policy(worker_id, "images")
-    pretend_description = None
-    worker_b64 = worker_url = worker_mime = None
+    copilot_backing = _copilot_backing_model(body.model)
+    copilot_metadata = (
+        _copilot_model_metadata(copilot_backing)
+        if copilot_backing
+        else None
+    )
+    copilot_entry = (
+        _copilot_catalog_model_entry(copilot_metadata)
+        if copilot_metadata
+        else None
+    )
+    can_pretend = (
+        True
+        if copilot_entry
+        and (
+            (copilot_entry.get("task_capabilities") or {})
+            .get("image_output", {})
+            .get("enabled")
+        )
+        else await _capable_or_policy(worker_id, "images")
+    )
+    result: Any = None
     if can_pretend:
         result = await _relay_full(
             body.model,
-            "(image-generation) Produce an image for this prompt. If you can, return it "
-            "as base64 PNG in an 'image_b64' field; otherwise describe, in one or two "
-            f"sentences, the image you would generate: {body.prompt}",
+            "(image-generation) Create a real PNG image for the prompt below. Use your "
+            "enabled file/terminal tools and write it as 'emullm-generated-image.png' "
+            "inside the current workspace. You may generate PNG bytes with Python's "
+            "standard library. When the file is complete, reply only: "
+            "EMULLM_IMAGE_FILE: emullm-generated-image.png\n\n"
+            f"Image prompt: {body.prompt}",
             kind="image",
+            required_capabilities={"image_output"},
         )
-        worker_b64, worker_url, worker_mime = _reply_image(result)
-        if not (worker_b64 or worker_url):
-            pretend_description = _reply_content(result) or None
-    entry: dict[str, Any] = {"revised_prompt": body.prompt}
-    if worker_b64 or worker_url:
-        # A real image came back from the worker. Persist it to the shared cloud
-        # files store and hand back a stable URL (plus b64 if the caller asked).
-        data, mime = _decode_media(worker_b64, worker_url)
-        if data is not None:
-            record = _store_cloud_bytes(data, f"image{_ext_for_mime(mime or worker_mime)}", purpose="output")
-            entry["file_id"] = record["id"]
-            entry["source"] = "worker"
-            if body.response_format == "b64_json":
-                entry["b64_json"] = worker_b64 or base64.b64encode(data).decode("ascii")
-            else:
-                entry["url"] = _cloud_file_url(record["id"])
-        else:
-            # A non-data URL (already hosted somewhere) -- pass it straight through.
-            entry["url"] = worker_url
-            entry["source"] = "worker"
-    else:
-        if body.response_format == "b64_json":
-            entry["b64_json"] = _STUB_PIXEL_PNG_DATA_URL.split(",", 1)[1]
-        else:
-            entry["url"] = _STUB_PIXEL_PNG_DATA_URL
-        if pretend_description:
-            entry["pretend_description"] = pretend_description
+    entry = _materialize_image_result(
+        result,
+        prompt=body.prompt,
+        model=body.model,
+        operation="generation",
+        response_format=body.response_format,
+    )
     return {"created": int(time.time()), "data": [dict(entry) for _ in range(body.n)]}
+
+
+async def _store_image_edit_upload(
+    upload: UploadFile,
+    index: int,
+) -> dict[str, Any]:
+    data = bytearray()
+    try:
+        while chunk := await upload.read(1024 * 1024):
+            data += chunk
+            if len(data) > _MAX_ADMIN_TEST_ATTACHMENT_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"attachment-{index} exceeds the image upload limit",
+                )
+    finally:
+        await upload.close()
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail=f"attachment-{index} is empty",
+        )
+    mime_type = (
+        str(upload.content_type or "").split(";", 1)[0].strip().lower()
+        or "application/octet-stream"
+    )
+    if not mime_type.startswith("image/"):
+        raise HTTPException(
+            status_code=415,
+            detail=f"attachment-{index} must be an image",
+        )
+    name = _anonymous_attachment_name(index)
+    record = _store_cloud_bytes(
+        bytes(data),
+        name,
+        purpose="user_data",
+        mime_type=mime_type,
+    )
+    return {
+        "file_id": record["id"],
+        "name": name,
+        "url": _cloud_file_url(record["id"]),
+        "mime_type": mime_type,
+        "bytes": len(data),
+    }
+
+
+@router.post("/v1/images/edits")
+async def images_edits(request: Request) -> dict[str, Any]:
+    if not request.headers.get("content-type", "").startswith(
+        "multipart/form-data"
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail="use multipart/form-data with image and optional mask fields",
+        )
+    form = await request.form()
+    source_upload = form.get("image")
+    mask_upload = form.get("mask")
+    if not isinstance(source_upload, UploadFile):
+        raise HTTPException(status_code=400, detail="image is required")
+    if mask_upload is not None and not isinstance(mask_upload, UploadFile):
+        raise HTTPException(status_code=400, detail="mask must be an image file")
+    prompt = str(form.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    model = str(form.get("model") or "copilot/gpt-5.3-codex")
+    response_format = str(form.get("response_format") or "url")
+    if response_format not in {"url", "b64_json"}:
+        raise HTTPException(
+            status_code=422,
+            detail="response_format must be url or b64_json",
+        )
+    response_format_value: Literal["url", "b64_json"] = (
+        "b64_json" if response_format == "b64_json" else "url"
+    )
+    try:
+        count = int(str(form.get("n") or "1"))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="n must be an integer") from error
+    if not 1 <= count <= 10:
+        raise HTTPException(status_code=422, detail="n must be between 1 and 10")
+    size = str(form.get("size") or "256x256")
+
+    source = await _store_image_edit_upload(source_upload, 1)
+    mask = (
+        await _store_image_edit_upload(mask_upload, 2)
+        if isinstance(mask_upload, UploadFile)
+        else None
+    )
+    inputs = {"image": source, "mask": mask, "size": size}
+    attachments = [source, *([mask] if mask else [])]
+
+    worker_id, _, _ = _require_model(model)
+    copilot_backing = _copilot_backing_model(model)
+    metadata = (
+        _copilot_model_metadata(copilot_backing)
+        if copilot_backing
+        else None
+    )
+    copilot_entry = (
+        _copilot_catalog_model_entry(metadata)
+        if metadata
+        else None
+    )
+    can_generate = (
+        True
+        if copilot_entry
+        and (
+            (copilot_entry.get("task_capabilities") or {})
+            .get("image_output", {})
+            .get("enabled")
+        )
+        else await _capable_or_policy(worker_id, "images")
+    )
+    result: Any = None
+    if can_generate:
+        mask_instruction = (
+            "Attachment-2 is the mask; modify the masked/transparent region only."
+            if mask
+            else "No mask was supplied; edit the complete source image."
+        )
+        result = await _relay_full(
+            model,
+            "(image-edit) Attachment-1 is the source image. "
+            f"{mask_instruction} Create a {size} PNG satisfying the prompt. "
+            "Use enabled tools and write 'emullm-generated-image.png' in the "
+            "current workspace. Reply only: "
+            "EMULLM_IMAGE_FILE: emullm-generated-image.png\n\n"
+            f"Edit prompt: {prompt}",
+            images=[item["url"] for item in attachments],
+            files={"image_edit": inputs},
+            attachments=attachments,
+            kind="image_edit",
+            required_capabilities={"vision_input", "image_output"},
+        )
+    entry = _materialize_image_result(
+        result,
+        prompt=prompt,
+        model=model,
+        operation="edit",
+        response_format=response_format_value,
+        inputs=inputs,
+    )
+    return {
+        "created": int(time.time()),
+        "data": [dict(entry) for _ in range(count)],
+    }
 
 
 _MAX_AUDIO_BYTES = max(1, int(os.environ.get("EMULLM_MAX_AUDIO_BYTES", str(25 * 1024 * 1024))))
@@ -6656,17 +8030,42 @@ class SetRuntimeDirRequest(BaseModel):
 @router.get("/admin/emullm/state")
 @router.get("/emullm/admin/state")
 def admin_state() -> dict[str, Any]:
+    worker_service_stats, team_service_stats = _service_stats_snapshot()
+    for backend in _all_backends():
+        backend_id = f"backend-{backend.get('name') or 'proxy'}"
+        worker_service_stats.setdefault(
+            backend_id,
+            {
+                "kind": "backend",
+                "active": _worker_inflight.get(backend_id, 0),
+                "reserved": _worker_reservations.get(backend_id, 0),
+                "services": {},
+            },
+        )
+    waiting = _waiting_for_worker_snapshot()
+    connected_workers = sorted(_connected_workers.keys())
+    busy_workers = sum(
+        1 for worker_id in connected_workers if _worker_load(worker_id) > 0
+    )
+    idle_workers = sum(
+        1 for worker_id in connected_workers if _worker_is_idle(worker_id)
+    )
     return {
         "mode": ",".join(_current_modes()),
         "modes": _current_modes(),
         "started_at": _SERVER_STARTED_AT,
         "uptime_seconds": round(time.time() - _SERVER_STARTED_AT, 1),
         "runtime_dir": str(_RUNTIME_DIR),
-        "connected_worker_ids": sorted(_connected_workers.keys()),
+        "connected_worker_ids": connected_workers,
         "worker_models": {worker_id: sorted(models.keys()) for worker_id, models in _worker_models.items()},
         "worker_kinds": dict(_worker_kinds),
         "worker_runtime_models": dict(_worker_runtime_models),
         "worker_descriptions": dict(_worker_descriptions),
+        "worker_model_switches": dict(_worker_model_switch_stats),
+        "team_model_switches": sum(
+            int(stats.get("count", 0))
+            for stats in _worker_model_switch_stats.values()
+        ),
         "worker_capabilities": dict(_worker_capabilities),
         "worker_model_masks": {
             worker_id: list(_worker_model_masks[worker_id]) if worker_id in _worker_model_masks else None
@@ -6686,6 +8085,25 @@ def admin_state() -> dict[str, Any]:
             }
             for worker_id, usage in _worker_usage.items()
         },
+        "worker_service_stats": worker_service_stats,
+        "team_service_stats": team_service_stats,
+        "concurrency": {
+            "max_calls": _max_concurrent_calls,
+            "active_calls": sum(_worker_inflight.values()),
+            "reserved_calls": sum(_worker_reservations.values()),
+            "waiting_for_worker": len(waiting),
+            "connected_workers": len(connected_workers),
+            "busy_workers": busy_workers,
+            "idle_workers": idle_workers,
+            "recently_busy_workers": (
+                len(connected_workers) - busy_workers - idle_workers
+            ),
+            "idle_worker_target": _idle_worker_target,
+            "idle_grace_seconds": _idle_grace_seconds,
+            "idle_maintenance_paused": _idle_maintenance_paused,
+            "backend_fallback_delay_seconds": _backend_fallback_delay_seconds,
+        },
+        "waiting_for_worker": waiting,
         "worker_not_ready": {
             worker_id: {"retry_after": round(delay, 3)}
             for worker_id in list(_worker_not_ready_until)
@@ -7008,6 +8426,74 @@ class BackendConfig(BaseModel):
     default: bool | None = None
 
 
+class AdminBackendConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    base_url: str = Field(min_length=1, max_length=2_000)
+    description: str | None = Field(default=None, max_length=2_000)
+    api_key: str | None = Field(default=None, max_length=10_000)
+    api_key_env: str | None = Field(default=None, max_length=200)
+    clear_api_key: bool = False
+    model: str | None = Field(default=None, max_length=300)
+    default: bool = False
+    validation_interval: str | int | float | None = None
+    expected_name: str | None = Field(default=None, max_length=100)
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        return value.rstrip("/")
+
+
+class CodexSupplierConfig(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    id: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    name: str = Field(min_length=1, max_length=200)
+    kind: Literal["copilot", "codex-cli", "openai-compatible", "custom"] = "custom"
+    enabled: bool = True
+    priority: int = Field(default=0, ge=-10_000, le=10_000)
+    description: str | None = Field(default=None, max_length=2_000)
+    worker_pattern: str | None = Field(default=None, max_length=300)
+    model_prefix: str | None = Field(default=None, max_length=300)
+    model_patterns: list[str] = Field(default_factory=list, max_length=100)
+    command: str | None = Field(default=None, max_length=2_000)
+    base_url: str | None = Field(default=None, max_length=2_000)
+    api_key_env: str | None = Field(default=None, max_length=200)
+
+    @field_validator("model_patterns")
+    @classmethod
+    def _clean_model_patterns(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+_DEFAULT_CODEX_SUPPLIER = CodexSupplierConfig(
+    id="copilot",
+    name="GitHub Copilot",
+    kind="copilot",
+    enabled=True,
+    priority=0,
+    description=(
+        "Current Codex supplier: resident Copilot SDK workers serving Codex-family models."
+    ),
+    worker_pattern="worker-copilot-*",
+    model_prefix="copilot/",
+    model_patterns=["*codex*"],
+    command="copilot",
+).model_dump(mode="json")
+
+
 class MockConfig(BaseModel):
     """Global mock reply for ``mock`` mode (when no mock_worker matches)."""
 
@@ -7116,6 +8602,14 @@ class EmullmConfig(BaseModel):
     mode: str | list[str] | None = None
     subagent_launch: str | list[str] | None = None
     subagent_model: str | None = None  # default AI model for spawned Copilot workers
+    max_concurrent_calls: int | None = Field(default=None, ge=4, le=50)
+    idle_worker_target: int | None = Field(default=None, ge=0, le=50)
+    idle_grace_seconds: float | None = Field(default=None, ge=0, le=3600)
+    backend_fallback_delay_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        le=300,
+    )
     model_routes: dict[str, str | list[str]] | None = None  # model id -> worker or ordered targets
     model_catalog_overrides: dict[str, ModelCatalogOverrideConfig] | None = None
     capability_fallback: Literal["stub", "wait", "error"] | None = None
@@ -7129,6 +8623,7 @@ class EmullmConfig(BaseModel):
     headless_copilots: list[_copilot_api.HeadlessCopilotConfig] | None = None
     mock_workers: list[MockWorkerConfig] | None = None
     backends: list[BackendConfig] | None = None
+    codex_suppliers: list[CodexSupplierConfig] | None = None
     mock: MockConfig | None = None
 
 
@@ -7242,6 +8737,7 @@ _EDITABLE_CONFIG_SECTIONS = {
     "workers",
     "mock_workers",
     "backends",
+    "codex_suppliers",
     "mock",
 }
 
@@ -7286,6 +8782,317 @@ def admin_put_config_section(section: str, body: ConfigSectionRequest) -> dict[s
     }
 
 
+def _atomic_config_update(
+    mutator: Callable[[dict[str, Any]], dict[str, Any]],
+) -> dict[str, Any]:
+    def validated(config: dict[str, Any]) -> dict[str, Any]:
+        result = mutator(config)
+        try:
+            EmullmConfig.model_validate(config)
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail=error.errors()) from error
+        return result
+
+    try:
+        return _copilot_api.update_config_document(_CONFIG_PATH, validated)
+    except _copilot_api.CopilotInstanceError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _configured_backend_records(
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    document = config if config is not None else _read_config()
+    records: list[dict[str, Any]] = []
+    for source, entries in (
+        ("backends", document.get("backends")),
+        ("agents", document.get("agents")),
+    ):
+        if not isinstance(entries, list):
+            continue
+        for index, raw_entry in enumerate(entries):
+            if not isinstance(raw_entry, dict):
+                continue
+            if source == "agents" and raw_entry.get("launch") != "proxy":
+                continue
+            entry = dict(raw_entry)
+            has_api_key = bool(entry.pop("api_key", None))
+            records.append(
+                {
+                    **entry,
+                    "source": source,
+                    "index": index,
+                    "record_id": f"{source}:{index}",
+                    "has_api_key": has_api_key,
+                }
+            )
+    return records
+
+
+def _backend_entry(
+    config: dict[str, Any],
+    source: str,
+    index: int,
+    expected_name: str | None = None,
+) -> dict[str, Any]:
+    if source not in {"backends", "agents"}:
+        raise HTTPException(status_code=404, detail=f"unknown backend source '{source}'")
+    entries = config.get(source)
+    if not isinstance(entries, list) or not 0 <= index < len(entries):
+        raise HTTPException(status_code=404, detail="backend record not found")
+    entry = entries[index]
+    if not isinstance(entry, dict) or (
+        source == "agents" and entry.get("launch") != "proxy"
+    ):
+        raise HTTPException(status_code=404, detail="backend record not found")
+    if expected_name is not None and entry.get("name") != expected_name:
+        raise HTTPException(
+            status_code=409,
+            detail="backend record changed; refresh before editing",
+        )
+    return entry
+
+
+def _clear_backend_defaults(config: dict[str, Any]) -> None:
+    for source in ("backends", "agents"):
+        entries = config.get(source)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and (
+                source == "backends" or entry.get("launch") == "proxy"
+            ):
+                entry["default"] = False
+
+
+def _apply_backend_config(
+    entry: dict[str, Any],
+    body: AdminBackendConfig,
+) -> None:
+    entry.update(
+        name=body.name,
+        base_url=body.base_url,
+        default=body.default,
+    )
+    for key in ("description", "api_key_env", "model", "validation_interval"):
+        value = getattr(body, key)
+        if value in (None, ""):
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+    if body.clear_api_key:
+        entry.pop("api_key", None)
+    elif body.api_key:
+        entry["api_key"] = body.api_key
+
+
+def _ensure_unique_backend_names(config: dict[str, Any]) -> None:
+    names = [
+        str(record.get("name") or "").lower()
+        for record in _configured_backend_records(config)
+    ]
+    duplicates = sorted({name for name in names if name and names.count(name) > 1})
+    if duplicates:
+        raise HTTPException(
+            status_code=409,
+            detail=f"duplicate backend name(s): {', '.join(duplicates)}",
+        )
+
+
+@router.get("/admin/emullm/backends/configured")
+@router.get("/emullm/admin/backends/configured")
+def admin_configured_backends() -> dict[str, Any]:
+    records = _configured_backend_records()
+    return {"count": len(records), "backends": records}
+
+
+@router.post("/admin/emullm/backends/configured", status_code=201)
+@router.post("/emullm/admin/backends/configured", status_code=201)
+def admin_create_backend(body: AdminBackendConfig) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        entries = config.setdefault("backends", [])
+        if not isinstance(entries, list):
+            raise HTTPException(status_code=409, detail="backends config is not a list")
+        if body.default:
+            _clear_backend_defaults(config)
+        entry: dict[str, Any] = {}
+        _apply_backend_config(entry, body)
+        entries.append(entry)
+        _ensure_unique_backend_names(config)
+        records = _configured_backend_records(config)
+        created = next(
+            record
+            for record in records
+            if record["source"] == "backends"
+            and record["index"] == len(entries) - 1
+        )
+        return {
+            "saved": True,
+            "restart_required": True,
+            "backend": created,
+            "backends": records,
+        }
+
+    return _atomic_config_update(mutate)
+
+
+@router.put("/admin/emullm/backends/configured/{source}/{index}")
+@router.put("/emullm/admin/backends/configured/{source}/{index}")
+def admin_update_backend(
+    source: str,
+    index: int,
+    body: AdminBackendConfig,
+) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        entry = _backend_entry(config, source, index, body.expected_name)
+        if body.default:
+            _clear_backend_defaults(config)
+        _apply_backend_config(entry, body)
+        _ensure_unique_backend_names(config)
+        record = next(
+            item
+            for item in _configured_backend_records(config)
+            if item["source"] == source and item["index"] == index
+        )
+        return {
+            "saved": True,
+            "restart_required": True,
+            "backend": record,
+            "backends": _configured_backend_records(config),
+        }
+
+    return _atomic_config_update(mutate)
+
+
+@router.delete("/admin/emullm/backends/configured/{source}/{index}")
+@router.delete("/emullm/admin/backends/configured/{source}/{index}")
+def admin_delete_backend(
+    source: str,
+    index: int,
+    expected_name: str | None = None,
+) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        _backend_entry(config, source, index, expected_name)
+        entries = config[source]
+        deleted = entries.pop(index)
+        return {
+            "saved": True,
+            "restart_required": True,
+            "deleted": str(deleted.get("name") or f"{source}:{index}"),
+            "backends": _configured_backend_records(config),
+        }
+
+    return _atomic_config_update(mutate)
+
+
+def _configured_codex_suppliers(
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    document = config if config is not None else _read_config()
+    raw_suppliers = document.get("codex_suppliers")
+    if raw_suppliers is None:
+        return [dict(_DEFAULT_CODEX_SUPPLIER)]
+    return [
+        CodexSupplierConfig.model_validate(supplier).model_dump(mode="json")
+        for supplier in raw_suppliers
+        if isinstance(supplier, dict)
+    ]
+
+
+def _codex_supplier_for_model(backing_model: str) -> dict[str, Any] | None:
+    matches: list[tuple[int, int, dict[str, Any]]] = []
+    for supplier in _configured_codex_suppliers():
+        if not supplier.get("enabled"):
+            continue
+        patterns = supplier.get("model_patterns") or []
+        matching_patterns = [
+            str(pattern)
+            for pattern in patterns
+            if fnmatchcase(backing_model.lower(), str(pattern).lower())
+        ]
+        if matching_patterns:
+            specificity = max(
+                len(pattern.replace("*", "").replace("?", ""))
+                for pattern in matching_patterns
+            )
+            matches.append(
+                (int(supplier.get("priority") or 0), specificity, supplier)
+            )
+    return max(matches, key=lambda match: (match[0], match[1]))[2] if matches else None
+
+
+@router.get("/admin/emullm/codex-suppliers")
+@router.get("/emullm/admin/codex-suppliers")
+def admin_list_codex_suppliers() -> dict[str, Any]:
+    suppliers = _configured_codex_suppliers()
+    return {"count": len(suppliers), "suppliers": suppliers}
+
+
+@router.post("/admin/emullm/codex-suppliers", status_code=201)
+@router.post("/emullm/admin/codex-suppliers", status_code=201)
+def admin_create_codex_supplier(body: CodexSupplierConfig) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        suppliers = _configured_codex_suppliers(config)
+        if any(supplier["id"] == body.id for supplier in suppliers):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Codex supplier '{body.id}' already exists",
+            )
+        suppliers.append(body.model_dump(mode="json"))
+        config["codex_suppliers"] = suppliers
+        return {"saved": True, "supplier": suppliers[-1], "suppliers": suppliers}
+
+    return _atomic_config_update(mutate)
+
+
+@router.put("/admin/emullm/codex-suppliers/{supplier_id}")
+@router.put("/emullm/admin/codex-suppliers/{supplier_id}")
+def admin_update_codex_supplier(
+    supplier_id: str,
+    body: CodexSupplierConfig,
+) -> dict[str, Any]:
+    if supplier_id != body.id:
+        raise HTTPException(status_code=422, detail="path supplier ID must match body ID")
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        suppliers = _configured_codex_suppliers(config)
+        for index, supplier in enumerate(suppliers):
+            if supplier["id"] == supplier_id:
+                suppliers[index] = body.model_dump(mode="json")
+                break
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no Codex supplier '{supplier_id}'",
+            )
+        config["codex_suppliers"] = suppliers
+        return {
+            "saved": True,
+            "supplier": suppliers[index],
+            "suppliers": suppliers,
+        }
+
+    return _atomic_config_update(mutate)
+
+
+@router.delete("/admin/emullm/codex-suppliers/{supplier_id}")
+@router.delete("/emullm/admin/codex-suppliers/{supplier_id}")
+def admin_delete_codex_supplier(supplier_id: str) -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> dict[str, Any]:
+        suppliers = _configured_codex_suppliers(config)
+        remaining = [
+            supplier for supplier in suppliers if supplier["id"] != supplier_id
+        ]
+        if len(remaining) == len(suppliers):
+            raise HTTPException(
+                status_code=404,
+                detail=f"no Codex supplier '{supplier_id}'",
+            )
+        config["codex_suppliers"] = remaining
+        return {"saved": True, "deleted": supplier_id, "suppliers": remaining}
+
+    return _atomic_config_update(mutate)
+
+
 @router.get("/admin/emullm/model-config")
 @router.get("/emullm/admin/model-config")
 def admin_model_config() -> dict[str, Any]:
@@ -7304,10 +9111,12 @@ def admin_model_config() -> dict[str, Any]:
         "overrides": dict(_model_catalog_overrides),
         "routes": dict(_model_routes),
         "backends": _all_backends(),
+        "codex_suppliers": _configured_codex_suppliers(),
         "on_demand": {
             "worker_prefix": _ON_DEMAND_COPILOT_PREFIX,
             "worker_start": _ON_DEMAND_COPILOT_START,
-            "limit": _MAX_ON_DEMAND_COPILOTS,
+            "limit": _on_demand_copilot_limit(),
+            "max_concurrent_calls": _max_concurrent_calls,
             "slots": slots,
         },
     }
@@ -7383,6 +9192,7 @@ async def admin_load_copilot_model(model_id: str) -> dict[str, Any]:
             detail="only exported copilot/<model-id> entries can be loaded on demand",
         )
     worker_id = await _ensure_on_demand_copilot(model_id, backing_model)
+    _release_worker_reservation(worker_id)
     manager = _copilot_api.get_manager()
     return {
         "model_id": model_id,
@@ -7430,6 +9240,150 @@ def admin_test_sample(sample_id: str) -> Response:
     )
 
 
+async def _shutdown_connected_worker(
+    worker_id: str,
+    reason: str,
+) -> bool:
+    peer = _connected_workers.get(worker_id)
+    if peer is None:
+        return False
+    await peer.send_json({"type": "shutdown", "reason": reason})
+    _increment_active_websocket(
+        _worker_connection_ids.get(worker_id),
+        "messages_out",
+    )
+    deadline = time.monotonic() + 15
+    while worker_id in _connected_workers and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    return worker_id not in _connected_workers
+
+
+async def _wait_for_managed_worker_offline(
+    manager: Any,
+    worker_id: str,
+) -> None:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        instance = await asyncio.to_thread(manager.get, worker_id)
+        if not instance.get("running") and not instance.get("connected"):
+            return
+        await asyncio.sleep(0.1)
+
+
+@router.post("/admin/emullm/copilots/{worker_id}/online-action/{action}")
+@router.post("/emullm/admin/copilots/{worker_id}/online-action/{action}")
+async def admin_online_copilot_action(
+    worker_id: str,
+    action: str,
+) -> dict[str, Any]:
+    global _idle_maintenance_paused
+    if action not in {"start", "stop", "restart", "reset-session"}:
+        raise HTTPException(status_code=404, detail=f"unknown action '{action}'")
+    manager = _copilot_api.get_manager()
+    if manager is None:
+        raise HTTPException(status_code=409, detail="headless Copilot manager unavailable")
+    try:
+        instance = manager.get(worker_id)
+    except Exception as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    online = bool(instance.get("running") or instance.get("connected"))
+    if action == "start":
+        if online:
+            raise HTTPException(status_code=409, detail=f"worker '{worker_id}' is online")
+        _idle_maintenance_paused = False
+        return await asyncio.to_thread(manager.start, worker_id)
+    if not online:
+        raise HTTPException(status_code=409, detail=f"worker '{worker_id}' is offline")
+    if instance.get("connected"):
+        await _shutdown_connected_worker(worker_id, f"operator {action}")
+        await _wait_for_managed_worker_offline(manager, worker_id)
+    else:
+        await asyncio.to_thread(manager.stop, worker_id)
+    if action == "stop":
+        return {"worker_id": worker_id, "stopped": True}
+    if action == "reset-session":
+        result = await asyncio.to_thread(manager.reset_session, worker_id)
+        await asyncio.to_thread(manager.start, worker_id)
+        return {**result, "started": True}
+    _idle_maintenance_paused = False
+    return await asyncio.to_thread(manager.start, worker_id)
+
+
+@router.post("/admin/emullm/copilots/bulk/{action}")
+@router.post("/emullm/admin/copilots/bulk/{action}")
+async def admin_bulk_copilot_action(action: str) -> dict[str, Any]:
+    global _idle_maintenance_paused
+    if action not in {
+        "start",
+        "stop",
+        "stop-idle",
+        "restart",
+        "reset-session",
+    }:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown bulk Copilot action '{action}'",
+        )
+    manager = _copilot_api.get_manager()
+    if manager is None:
+        raise HTTPException(
+            status_code=409,
+            detail="headless Copilot manager is unavailable",
+        )
+    instances = manager.list()
+    results = []
+    if action in {"stop", "stop-idle"}:
+        _idle_maintenance_paused = True
+    elif action in {"start", "restart"}:
+        _idle_maintenance_paused = False
+    for instance in instances:
+        worker_id = str(instance["worker_id"])
+        online = bool(instance.get("running") or instance.get("connected"))
+        if action == "start":
+            if online:
+                continue
+            result = await asyncio.to_thread(manager.start, worker_id)
+        elif action in {"stop", "stop-idle"}:
+            if not online:
+                continue
+            if action == "stop-idle" and not _worker_is_idle(worker_id):
+                continue
+            if instance.get("connected"):
+                stopped = await _shutdown_connected_worker(
+                    worker_id,
+                    f"bulk {action}",
+                )
+                result = {"worker_id": worker_id, "stopped": stopped}
+            else:
+                result = await asyncio.to_thread(manager.stop, worker_id)
+        else:
+            if not online:
+                continue
+            if instance.get("connected"):
+                await _shutdown_connected_worker(
+                    worker_id,
+                    f"bulk {action}",
+                )
+                await _wait_for_managed_worker_offline(manager, worker_id)
+            else:
+                await asyncio.to_thread(manager.stop, worker_id)
+            if action == "reset-session":
+                result = await asyncio.to_thread(
+                    manager.reset_session,
+                    worker_id,
+                )
+                await asyncio.to_thread(manager.start, worker_id)
+            else:
+                result = await asyncio.to_thread(manager.start, worker_id)
+        results.append(result)
+    return {
+        "action": action,
+        "affected": len(results),
+        "idle_maintenance_paused": _idle_maintenance_paused,
+        "results": results,
+    }
+
+
 def _configured_agent_rows() -> list[dict[str, Any]]:
     config = _read_config()
     agents = config.get("agents") if isinstance(config.get("agents"), list) else []
@@ -7463,6 +9417,22 @@ def admin_list_websockets() -> dict[str, Any]:
     """List every active EMULLM WebSocket and its inbound/outbound frame counts."""
     connections = _active_websocket_rows()
     return {"count": len(connections), "connections": connections}
+
+
+@router.get("/admin/emullm/clients")
+@router.get("/emullm/admin/clients")
+def admin_list_clients() -> dict[str, Any]:
+    """List server-lifetime logical clients observed on OpenAI-compatible HTTP routes."""
+    clients = _openai_client_rows()
+    requests = _openai_request_rows()
+    return {
+        "count": len(clients),
+        "active_count": sum(1 for client in clients if client["connected"]),
+        "active_requests": sum(int(client["active_requests"]) for client in clients),
+        "clients": clients,
+        "request_count": len(requests),
+        "requests": requests,
+    }
 
 
 def _require_local_process_control(request: Request) -> None:
@@ -7800,6 +9770,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   .attachment-card { min-width: 0; padding: 8px; border: 1px solid var(--line-soft); border-radius: 6px; background: #06141c; }
   .attachment-card img, .attachment-card video { display: block; width: 100%; height: 110px; margin-bottom: 7px; border-radius: 4px; background: #02090d; object-fit: contain; }
   .attachment-card audio { width: 100%; height: 34px; margin: 5px 0; }
+  #image-generation-preview { display: none; width: min(100%, 640px); max-height: 480px; margin-top: 9px; border: 1px solid var(--line); border-radius: 6px; background: #02090d; object-fit: contain; }
   .attachment-card .file-icon { display: grid; place-items: center; height: 58px; margin-bottom: 6px; border-radius: 4px; background: #0d2833; color: var(--accent); font: 800 1.1rem monospace; }
   .attachment-name { overflow: hidden; color: #c5e0e5; font-size: .7rem; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
   .attachment-meta { color: var(--muted); font-size: .62rem; line-height: 1.45; overflow-wrap: anywhere; }
@@ -7841,6 +9812,11 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   .route-order-item { width: max-content; max-width: 100%; display: grid; grid-template-columns: auto max-content auto; gap: 5px; align-items: center; padding: 5px 6px; border: 1px solid var(--line-soft); border-radius: 5px; background: #06141c; }
   .route-order-item code { max-width: 310px; overflow: hidden; color: #b9d8de; text-overflow: ellipsis; white-space: nowrap; }
   .route-order-item button { min-width: 32px; padding: 3px 7px; }
+  .sort-button { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; }
+  .stats-scroll { max-height: 210px; overflow: auto; }
+  .stats-scroll.expanded { max-height: none; }
+  .stats-scroll thead { position: sticky; top: 0; z-index: 2; background: var(--panel-2); }
+  .stats-scroll tfoot { position: sticky; bottom: 0; z-index: 2; background: var(--panel-2); }
   @media (max-width: 1050px) { .two-column { grid-template-columns: 1fr; } }
   @media (max-width: 760px) {
     .app-shell { grid-template-columns: 1fr; }
@@ -7864,10 +9840,14 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <div class="nav-label">Live</div>
     <a class="nav-link" href="#overview"><span>Overview</span><b>LIVE</b></a>
     <a class="nav-link" href="#connections"><span>WebSockets</span><b id="nav-socket-count">0</b></a>
+    <a class="nav-link" href="#clients"><span>FastAPI requests</span><b id="nav-client-count">0</b></a>
+    <a class="nav-link" href="#telemetry"><span>Request telemetry</span><b id="nav-waiting-count">0</b></a>
     <a class="nav-link" href="#servants"><span>Headless servants</span><b id="nav-servant-count">0</b></a>
     <div class="nav-label">Control</div>
     <a class="nav-link" href="#agents"><span>Agent controls</span><b>CFG</b></a>
     <a class="nav-link" href="#server-settings"><span>Server settings</span><b>CFG</b></a>
+    <a class="nav-link" href="#backend-config"><span>Backends</span><b id="nav-backend-count">0</b></a>
+    <a class="nav-link" href="#codex-suppliers"><span>Codex suppliers</span><b id="nav-supplier-count">0</b></a>
     <a class="nav-link" href="#managed"><span>Managed workers</span><b id="nav-managed-count">0</b></a>
     <a class="nav-link" href="#model-configurator"><span>Models configurator</span><b id="nav-config-model-count">0</b></a>
     <a class="nav-link" href="#test-client"><span>Model test client</span><b id="nav-model-count">0</b></a>
@@ -7882,8 +9862,13 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   <div class="chips">
     <span class="chip">MODE <b id="mode">-</b></span>
     <span class="chip">SOCKETS <b id="top-socket-count">0</b></span>
+    <span class="chip">CLIENTS <b id="top-client-count">0/0</b></span>
     <span class="chip">SERVANTS <b id="top-servant-count">0</b></span>
     <span class="chip">MODELS <b id="top-model-count">0</b></span>
+    <span class="chip">ACTIVE <b id="top-active-count">0</b></span>
+    <span class="chip">WAITING <b id="top-waiting-count">0</b></span>
+    <span class="chip">SERVED <b id="top-served-count">0</b></span>
+    <span class="chip">SWITCHES <b id="top-switch-count">0</b></span>
     <span class="chip">UPTIME <b id="top-uptime">0s</b></span>
     <span class="chip"><a href="/emullm/status">STATUS</a></span>
     <span class="chip" id="updated">-</span>
@@ -7910,6 +9895,10 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <select id="server-capability-fallback"><option value="stub">stub</option><option value="wait">wait</option><option value="error">error</option></select>
   </label>
   <label>Default subagent model<input id="server-subagent-model"></label>
+  <label>Maximum simultaneous calls<input id="server-max-concurrent" type="number" min="4" max="50" value="50"></label>
+  <label>Idle worker target<input id="server-idle-workers" type="number" min="0" max="50" value="5"></label>
+  <label>Idle grace (seconds)<input id="server-idle-grace" type="number" min="0" max="3600" step="1" value="30"></label>
+  <label>Backend fallback delay (seconds)<input id="server-backend-delay" type="number" min="0" max="300" step="0.5" value="5"></label>
   <label>Validation interval default<input id="server-validation-default" placeholder="never, 1day, 12h"></label>
   <label>Validation override<input id="server-validation-override" placeholder="blank = none"></label>
   <label>Proxy backend URL<input id="server-proxy-url" placeholder="https://.../v1"></label>
@@ -7922,15 +9911,163 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 </div>
 </section>
 
+<section class="panel" id="backend-config">
+<h2>OpenAI-compatible backends <button id="backend-new" type="button">Add backend</button>
+  <button id="backend-refresh" type="button">Refresh</button>
+  <span id="backend-note" class="muted"></span></h2>
+<p class="sub">Configures both direct <code>backends[]</code> entries and
+  <code>launch: proxy</code> agents. Existing proxy-agent service catalogs are
+  preserved. Inline API keys are write-only here; environment-variable keys are preferred.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Name</th><th>Source</th><th>Base URL</th><th>Model</th><th>Credential</th><th>Default</th><th>Actions</th></tr></thead>
+  <tbody id="backend-config-rows"><tr><td colspan="7" class="muted">loading...</td></tr></tbody>
+</table>
+</div>
+<details id="backend-editor">
+  <summary id="backend-editor-title">Add backend</summary>
+  <form id="backend-form">
+    <div class="form-grid">
+      <label>Name<input id="backend-name" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" maxlength="100"></label>
+      <label>Base URL<input id="backend-base-url" required placeholder="https://provider.example/v1"></label>
+      <label>Default model<input id="backend-model" placeholder="provider/model"></label>
+      <label>API-key environment variable<input id="backend-api-key-env" placeholder="PROVIDER_API_KEY"></label>
+      <label>Inline API key (leave blank to preserve)<input id="backend-api-key" type="password" autocomplete="new-password"></label>
+      <label>Validation interval<input id="backend-validation" placeholder="never, 1day, 12h"></label>
+      <label>Description<input id="backend-description"></label>
+    </div>
+    <div class="checks">
+      <label><input id="backend-default" type="checkbox"> default backend</label>
+      <label><input id="backend-clear-api-key" type="checkbox"> clear stored inline API key</label>
+    </div>
+    <button type="submit">Save backend</button>
+    <button id="backend-cancel" type="button">Cancel</button>
+    <span id="backend-msg" class="msg"></span>
+  </form>
+</details>
+</section>
+
+<section class="panel" id="codex-suppliers">
+<h2>Codex suppliers <button id="supplier-new" type="button">Add supplier</button>
+  <button id="supplier-refresh" type="button">Refresh</button>
+  <span id="supplier-note" class="muted"></span></h2>
+<p class="sub">Declares providers capable of supplying Codex-family workers and models.
+  The current supplier is GitHub Copilot through resident <code>worker-copilot-*</code>
+  sessions.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Supplier</th><th>Kind</th><th>Worker pattern</th><th>Models</th><th>State</th><th>Actions</th></tr></thead>
+  <tbody id="supplier-rows"><tr><td colspan="6" class="muted">loading...</td></tr></tbody>
+</table>
+</div>
+<details id="supplier-editor">
+  <summary id="supplier-editor-title">Add Codex supplier</summary>
+  <form id="supplier-form">
+    <div class="form-grid">
+      <label>Supplier ID<input id="supplier-id" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" maxlength="100"></label>
+      <label>Name<input id="supplier-name" required maxlength="200"></label>
+      <label>Kind<select id="supplier-kind"><option value="copilot">copilot</option><option value="codex-cli">codex-cli</option><option value="openai-compatible">openai-compatible</option><option value="custom">custom</option></select></label>
+      <label>Priority<input id="supplier-priority" type="number" min="-10000" max="10000" value="0"></label>
+      <label>Worker pattern<input id="supplier-worker-pattern" placeholder="worker-codex-*"></label>
+      <label>Model prefix<input id="supplier-model-prefix" placeholder="copilot/"></label>
+      <label>Model patterns<input id="supplier-model-patterns" placeholder="*codex*,gpt-5.3-*"></label>
+      <label>Command<input id="supplier-command" placeholder="copilot or codex"></label>
+      <label>Base URL<input id="supplier-base-url" placeholder="https://provider.example/v1"></label>
+      <label>API-key environment variable<input id="supplier-api-key-env" placeholder="PROVIDER_API_KEY"></label>
+      <label>Description<input id="supplier-description"></label>
+    </div>
+    <div class="checks"><label><input id="supplier-enabled" type="checkbox" checked> enabled</label></div>
+    <button type="submit">Save supplier</button>
+    <button id="supplier-cancel" type="button">Cancel</button>
+    <span id="supplier-msg" class="msg"></span>
+  </form>
+</details>
+</section>
+
 <section class="panel" id="connections">
 <h2>Connected WebSockets <button id="refresh-websockets" type="button">List / refresh</button>
   <span id="websocket-note" class="muted"></span></h2>
 <div class="table-wrap">
 <table>
-  <thead><tr><th>Connection</th><th>Kind / endpoint</th><th>Identity / subscription</th><th>Client</th><th>Messages</th><th>Age</th></tr></thead>
-  <tbody id="websocket-connections"><tr><td colspan="6" class="muted">Click List / refresh.</td></tr></tbody>
+  <thead><tr><th>Connection</th><th>Kind / endpoint</th><th>Identity / subscription</th><th>Client</th><th>Messages</th><th>Age</th><th>Last satisfied</th><th>Last client work</th></tr></thead>
+  <tbody id="websocket-connections"><tr><td colspan="8" class="muted">Click List / refresh.</td></tr></tbody>
 </table>
 </div>
+</section>
+
+<section class="panel" id="clients">
+<h2>FastAPI requests <button id="refresh-clients" type="button">List / refresh</button>
+  <span id="client-note" class="muted"></span></h2>
+<p class="sub">Logical sessions observed on <code>/v1/*</code>. Supply
+  <code>X-EmuLLM-Client-ID</code> for a stable identity; otherwise EMULLM groups by
+  remote host and User-Agent. “Connected” means at least one request is active.</p>
+<h3>Active / recent requests</h3>
+<div class="table-wrap stats-scroll">
+<table>
+  <thead><tr><th>Request</th><th>Client</th><th>Method / endpoint</th><th>State</th><th>Started</th><th>Duration</th></tr></thead>
+  <tbody id="fastapi-requests"><tr><td colspan="6" class="muted">Click List / refresh.</td></tr></tbody>
+</table>
+</div>
+<h3>Logical client sessions</h3>
+<div class="table-wrap stats-scroll">
+<table>
+  <thead><tr><th>Client</th><th>Address</th><th>State</th><th>Requests</th><th>Last endpoint</th><th>First seen</th><th>Last seen</th></tr></thead>
+  <tbody id="openai-clients"><tr><td colspan="7" class="muted">Click List / refresh.</td></tr></tbody>
+</table>
+</div>
+</section>
+
+<section class="panel" id="telemetry">
+<h2>Request telemetry <span id="telemetry-summary" class="muted"></span>
+  <label style="display:inline-flex;align-items:center;gap:5px">Footer
+    <select id="telemetry-footer-mode" style="width:auto">
+      <option value="both">Totals + weighted averages</option>
+      <option value="totals">Cumulative totals</option>
+      <option value="averages">Cumulative averages</option>
+    </select>
+  </label>
+</h2>
+<p class="sub">Server-lifetime service time starts when a request reaches a worker. Waiting shows
+  client requests deliberately held because no worker is connected/ready or before backend fallback.</p>
+<h3>By service kind</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Service</th><th>Active</th><th>Attempts</th><th>Served</th><th>Deferred</th><th>Rejected</th><th>Failed</th><th>Total time</th><th>Average</th></tr></thead>
+  <tbody id="telemetry-services"><tr><td colspan="9" class="muted">No requests served yet.</td></tr></tbody>
+  <tfoot id="telemetry-services-total"></tfoot>
+</table></div>
+<h3>By worker / relayed backend <button id="telemetry-workers-toggle" type="button">Show all</button></h3>
+<div class="table-wrap stats-scroll" id="telemetry-workers-wrap"><table>
+  <thead><tr>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="id">Worker</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="active">Active</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="reserved">Reserved</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="attempts">Attempts</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="served">Served</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="deferred">Deferred</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="failed">Failed / rejected</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="switches">Model switches</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="total_seconds">Total time</button></th>
+    <th><button class="sort-button" data-stats-table="workers" data-stats-key="average_seconds">Average</button></th>
+  </tr></thead>
+  <tbody id="telemetry-workers"><tr><td colspan="10" class="muted">No worker timing yet.</td></tr></tbody>
+  <tfoot id="telemetry-workers-total"></tfoot>
+</table></div>
+<h3>By requested model <button id="telemetry-models-toggle" type="button">Show all</button></h3>
+<div class="table-wrap stats-scroll" id="telemetry-models-wrap"><table>
+  <thead><tr>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="id">Model</button></th>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="active">Active</button></th>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="attempts">Requests</button></th>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="served">Served</button></th>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="deferred">Deferred</button></th>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="failed">Failed / rejected</button></th>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="total_seconds">Total time</button></th>
+    <th><button class="sort-button" data-stats-table="models" data-stats-key="average_seconds">Average</button></th>
+  </tr></thead>
+  <tbody id="telemetry-models"><tr><td colspan="8" class="muted">No model timing yet.</td></tr></tbody>
+  <tfoot id="telemetry-models-total"></tfoot>
+</table></div>
+<div id="telemetry-waiting" class="capability-card"></div>
 </section>
 
 <section class="panel" id="managed">
@@ -7948,6 +10085,14 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 <h2>Headless Copilot servants <button id="refresh-copilots" type="button">Refresh</button>
   <button id="refresh-copilot-models" type="button">Refresh Copilot LLMs</button>
   <span id="copilot-note" class="muted"></span></h2>
+<div style="margin-bottom:9px">
+  <button id="copilot-start-all" type="button">Start all offline</button>
+  <button id="copilot-stop-all" type="button">Stop all online</button>
+  <button id="copilot-stop-idle" type="button">Stop idle workers</button>
+  <button id="copilot-restart-all" type="button">Restart all online</button>
+  <button id="copilot-reset-all" type="button">New sessions for all online</button>
+  <span id="copilot-bulk-msg" class="msg"></span>
+</div>
 <p class="sub">Each servant connects to <code>/emullm/ws</code> and reuses one Copilot
   SDK/CLI process and session across requests. Tool access is disabled unless explicitly enabled.
   <span id="copilot-model-note"></span></p>
@@ -7994,6 +10139,8 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       <label>Max AI credits<input id="cp-credits" type="number" min="0.01" step="0.01" placeholder="unlimited"></label>
       <label>Request timeout (seconds)<input id="cp-timeout" type="number" min="1" max="86400" value="900"></label>
       <label>Reconnect delay (seconds)<input id="cp-reconnect" type="number" min="0.1" max="300" step="0.1" value="2"></label>
+      <label>Anti-idle interval (seconds; default 40, 0 disables)<input id="cp-keepalive-interval" type="number" min="0" max="3600" step="1" value="40"></label>
+      <label>Anti-idle timeout (≤3 seconds)<input id="cp-keepalive-timeout" type="number" min="0.1" max="3" step="0.1" value="3"></label>
       <label>Startup warmup prompt<input id="cp-warmup-prompt" value="Startup warmup: reply only READY."></label>
       <label>Chunk token override<input id="cp-chunk-tokens" type="number" min="1000" max="1000000" placeholder="derive from selected model"></label>
       <label>Maximum chunks<input id="cp-max-chunks" type="number" min="1" max="1000" value="64"></label>
@@ -8006,11 +10153,10 @@ _ADMIN_PAGE_HTML = """<!doctype html>
     <textarea id="copilot-prompt" spellcheck="false"></textarea>
     <div class="checks">
       <label><input id="cp-autostart" type="checkbox" checked> autostart with EMULLM</label>
-      <label><input id="cp-warmup" type="checkbox" checked> call once at startup before connecting</label>
       <label><input id="cp-chunk-prompts" type="checkbox" checked> chunk prompts larger than the servant model</label>
-      <label><input id="cp-allow-all" type="checkbox"> allow all tools, paths, and URLs (unsafe)</label>
-      <label><input id="cp-custom-instructions" type="checkbox"> load repository instructions</label>
-      <label><input id="cp-builtin-mcps" type="checkbox"> enable built-in MCPs</label>
+      <label><input id="cp-allow-all" type="checkbox" checked> allow all tools, paths, and URLs (unsafe)</label>
+      <label><input id="cp-custom-instructions" type="checkbox" checked> load repository instructions</label>
+      <label><input id="cp-builtin-mcps" type="checkbox" checked> enable built-in MCPs</label>
     </div>
     <button type="submit">Save configuration</button>
     <button id="copilot-new" type="button">Create new servant</button>
@@ -8046,6 +10192,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       <label><input id="model-config-audio" type="checkbox"> audio input</label>
       <label><input id="model-config-file" type="checkbox"> general files</label>
       <label><input id="model-config-code" type="checkbox"> code</label>
+      <label><input id="model-config-image-output" type="checkbox"> image output</label>
       <label><input id="model-config-summary" type="checkbox"> summarization</label>
     </div>
     <div class="checks">
@@ -8054,6 +10201,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       <label><input id="model-route-codex" type="checkbox"> worker-codex-*</label>
       <label><input id="model-route-unknown" type="checkbox"> worker-unknown-*</label>
       <label><input id="model-route-backends" type="checkbox"> backend-*</label>
+      <span id="model-route-specific-backends"></span>
     </div>
     <div class="sub">Ordered active targets (move left for higher priority, right for lower)</div>
     <div id="model-route-order" class="route-order"></div>
@@ -8113,6 +10261,19 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   <summary>Raw response</summary>
   <pre id="model-test-raw"></pre>
 </details>
+<h3>Image generation test</h3>
+<p class="sub">Uses the real <code>POST /v1/images/generations</code> surface. The default
+  Copilot model generates a workspace PNG with tools; the result explicitly says whether
+  it came from a worker or the simulated placeholder.</p>
+<div class="form-grid">
+  <label>Image model<input id="image-generation-model" value="copilot/gpt-5.3-codex"></label>
+  <label>Image prompt<input id="image-generation-prompt" value="A bright red circle centered on a clean white background"></label>
+</div>
+<button id="image-generation-run" type="button">Generate test image</button>
+<span id="image-generation-status" class="msg"></span>
+<img id="image-generation-preview" alt="Generated image test result">
+<pre id="image-generation-description" class="muted"></pre>
+<details><summary>Raw image response</summary><pre id="image-generation-raw"></pre></details>
 </section>
 
 <section class="panel" id="config-sections">
@@ -8163,6 +10324,13 @@ function formatDuration(value) {
   const hours = Math.floor(seconds / 3600); seconds %= 3600;
   const minutes = Math.floor(seconds / 60); seconds %= 60;
   return [days ? days + 'd' : '', hours ? hours + 'h' : '', minutes ? minutes + 'm' : '', seconds + 's'].filter(Boolean).join(' ');
+}
+function formatActivityTime(timestamp, elapsedSeconds, kind) {
+  if (!timestamp) return '<span class="muted">never</span>';
+  const date = new Date(timestamp);
+  const clock = Number.isNaN(date.getTime()) ? String(timestamp) : date.toLocaleTimeString();
+  return (kind ? '<b>' + esc(kind) + '</b><br>' : '') + esc(clock) +
+    '<br><span class="muted">' + formatDuration(elapsedSeconds) + ' ago</span>';
 }
 function formatTokens(value) {
   const tokens = Number(value) || 0;
@@ -8258,9 +10426,14 @@ let copilotInstances = [];
 let copilotModelCatalog = [];
 let apiModelCatalog = [];
 let modelConfigCatalog = [];
-let modelConfigMeta = { overrides: {}, routes: {}, backends: [], on_demand: { slots: [], limit: 4 } };
+let modelConfigMeta = { overrides: {}, routes: {}, backends: [], on_demand: { slots: [], limit: 46, max_concurrent_calls: 50 } };
 let selectedModelConfigId = '';
 let selectedModelConfigIds = [];
+let latestTelemetryState = {};
+let telemetryWorkerSort = { key: 'served', direction: -1 };
+let telemetryModelSort = { key: 'attempts', direction: -1 };
+let telemetryShowAllWorkers = false;
+let telemetryShowAllModels = false;
 let editingCopilot = null;
 let suggestedCopilotId = 'worker-copilot-1';
 let modelTestController = null;
@@ -8271,6 +10444,10 @@ let modelTestAttachments = [];
 let serverPid = null;
 let currentConfig = {};
 let activeConfigSection = 'services';
+let configuredBackends = [];
+let editingBackend = null;
+let codexSuppliers = [];
+let editingSupplier = null;
 const CONFIG_SECTIONS = {
   services: ['Service catalog and per-service fallback policies.', 'object'],
   agents: ['Unified recruit, subagent, mock, and proxy agent definitions.', 'array'],
@@ -8278,6 +10455,7 @@ const CONFIG_SECTIONS = {
   workers: ['Legacy managed worker definitions used by auto mode.', 'array'],
   mock_workers: ['Legacy in-process mock worker definitions.', 'array'],
   backends: ['Legacy OpenAI-compatible proxy backend definitions.', 'array'],
+  codex_suppliers: ['Codex worker/model supplier definitions.', 'array'],
   mock: ['Global mock reply and template used by mock mode.', 'object'],
 };
 
@@ -8342,6 +10520,250 @@ field('carol-enabled').addEventListener('change', async () => {
   await Promise.all([refreshConfiguredAgents(), refreshWorkers(), refreshCopilots(), loadConfig()]);
 });
 
+function setBackendMsg(text, cls) {
+  field('backend-msg').textContent = text;
+  field('backend-msg').className = 'msg ' + (cls || '');
+}
+function resetBackendEditor() {
+  editingBackend = null;
+  field('backend-editor').open = true;
+  field('backend-editor-title').textContent = 'Add backend';
+  field('backend-form').reset();
+  field('backend-default').checked = false;
+  field('backend-clear-api-key').checked = false;
+  setBackendMsg('', '');
+}
+function editBackend(record) {
+  editingBackend = { source: record.source, index: record.index };
+  field('backend-editor').open = true;
+  field('backend-editor-title').textContent = 'Edit ' + (record.name || record.record_id);
+  field('backend-name').value = record.name || '';
+  field('backend-base-url').value = record.base_url || '';
+  field('backend-model').value = record.model || '';
+  field('backend-api-key-env').value = record.api_key_env || '';
+  field('backend-api-key').value = '';
+  field('backend-validation').value = record.validation_interval ?? '';
+  field('backend-description').value = record.description || '';
+  field('backend-default').checked = !!record.default;
+  field('backend-clear-api-key').checked = false;
+  setBackendMsg(
+    record.has_api_key ? 'A stored inline API key is present and remains unchanged.' : '',
+    '',
+  );
+}
+async function refreshBackendConfigs() {
+  const response = await getJSON(ADMIN + '/backends/configured', { cache: 'no-store' });
+  configuredBackends = (response.body && response.body.backends) || [];
+  field('backend-note').textContent = configuredBackends.length + ' configured';
+  field('nav-backend-count').textContent = configuredBackends.length;
+  field('backend-config-rows').innerHTML = configuredBackends.length
+    ? configuredBackends.map(record =>
+      '<tr><td><b>' + esc(record.name || record.record_id) + '</b><br><span class="muted">' +
+      esc(record.description || '') + '</span></td><td><code>' + esc(record.source) +
+      ':' + record.index + '</code></td><td><code>' + esc(record.base_url || '--') +
+      '</code></td><td>' + esc(record.model || '--') + '</td><td>' +
+      (record.has_api_key ? 'stored key' : (record.api_key_env ? ('env ' + esc(record.api_key_env)) : 'none')) +
+      '</td><td>' + (record.default ? 'yes' : 'no') + '</td><td>' +
+      '<button data-backend-action="edit" data-source="' + esc(record.source) +
+      '" data-index="' + record.index + '">Edit</button>' +
+      '<button data-backend-action="delete" class="danger" data-source="' +
+      esc(record.source) + '" data-index="' + record.index + '">Delete</button></td></tr>'
+    ).join('')
+    : '<tr><td colspan="7" class="muted">none configured</td></tr>';
+}
+field('backend-new').addEventListener('click', resetBackendEditor);
+field('backend-cancel').addEventListener('click', () => {
+  field('backend-editor').open = false;
+  editingBackend = null;
+});
+field('backend-refresh').addEventListener('click', refreshBackendConfigs);
+field('backend-config-rows').addEventListener('click', async event => {
+  const button = event.target.closest('button[data-backend-action]');
+  if (!button) return;
+  const source = button.dataset.source;
+  const index = Number(button.dataset.index);
+  const record = configuredBackends.find(
+    item => item.source === source && item.index === index
+  );
+  if (!record) return;
+  if (button.dataset.backendAction === 'edit') {
+    editBackend(record);
+    return;
+  }
+  if (!confirm('Delete backend ' + (record.name || record.record_id) + '?')) return;
+  const deletePath = ADMIN + '/backends/configured/' + encodeURIComponent(source) +
+    '/' + index + (record.name
+      ? '?expected_name=' + encodeURIComponent(record.name)
+      : '');
+  const response = await getJSON(deletePath, { method: 'DELETE' });
+  setBackendMsg(
+    response.ok ? 'backend deleted' : JSON.stringify(response.body.detail || response.status),
+    response.ok ? 'ok' : 'err',
+  );
+  if (response.ok) await Promise.all([refreshBackendConfigs(), loadConfig()]);
+});
+field('backend-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const apiKey = field('backend-api-key').value;
+  const body = {
+    name: field('backend-name').value.trim(),
+    base_url: field('backend-base-url').value.trim(),
+    description: field('backend-description').value.trim() || null,
+    api_key_env: field('backend-api-key-env').value.trim() || null,
+    model: field('backend-model').value.trim() || null,
+    default: field('backend-default').checked,
+    validation_interval: field('backend-validation').value.trim() || null,
+    clear_api_key: field('backend-clear-api-key').checked,
+  };
+  if (editingBackend) {
+    const existing = configuredBackends.find(
+      item => item.source === editingBackend.source && item.index === editingBackend.index
+    );
+    if (existing) body.expected_name = existing.name;
+  }
+  if (apiKey) body.api_key = apiKey;
+  const path = editingBackend
+    ? ADMIN + '/backends/configured/' + encodeURIComponent(editingBackend.source) +
+      '/' + editingBackend.index
+    : ADMIN + '/backends/configured';
+  const response = await getJSON(path, {
+    method: editingBackend ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  setBackendMsg(
+    response.ok ? 'saved; restart to refresh advertised backend catalogs' :
+      JSON.stringify(response.body.detail || response.status),
+    response.ok ? 'ok' : 'err',
+  );
+  if (response.ok) {
+    editingBackend = null;
+    field('backend-editor').open = false;
+    await Promise.all([refreshBackendConfigs(), loadConfig(), refreshModelConfigurator()]);
+  }
+});
+
+function setSupplierMsg(text, cls) {
+  field('supplier-msg').textContent = text;
+  field('supplier-msg').className = 'msg ' + (cls || '');
+}
+function resetSupplierEditor() {
+  editingSupplier = null;
+  field('supplier-editor').open = true;
+  field('supplier-editor-title').textContent = 'Add Codex supplier';
+  field('supplier-form').reset();
+  field('supplier-kind').value = 'custom';
+  field('supplier-priority').value = '0';
+  field('supplier-enabled').checked = true;
+  field('supplier-id').readOnly = false;
+  setSupplierMsg('', '');
+}
+function editSupplier(supplier) {
+  editingSupplier = supplier.id;
+  field('supplier-editor').open = true;
+  field('supplier-editor-title').textContent = 'Edit ' + supplier.name;
+  field('supplier-id').value = supplier.id;
+  field('supplier-id').readOnly = true;
+  field('supplier-name').value = supplier.name || '';
+  field('supplier-kind').value = supplier.kind || 'custom';
+  field('supplier-priority').value = supplier.priority ?? 0;
+  field('supplier-worker-pattern').value = supplier.worker_pattern || '';
+  field('supplier-model-prefix').value = supplier.model_prefix || '';
+  field('supplier-model-patterns').value = (supplier.model_patterns || []).join(',');
+  field('supplier-command').value = supplier.command || '';
+  field('supplier-base-url').value = supplier.base_url || '';
+  field('supplier-api-key-env').value = supplier.api_key_env || '';
+  field('supplier-description').value = supplier.description || '';
+  field('supplier-enabled').checked = supplier.enabled !== false;
+  setSupplierMsg('', '');
+}
+async function refreshCodexSuppliers() {
+  const response = await getJSON(ADMIN + '/codex-suppliers', { cache: 'no-store' });
+  codexSuppliers = (response.body && response.body.suppliers) || [];
+  field('supplier-note').textContent = codexSuppliers.length + ' configured';
+  field('nav-supplier-count').textContent = codexSuppliers.length;
+  field('supplier-rows').innerHTML = codexSuppliers.length
+    ? codexSuppliers.map(supplier =>
+      '<tr><td><b>' + esc(supplier.name) + '</b><br><code>' + esc(supplier.id) +
+      '</code></td><td>' + esc(supplier.kind) + '</td><td><code>' +
+      esc(supplier.worker_pattern || '--') + '</code></td><td>' +
+      esc((supplier.model_patterns || []).join(', ') || '--') + '</td><td>' +
+      (supplier.enabled ? '<span class="dot on"></span>enabled' :
+        '<span class="dot off"></span>disabled') + '</td><td>' +
+      '<button data-supplier-action="edit" data-id="' + esc(supplier.id) +
+      '">Edit</button><button data-supplier-action="delete" class="danger" data-id="' +
+      esc(supplier.id) + '">Delete</button></td></tr>'
+    ).join('')
+    : '<tr><td colspan="6" class="muted">none configured</td></tr>';
+}
+field('supplier-new').addEventListener('click', resetSupplierEditor);
+field('supplier-cancel').addEventListener('click', () => {
+  field('supplier-editor').open = false;
+  editingSupplier = null;
+});
+field('supplier-refresh').addEventListener('click', refreshCodexSuppliers);
+field('supplier-rows').addEventListener('click', async event => {
+  const button = event.target.closest('button[data-supplier-action]');
+  if (!button) return;
+  const supplier = codexSuppliers.find(item => item.id === button.dataset.id);
+  if (!supplier) return;
+  if (button.dataset.supplierAction === 'edit') {
+    editSupplier(supplier);
+    return;
+  }
+  if (!confirm('Delete Codex supplier ' + supplier.name + '?')) return;
+  const response = await getJSON(
+    ADMIN + '/codex-suppliers/' + encodeURIComponent(supplier.id),
+    { method: 'DELETE' },
+  );
+  setSupplierMsg(
+    response.ok ? 'supplier deleted' : JSON.stringify(response.body.detail || response.status),
+    response.ok ? 'ok' : 'err',
+  );
+  if (response.ok) await Promise.all([refreshCodexSuppliers(), loadConfig()]);
+});
+field('supplier-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const body = {
+    id: field('supplier-id').value.trim(),
+    name: field('supplier-name').value.trim(),
+    kind: field('supplier-kind').value,
+    enabled: field('supplier-enabled').checked,
+    priority: Number(field('supplier-priority').value) || 0,
+    description: field('supplier-description').value.trim() || null,
+    worker_pattern: field('supplier-worker-pattern').value.trim() || null,
+    model_prefix: field('supplier-model-prefix').value.trim() || null,
+    model_patterns: csv(field('supplier-model-patterns').value),
+    command: field('supplier-command').value.trim() || null,
+    base_url: field('supplier-base-url').value.trim() || null,
+    api_key_env: field('supplier-api-key-env').value.trim() || null,
+  };
+  const response = await getJSON(
+    editingSupplier
+      ? ADMIN + '/codex-suppliers/' + encodeURIComponent(editingSupplier)
+      : ADMIN + '/codex-suppliers',
+    {
+      method: editingSupplier ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+  setSupplierMsg(
+    response.ok ? 'supplier saved' : JSON.stringify(response.body.detail || response.status),
+    response.ok ? 'ok' : 'err',
+  );
+  if (response.ok) {
+    editingSupplier = null;
+    field('supplier-editor').open = false;
+    await Promise.all([
+      refreshCodexSuppliers(),
+      loadConfig(),
+      refreshApiModels(),
+      refreshModelConfigurator(),
+    ]);
+  }
+});
+
 async function refreshWebsockets() {
   const r = await getJSON(ADMIN + '/websockets', { cache: 'no-store' });
   const connections = (r.body && r.body.connections) || [];
@@ -8350,7 +10772,7 @@ async function refreshWebsockets() {
   field('top-socket-count').textContent = connections.length;
   const tbody = field('websocket-connections');
   if (!connections.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">none</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="muted">none</td></tr>';
     return;
   }
   tbody.innerHTML = connections.map(connection => {
@@ -8360,10 +10782,62 @@ async function refreshWebsockets() {
       '<td><b>' + esc(connection.kind) + '</b><br><code>' + esc(connection.endpoint) + '</code></td>' +
       '<td>' + esc(identity) + '</td><td>' + esc(connection.client || '--') + '</td>' +
       '<td>in ' + (connection.messages_in || 0) + ' / out ' + (connection.messages_out || 0) + '</td>' +
-      '<td>' + (connection.connected_seconds || 0) + 's</td></tr>';
+      '<td>' + formatDuration(connection.connected_seconds) + '</td><td>' +
+      formatActivityTime(
+        connection.last_satisfied_at,
+        connection.last_satisfied_seconds,
+        connection.last_satisfied_kind,
+      ) + '</td><td>' +
+      formatActivityTime(connection.last_client_work_at, connection.last_client_work_seconds) +
+      '</td></tr>';
   }).join('');
 }
 field('refresh-websockets').addEventListener('click', refreshWebsockets);
+
+async function refreshClients() {
+  const r = await getJSON(ADMIN + '/clients', { cache: 'no-store' });
+  const clients = (r.body && r.body.clients) || [];
+  const requests = (r.body && r.body.requests) || [];
+  const active = Number((r.body && r.body.active_count) || 0);
+  const activeRequests = Number((r.body && r.body.active_requests) || 0);
+  field('client-note').textContent = active + ' connected · ' + clients.length +
+    ' known · ' + activeRequests + ' active request(s)';
+  field('nav-client-count').textContent = clients.length;
+  field('top-client-count').textContent = active + '/' + clients.length;
+  const requestBody = field('fastapi-requests');
+  requestBody.innerHTML = requests.length ? requests.map(request => {
+    const client = request.declared_client_id || request.client_id;
+    const state = request.active
+      ? '<span class="dot on"></span>active'
+      : '<span class="dot off"></span>HTTP ' + esc(request.status ?? '--');
+    return '<tr><td><code>' + esc(request.external_request_id || request.request_id) +
+      '</code></td><td>' + esc(client) + '</td><td><b>' + esc(request.method) +
+      '</b><br><code>' + esc(request.endpoint) + '</code></td><td>' + state +
+      '</td><td>' + formatActivityTime(request.started_at, request.age_seconds) +
+      '</td><td>' + formatDuration(request.duration_seconds) + '</td></tr>';
+  }).join('') : '<tr><td colspan="6" class="muted">none observed</td></tr>';
+  const tbody = field('openai-clients');
+  if (!clients.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">none observed</td></tr>';
+    return;
+  }
+  tbody.innerHTML = clients.map(client => {
+    const name = client.declared_id || client.client_id;
+    const address = client.host + (client.last_port != null ? ':' + client.last_port : '');
+    const state = client.connected
+      ? '<span class="dot on"></span>connected · ' + client.active_requests + ' active'
+      : '<span class="dot off"></span>idle';
+    return '<tr><td><b>' + esc(name) + '</b><br><span class="muted">' +
+      esc(client.user_agent || 'unknown') + '</span></td><td><code>' + esc(address) +
+      '</code></td><td>' + state + '</td><td>' + client.requests + '</td><td><code>' +
+      esc((client.last_method || '') + ' ' + (client.last_endpoint || '')) +
+      '</code><br><span class="muted">HTTP ' + esc(client.last_status ?? '--') +
+      '</span></td><td>' +
+      formatActivityTime(client.first_seen_at, client.first_seen_seconds) + '</td><td>' +
+      formatActivityTime(client.last_seen_at, client.last_seen_seconds) + '</td></tr>';
+  }).join('');
+}
+field('refresh-clients').addEventListener('click', refreshClients);
 
 async function refreshWorkers() {
   const r = await getJSON(ADMIN + '/workers', { cache: 'no-store' });
@@ -8417,6 +10891,8 @@ function resetCopilotForm() {
   field('cp-credits').value = '';
   field('cp-timeout').value = '900';
   field('cp-reconnect').value = '2';
+  field('cp-keepalive-interval').value = '40';
+  field('cp-keepalive-timeout').value = '3';
   field('cp-warmup-prompt').value = 'Startup warmup: reply only READY.';
   field('cp-chunk-tokens').value = '';
   field('cp-max-chunks').value = '64';
@@ -8425,11 +10901,10 @@ function resetCopilotForm() {
   field('cp-max-attachment').value = '26214400';
   field('copilot-prompt').value = DEFAULT_COPILOT_PROMPT;
   field('cp-autostart').checked = true;
-  field('cp-warmup').checked = true;
   field('cp-chunk-prompts').checked = true;
-  field('cp-allow-all').checked = false;
-  field('cp-custom-instructions').checked = false;
-  field('cp-builtin-mcps').checked = false;
+  field('cp-allow-all').checked = true;
+  field('cp-custom-instructions').checked = true;
+  field('cp-builtin-mcps').checked = true;
   updateReasoningOptions();
   renderCopilotCapabilities();
   setCopilotMsg('', '');
@@ -8455,6 +10930,8 @@ function editCopilot(config) {
   field('cp-credits').value = config.max_ai_credits ?? '';
   field('cp-timeout').value = config.timeout_seconds ?? 900;
   field('cp-reconnect').value = config.reconnect_seconds ?? 2;
+  field('cp-keepalive-interval').value = config.keepalive_interval_seconds ?? 40;
+  field('cp-keepalive-timeout').value = config.keepalive_timeout_seconds ?? 3;
   field('cp-warmup-prompt').value = config.warmup_prompt || 'Startup warmup: reply only READY.';
   field('cp-chunk-tokens').value = config.chunk_tokens ?? '';
   field('cp-max-chunks').value = config.max_chunks ?? 64;
@@ -8463,7 +10940,6 @@ function editCopilot(config) {
   field('cp-max-attachment').value = config.max_attachment_bytes ?? 26214400;
   field('copilot-prompt').value = config.system_prompt || DEFAULT_COPILOT_PROMPT;
   field('cp-autostart').checked = config.autostart !== false;
-  field('cp-warmup').checked = config.warmup !== false;
   field('cp-chunk-prompts').checked = config.chunk_long_prompts !== false;
   field('cp-allow-all').checked = !!config.allow_all;
   field('cp-custom-instructions').checked = !!config.load_custom_instructions;
@@ -8482,12 +10958,14 @@ function copilotConfigFromForm() {
     capabilities: csv(field('cp-capabilities').value),
     system_prompt: field('copilot-prompt').value,
     autostart: field('cp-autostart').checked,
-    warmup: field('cp-warmup').checked,
+    warmup: true,
     warmup_prompt: field('cp-warmup-prompt').value,
     chunk_long_prompts: field('cp-chunk-prompts').checked,
     max_chunks: Number(field('cp-max-chunks').value),
     timeout_seconds: Number(field('cp-timeout').value),
     reconnect_seconds: Number(field('cp-reconnect').value),
+    keepalive_interval_seconds: Number(field('cp-keepalive-interval').value),
+    keepalive_timeout_seconds: Number(field('cp-keepalive-timeout').value),
     context: field('cp-context').value,
     allow_all: field('cp-allow-all').checked,
     load_custom_instructions: field('cp-custom-instructions').checked,
@@ -8514,6 +10992,13 @@ async function refreshCopilots() {
   const tbody = field('copilots');
   const note = field('copilot-note');
   copilotInstances = (r.body && r.body.instances) || [];
+  const online = copilotInstances.filter(item => item.running || item.connected);
+  const offline = copilotInstances.filter(item => !item.running && !item.connected);
+  field('copilot-start-all').disabled = offline.length === 0;
+  field('copilot-stop-all').disabled = online.length === 0;
+  field('copilot-stop-idle').disabled = online.length === 0;
+  field('copilot-restart-all').disabled = online.length === 0;
+  field('copilot-reset-all').disabled = online.length === 0;
   field('nav-servant-count').textContent = copilotInstances.length;
   field('top-servant-count').textContent = copilotInstances.length;
   suggestedCopilotId = (r.body && r.body.next_worker_id) || 'worker-copilot-1';
@@ -8528,6 +11013,7 @@ async function refreshCopilots() {
     const cfg = item.config || {};
     const runtime = item.runtime || {};
     const state = item.connected ? 'connected' : (item.running ? 'starting / reconnecting' : 'stopped');
+    const online = item.running || item.connected;
     const masks = (item.modelmasks || []).length ? item.modelmasks.join(', ') : 'all API models';
     return '<tr><td><span class="dot ' + (item.running ? 'on' : 'off') + '"></span><b>' + esc(item.worker_id) + '</b></td>' +
       '<td>' + esc(item.selected_model || item.model || 'not started') +
@@ -8540,12 +11026,16 @@ async function refreshCopilots() {
       (runtime.bridge_pid ? (' · bridge ' + runtime.bridge_pid) : '') +
       (runtime.warmup_duration_ms != null ? ('<br>warmup ' + (runtime.warmup_duration_ms / 1000).toFixed(1) + 's') : '') +
       (runtime.last_chunk_count > 1 ? (' · ' + runtime.last_chunk_count + ' chunks') : '') +
-      (runtime.last_duration_ms != null ? ('<br>last ' + (runtime.last_duration_ms / 1000).toFixed(1) + 's') : '') + '</td>' +
+      (runtime.last_duration_ms != null ? ('<br>last ' + (runtime.last_duration_ms / 1000).toFixed(1) + 's') : '') +
+      (runtime.keepalives ? (' · keepalives ' + runtime.keepalives) : '') +
+      ((runtime.retired_keepalive_tasks || []).length
+        ? (' · retired tasks ' + runtime.retired_keepalive_tasks.length)
+        : '') + '</td>' +
       '<td><button data-cp-act="edit" data-id="' + esc(item.worker_id) + '">Edit</button>' +
-      '<button data-cp-act="start" data-id="' + esc(item.worker_id) + '">Start</button>' +
-      '<button data-cp-act="stop" data-id="' + esc(item.worker_id) + '">Stop</button>' +
-      '<button data-cp-act="restart" data-id="' + esc(item.worker_id) + '">Restart</button>' +
-      '<button data-cp-act="reset-session" data-id="' + esc(item.worker_id) + '">New session</button>' +
+      '<button data-cp-act="start" data-id="' + esc(item.worker_id) + '"' + (online ? ' disabled' : '') + '>Start</button>' +
+      '<button data-cp-act="stop" data-id="' + esc(item.worker_id) + '"' + (!online ? ' disabled' : '') + '>Stop</button>' +
+      '<button data-cp-act="restart" data-id="' + esc(item.worker_id) + '"' + (!online ? ' disabled' : '') + '>Restart</button>' +
+      '<button data-cp-act="reset-session" data-id="' + esc(item.worker_id) + '"' + (!online ? ' disabled' : '') + '>New session</button>' +
       '<button data-cp-act="delete" data-id="' + esc(item.worker_id) + '">Delete</button>' +
       '<a class="action-link" href="' + ADMIN + '/copilots/' + encodeURIComponent(item.worker_id) + '/log" target="_blank">log</a></td></tr>';
   }).join('');
@@ -8574,6 +11064,33 @@ async function refreshCopilotModels(force) {
 }
 field('refresh-copilots').addEventListener('click', refreshCopilots);
 field('refresh-copilot-models').addEventListener('click', () => refreshCopilotModels(true));
+async function runBulkCopilotAction(action, prompt) {
+  if (prompt && !confirm(prompt)) return;
+  const buttons = [
+    'copilot-start-all','copilot-stop-all','copilot-stop-idle',
+    'copilot-restart-all','copilot-reset-all',
+  ];
+  for (const id of buttons) field(id).disabled = true;
+  field('copilot-bulk-msg').textContent = action + '...';
+  const response = await getJSON(ADMIN + '/copilots/bulk/' + action, {
+    method: 'POST',
+  });
+  field('copilot-bulk-msg').textContent = response.ok
+    ? (response.body.affected + ' worker(s) affected')
+    : ('bulk action failed: ' + JSON.stringify((response.body && response.body.detail) || response.status));
+  field('copilot-bulk-msg').className = 'msg ' + (response.ok ? 'ok' : 'err');
+  await refreshCopilots();
+}
+field('copilot-start-all').addEventListener('click', () =>
+  runBulkCopilotAction('start', 'Start every offline Copilot worker?'));
+field('copilot-stop-all').addEventListener('click', () =>
+  runBulkCopilotAction('stop', 'Stop every online Copilot worker and pause idle maintenance?'));
+field('copilot-stop-idle').addEventListener('click', () =>
+  runBulkCopilotAction('stop-idle', 'Stop workers idle for at least the configured grace period?'));
+field('copilot-restart-all').addEventListener('click', () =>
+  runBulkCopilotAction('restart', 'Restart every online Copilot worker?'));
+field('copilot-reset-all').addEventListener('click', () =>
+  runBulkCopilotAction('reset-session', 'Replace the persistent sessions of every online worker?'));
 field('cp-model-picker').addEventListener('change', () => {
   if (field('cp-model-picker').value) field('cp-model').value = field('cp-model-picker').value;
   updateReasoningOptions();
@@ -8621,9 +11138,18 @@ field('copilots').addEventListener('click', async (event) => {
   if (action === 'edit') { editCopilot((item && item.config) || {}); return; }
   if (action === 'delete') {
     if (!confirm('Delete headless Copilot servant ' + id + '? Logs are retained.')) return;
+    if (item && (item.running || item.connected)) {
+      await getJSON(
+        ADMIN + '/copilots/' + encodeURIComponent(id) + '/online-action/stop',
+        { method: 'POST' },
+      );
+    }
     await getJSON(ADMIN + '/copilots/' + encodeURIComponent(id), { method: 'DELETE' });
   } else {
-    await getJSON(ADMIN + '/copilots/' + encodeURIComponent(id) + '/' + action, { method: 'POST' });
+    await getJSON(
+      ADMIN + '/copilots/' + encodeURIComponent(id) + '/online-action/' + action,
+      { method: 'POST' },
+    );
   }
   await refreshCopilots(); await loadConfig();
 });
@@ -8862,7 +11388,17 @@ function syncModelRouteShortcuts() {
   field('model-route-codex').checked = targets.includes('worker-codex-*');
   field('model-route-unknown').checked = targets.includes('worker-unknown-*');
   field('model-route-backends').checked = targets.includes('backend-*');
+  for (const input of field('model-route-specific-backends').querySelectorAll('input[data-backend-target]')) {
+    input.checked = targets.includes(input.dataset.backendTarget);
+  }
   renderModelRouteOrder();
+}
+function renderSpecificBackendShortcuts() {
+  field('model-route-specific-backends').innerHTML = (modelConfigMeta.backends || []).map(backend => {
+    const target = 'backend-' + backend.name;
+    return '<label><input type="checkbox" data-backend-target="' + esc(target) + '"> ' +
+      esc(target) + '</label>';
+  }).join('');
 }
 function renderModelRouteOrder() {
   const targets = modelConfigRouteTargets();
@@ -8918,6 +11454,7 @@ function syncModelConfigCheckboxes(model) {
   field('model-config-audio').checked = modelConfigModality(model, 'audio');
   field('model-config-file').checked = modelConfigModality(model, 'general_file');
   field('model-config-code').checked = modelConfigTask(model, 'code');
+  field('model-config-image-output').checked = modelConfigTask(model, 'image_output');
   field('model-config-summary').checked = modelConfigTask(model, 'summarization');
   field('model-config-load').disabled = !model.id.startsWith('copilot/') || !model.on_demand;
 }
@@ -8939,6 +11476,7 @@ function applyModelConfigCheckboxes() {
   model.task_capabilities = model.task_capabilities || {};
   for (const [name, id] of [
     ['code', 'model-config-code'],
+    ['image_output', 'model-config-image-output'],
     ['summarization', 'model-config-summary'],
   ]) {
     model.task_capabilities[name] = model.task_capabilities[name] || {};
@@ -8954,15 +11492,17 @@ function renderModelConfigSlots() {
   const slots = onDemand.slots || [];
   const limit = Number(onDemand.limit) || 4;
   field('model-config-slot-count').textContent = slots.length + '/' + limit;
-  field('model-config-slots').innerHTML = Array.from({ length: limit }, (_, index) => {
-    const workerId = (onDemand.worker_prefix || 'worker-copilot-') +
-      ((Number(onDemand.worker_start) || 5) + index);
-    const slot = slots.find(item => item.worker_id === workerId);
-    if (!slot) return '<div class="slot-card"><b>' + esc(workerId) + '</b> · empty</div>';
+  const cards = [...slots].sort((left, right) =>
+    String(left.worker_id).localeCompare(String(right.worker_id), undefined, { numeric: true })
+  ).map(slot => {
+    const workerId = slot.worker_id;
     const state = slot.connected ? 'connected' : (slot.running ? 'starting' : 'stopped');
     return '<div class="slot-card"><b>' + esc(workerId) + '</b> · ' + esc(state) +
       '<br>' + esc(slot.selected_model || slot.model || ((slot.config || {}).model) || 'unassigned') + '</div>';
-  }).join('');
+  });
+  const available = Math.max(0, limit - slots.length);
+  if (available) cards.push('<div class="slot-card"><b>+' + available + '</b> elastic slots available</div>');
+  field('model-config-slots').innerHTML = cards.join('');
 }
 function renderModelConfigList() {
   const search = field('model-config-search').value.trim().toLowerCase();
@@ -8991,6 +11531,7 @@ function renderSelectedModelConfig() {
     'model-config-export','model-config-ondemand','model-config-simulated',
     'model-config-image','model-config-audio','model-config-file',
     'model-config-code','model-config-summary',
+    'model-config-image-output',
     'model-config-save','model-config-reset','model-config-clear-route',
   ];
   for (const id of controls) field(id).disabled = !model;
@@ -9033,6 +11574,7 @@ async function refreshModelConfigurator() {
   }
   modelConfigCatalog = [...byId.values()];
   field('nav-config-model-count').textContent = modelConfigCatalog.length;
+  renderSpecificBackendShortcuts();
   renderModelConfigSlots();
   renderModelConfigList();
 }
@@ -9078,7 +11620,8 @@ field('model-config-list').addEventListener('change', () => {
 });
 for (const id of [
   'model-config-ondemand','model-config-simulated','model-config-image',
-  'model-config-audio','model-config-file','model-config-code','model-config-summary',
+  'model-config-audio','model-config-file','model-config-code',
+  'model-config-image-output','model-config-summary',
 ]) field(id).addEventListener('change', applyModelConfigCheckboxes);
 field('model-config-json').addEventListener('change', () => {
   const model = modelConfigJson(); if (model) syncModelConfigCheckboxes(model);
@@ -9104,6 +11647,10 @@ field('model-route-unknown').addEventListener('change', event =>
   setModelRouteShortcut('worker-unknown-*', event.target.checked));
 field('model-route-backends').addEventListener('change', event =>
   setModelRouteShortcut('backend-*', event.target.checked));
+field('model-route-specific-backends').addEventListener('change', event => {
+  const input = event.target.closest('input[data-backend-target]'); if (!input) return;
+  setModelRouteShortcut(input.dataset.backendTarget, input.checked);
+});
 field('model-config-save').addEventListener('click', () => saveSelectedModelConfig(false));
 field('model-config-reset').addEventListener('click', () => saveSelectedModelConfig(true));
 field('model-config-clear-route').addEventListener('click', () => {
@@ -9268,6 +11815,52 @@ field('model-test-form').addEventListener('submit', async (event) => {
   }
 });
 
+field('image-generation-run').addEventListener('click', async () => {
+  const model = field('image-generation-model').value.trim();
+  const prompt = field('image-generation-prompt').value.trim();
+  if (!model || !prompt) return;
+  field('image-generation-run').disabled = true;
+  field('image-generation-status').textContent = 'generating...';
+  field('image-generation-status').className = 'msg';
+  field('image-generation-preview').style.display = 'none';
+  try {
+    const response = await getJSON('/v1/images/generations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, prompt, response_format: 'url' }),
+    });
+    const entry = response.body && response.body.data ? response.body.data[0] : null;
+    field('image-generation-raw').textContent = JSON.stringify(response.body, null, 2);
+    if (!response.ok || !entry) {
+      field('image-generation-status').textContent = 'unavailable · HTTP ' + response.status;
+      field('image-generation-status').className = 'msg err';
+      field('image-generation-description').textContent =
+        JSON.stringify((response.body && response.body.detail) || response.body || '');
+      return;
+    }
+    const source = entry.source || 'simulated';
+    field('image-generation-status').textContent = source === 'worker'
+      ? 'worker-generated image'
+      : 'simulated placeholder';
+    field('image-generation-status').className = 'msg ' + (source === 'worker' ? 'ok' : '');
+    field('image-generation-description').textContent =
+      entry.pretend_description || entry.revised_prompt || '';
+    const imageUrl = entry.url || (
+      entry.b64_json ? 'data:image/png;base64,' + entry.b64_json : ''
+    );
+    if (imageUrl) {
+      field('image-generation-preview').src = imageUrl;
+      field('image-generation-preview').style.display = 'block';
+    }
+  } catch (error) {
+    field('image-generation-status').textContent = 'generation failed';
+    field('image-generation-status').className = 'msg err';
+    field('image-generation-description').textContent = String(error);
+  } finally {
+    field('image-generation-run').disabled = false;
+  }
+});
+
 async function loadConfig() {
   const r = await getJSON(ADMIN + '/config', { cache: 'no-store' });
   document.getElementById('cfg-path').textContent = r.body.path || '';
@@ -9278,6 +11871,10 @@ async function loadConfig() {
   field('server-mode').value = Array.isArray(config.mode) ? config.mode.join(',') : (config.mode || '');
   field('server-capability-fallback').value = config.capability_fallback || 'stub';
   field('server-subagent-model').value = config.subagent_model || '';
+  field('server-max-concurrent').value = config.max_concurrent_calls ?? 50;
+  field('server-idle-workers').value = config.idle_worker_target ?? 5;
+  field('server-idle-grace').value = config.idle_grace_seconds ?? 30;
+  field('server-backend-delay').value = config.backend_fallback_delay_seconds ?? 5;
   field('server-validation-default').value = config.validation_interval_default ?? config.validation_interval ?? '';
   field('server-validation-override').value = config.validation_interval_override ?? '';
   const proxy = (config.agents || []).find(agent => agent && agent.launch === 'proxy') || {};
@@ -9305,6 +11902,10 @@ field('server-settings-save').addEventListener('click', async () => {
   setOptional('mode', field('server-mode').value);
   config.capability_fallback = field('server-capability-fallback').value;
   setOptional('subagent_model', field('server-subagent-model').value);
+  config.max_concurrent_calls = Number(field('server-max-concurrent').value) || 50;
+  config.idle_worker_target = Number(field('server-idle-workers').value) || 0;
+  config.idle_grace_seconds = Number(field('server-idle-grace').value) || 0;
+  config.backend_fallback_delay_seconds = Number(field('server-backend-delay').value) || 0;
   setOptional('validation_interval_default', field('server-validation-default').value);
   setOptional('validation_interval_override', field('server-validation-override').value);
   const proxy = (config.agents || []).find(agent => agent && agent.launch === 'proxy');
@@ -9329,13 +11930,225 @@ document.getElementById('save').addEventListener('click', async () => {
   setMsg(r.ok ? 'saved' : ('save failed (' + r.status + ')'), r.ok ? 'ok' : 'err');
 });
 
+function telemetryTotals(services) {
+  const totals = { attempts: 0, served: 0, failed: 0, rejected: 0, deferred: 0, cancelled: 0, total_seconds: 0 };
+  for (const stats of Object.values(services || {})) {
+    for (const key of ['attempts','served','failed','rejected','deferred','cancelled']) {
+      totals[key] += Number(stats[key]) || 0;
+    }
+    totals.total_seconds += Number(stats.total_seconds) || 0;
+  }
+  totals.average_seconds = totals.attempts ? totals.total_seconds / totals.attempts : 0;
+  return totals;
+}
+function telemetrySeconds(value) {
+  return (Number(value) || 0).toFixed(2) + 's';
+}
+function sortTelemetryRows(rows, sort) {
+  return [...rows].sort((left, right) => {
+    const a = left[sort.key];
+    const b = right[sort.key];
+    const compared = typeof a === 'string'
+      ? String(a).localeCompare(String(b), undefined, { numeric: true })
+      : (Number(a) || 0) - (Number(b) || 0);
+    return compared * sort.direction;
+  });
+}
+function telemetryFooterValues(totals) {
+  const mode = field('telemetry-footer-mode').value;
+  return {
+    count: value => mode === 'averages' ? '—' : value,
+    total: mode === 'averages' ? '—' : telemetrySeconds(totals.total_seconds),
+    average: mode === 'totals' ? '—' : telemetrySeconds(totals.average_seconds),
+    label: mode === 'averages' ? 'Weighted average' : 'Cumulative total',
+  };
+}
+function renderTelemetry(state) {
+  latestTelemetryState = state;
+  const concurrency = state.concurrency || {};
+  const team = state.team_service_stats || { totals: {}, services: {}, models: {} };
+  const totals = team.totals || {};
+  const waiting = state.waiting_for_worker || [];
+  field('top-active-count').textContent = concurrency.active_calls || 0;
+  field('top-waiting-count').textContent = concurrency.waiting_for_worker || 0;
+  field('nav-waiting-count').textContent = concurrency.waiting_for_worker || 0;
+  field('top-served-count').textContent = totals.served || 0;
+  field('top-switch-count').textContent = state.team_model_switches || 0;
+  field('telemetry-summary').textContent =
+    (concurrency.active_calls || 0) + '/' + (concurrency.max_calls || 50) + ' active · ' +
+    (concurrency.idle_workers || 0) + ' idle / target ' + (concurrency.idle_worker_target ?? 5) +
+    ' · ' + (concurrency.recently_busy_workers || 0) + ' cooling (' +
+    (concurrency.idle_grace_seconds ?? 30) + 's)' +
+    (concurrency.idle_maintenance_paused ? ' · idle maintenance paused' : '') +
+    ' · ' + (concurrency.waiting_for_worker || 0) + ' waiting · backend delay ' +
+    (concurrency.backend_fallback_delay_seconds ?? 5) + 's · ' +
+    (state.team_model_switches || 0) + ' model switches';
+  const services = Object.entries(team.services || {});
+  field('telemetry-services').innerHTML = services.length ? services.map(([kind, stats]) =>
+    '<tr><td><code>' + esc(kind) + '</code></td><td>' + (stats.active || 0) +
+    '</td><td>' + (stats.attempts || 0) + '</td><td>' + (stats.served || 0) +
+    '</td><td>' + (stats.deferred || 0) + '</td><td>' + (stats.rejected || 0) +
+    '</td><td>' + ((stats.failed || 0) + (stats.cancelled || 0)) +
+    '</td><td>' + telemetrySeconds(stats.total_seconds) +
+    '</td><td>' + telemetrySeconds(stats.average_seconds) + '</td></tr>'
+  ).join('') : '<tr><td colspan="9" class="muted">No requests served yet.</td></tr>';
+  const serviceFooter = telemetryFooterValues(totals);
+  field('telemetry-services-total').innerHTML =
+    '<tr><th>' + serviceFooter.label + '</th><th>' +
+    services.reduce((sum, [, stats]) => sum + (Number(stats.active) || 0), 0) +
+    '</th><th>' + serviceFooter.count(totals.attempts || 0) +
+    '</th><th>' + serviceFooter.count(totals.served || 0) +
+    '</th><th>' + serviceFooter.count(totals.deferred || 0) +
+    '</th><th>' + serviceFooter.count(totals.rejected || 0) +
+    '</th><th>' + serviceFooter.count((totals.failed || 0) + (totals.cancelled || 0)) +
+    '</th><th>' + serviceFooter.total + '</th><th>' + serviceFooter.average + '</th></tr>';
+  const workers = Object.entries(state.worker_service_stats || {}).map(([workerId, worker]) => {
+    const stats = telemetryTotals(worker.services);
+    const switches = (state.worker_model_switches || {})[workerId] || {};
+    return {
+      id: workerId,
+      kind: worker.kind || 'worker',
+      active: Number(worker.active) || 0,
+      reserved: Number(worker.reserved) || 0,
+      attempts: stats.attempts,
+      served: stats.served,
+      deferred: stats.deferred,
+      failed: stats.failed + stats.rejected + stats.cancelled,
+      switches: Number(switches.count) || 0,
+      switchTitle: (switches.previous_model || '') + ' → ' + (switches.new_model || ''),
+      total_seconds: stats.total_seconds,
+      average_seconds: stats.average_seconds,
+    };
+  });
+  const visibleWorkers = sortTelemetryRows(workers, telemetryWorkerSort);
+  field('telemetry-workers-wrap').classList.toggle(
+    'expanded',
+    telemetryShowAllWorkers,
+  );
+  field('telemetry-workers').innerHTML = visibleWorkers.length ? visibleWorkers.map(worker =>
+    '<tr><td><code>' + esc(worker.id) + '</code><br><span class="muted">' +
+    esc(worker.kind) + '</span></td><td>' + worker.active +
+    '</td><td>' + worker.reserved + '</td><td>' +
+    (worker.kind === 'backend' && worker.attempts === 0 ? '—' : worker.attempts) +
+    '</td><td>' + (worker.kind === 'backend' && worker.attempts === 0 ? '—' : worker.served) +
+    '</td><td>' + (worker.kind === 'backend' && worker.attempts === 0 ? '—' : worker.deferred) +
+    '</td><td>' + (worker.kind === 'backend' && worker.attempts === 0 ? '—' : worker.failed) +
+    '</td><td title="' + esc(worker.switchTitle) + '">' +
+    (worker.kind === 'backend' ? '—' : worker.switches) + '</td><td>' +
+    (worker.kind === 'backend' && worker.attempts === 0 ? '—' : telemetrySeconds(worker.total_seconds)) +
+    '</td><td>' + (worker.kind === 'backend' && worker.attempts === 0 ? '—' : telemetrySeconds(worker.average_seconds)) +
+    '</td></tr>'
+  ).join('') : '<tr><td colspan="10" class="muted">No worker timing yet.</td></tr>';
+  field('telemetry-workers-toggle').textContent = telemetryShowAllWorkers
+    ? 'Show four-row scroll'
+    : ('Expand all (' + workers.length + ')');
+  field('telemetry-workers-toggle').disabled = workers.length <= 4;
+  const workerTotals = telemetryTotals(
+    Object.fromEntries(workers.map(worker => [worker.id, {
+      attempts: worker.attempts, served: worker.served, deferred: worker.deferred,
+      failed: worker.failed, rejected: 0, cancelled: 0, total_seconds: worker.total_seconds,
+    }]))
+  );
+  const workerFooter = telemetryFooterValues(workerTotals);
+  field('telemetry-workers-total').innerHTML =
+    '<tr><th>' + workerFooter.label + '</th><th>' +
+    workers.reduce((sum, worker) => sum + worker.active, 0) +
+    '</th><th>' + workers.reduce((sum, worker) => sum + worker.reserved, 0) +
+    '</th><th>' + workerFooter.count(workerTotals.attempts) +
+    '</th><th>' + workerFooter.count(workerTotals.served) +
+    '</th><th>' + workerFooter.count(workerTotals.deferred) +
+    '</th><th>' + workerFooter.count(workerTotals.failed) +
+    '</th><th>' + workerFooter.count(state.team_model_switches || 0) +
+    '</th><th>' + workerFooter.total + '</th><th>' + workerFooter.average + '</th></tr>';
+  const models = Object.entries(team.models || {}).map(([modelId, model]) => {
+    const stats = model.totals || {};
+    return {
+      id: modelId,
+      active: Number(model.active) || 0,
+      attempts: Number(stats.attempts) || 0,
+      served: Number(stats.served) || 0,
+      deferred: Number(stats.deferred) || 0,
+      failed: (Number(stats.failed) || 0) + (Number(stats.rejected) || 0) +
+        (Number(stats.cancelled) || 0),
+      total_seconds: Number(stats.total_seconds) || 0,
+      average_seconds: Number(stats.average_seconds) || 0,
+    };
+  });
+  const visibleModels = sortTelemetryRows(models, telemetryModelSort);
+  field('telemetry-models-wrap').classList.toggle(
+    'expanded',
+    telemetryShowAllModels,
+  );
+  field('telemetry-models').innerHTML = visibleModels.length ? visibleModels.map(model =>
+    '<tr><td><code>' + esc(model.id) + '</code></td><td>' + model.active +
+    '</td><td>' + model.attempts + '</td><td>' + model.served +
+    '</td><td>' + model.deferred + '</td><td>' + model.failed +
+    '</td><td>' + telemetrySeconds(model.total_seconds) +
+    '</td><td>' + telemetrySeconds(model.average_seconds) + '</td></tr>'
+  ).join('') : '<tr><td colspan="8" class="muted">No model timing yet.</td></tr>';
+  field('telemetry-models-toggle').textContent = telemetryShowAllModels
+    ? 'Show four-row scroll'
+    : ('Expand all (' + models.length + ')');
+  field('telemetry-models-toggle').disabled = models.length <= 4;
+  const modelFooter = telemetryFooterValues(totals);
+  field('telemetry-models-total').innerHTML =
+    '<tr><th>' + modelFooter.label + '</th><th>' +
+    models.reduce((sum, model) => sum + model.active, 0) +
+    '</th><th>' + modelFooter.count(totals.attempts || 0) +
+    '</th><th>' + modelFooter.count(totals.served || 0) +
+    '</th><th>' + modelFooter.count(totals.deferred || 0) +
+    '</th><th>' + modelFooter.count(
+      (totals.failed || 0) + (totals.rejected || 0) + (totals.cancelled || 0)
+    ) + '</th><th>' + modelFooter.total + '</th><th>' + modelFooter.average + '</th></tr>';
+  field('telemetry-waiting').innerHTML = waiting.length
+    ? '<strong>Waiting client requests</strong>' + waiting.map(item =>
+      '<div><code>' + esc(item.model) + '</code> → ' + esc(item.worker_id) +
+      ' · ' + telemetrySeconds(item.waiting_seconds) + ' · ' + esc(item.reason) + '</div>'
+    ).join('')
+    : '';
+}
+field('telemetry-workers-toggle').addEventListener('click', () => {
+  telemetryShowAllWorkers = !telemetryShowAllWorkers;
+  renderTelemetry(latestTelemetryState);
+});
+field('telemetry-models-toggle').addEventListener('click', () => {
+  telemetryShowAllModels = !telemetryShowAllModels;
+  renderTelemetry(latestTelemetryState);
+});
+field('telemetry-footer-mode').addEventListener('change', () =>
+  renderTelemetry(latestTelemetryState));
+field('telemetry').addEventListener('click', event => {
+  const button = event.target.closest('button[data-stats-table]'); if (!button) return;
+  const sort = button.dataset.statsTable === 'workers'
+    ? telemetryWorkerSort
+    : telemetryModelSort;
+  if (sort.key === button.dataset.statsKey) sort.direction *= -1;
+  else {
+    sort.key = button.dataset.statsKey;
+    sort.direction = button.dataset.statsKey === 'id' ? 1 : -1;
+  }
+  renderTelemetry(latestTelemetryState);
+});
+
 async function tick() {
   try {
     const s = await getJSON(ADMIN + '/state', { cache: 'no-store' });
     document.getElementById('mode').textContent = (s.body && s.body.mode) || 'relay';
-    serverPid = s.body && s.body.process ? s.body.process.pid : null;
+    const nextServerPid = s.body && s.body.process ? s.body.process.pid : null;
+    if (serverPid && nextServerPid && nextServerPid !== serverPid) {
+      location.reload();
+      return;
+    }
+    serverPid = nextServerPid;
     field('top-uptime').textContent = formatDuration(s.body && s.body.uptime_seconds);
-    await Promise.all([refreshConfiguredAgents(), refreshWebsockets(), refreshWorkers(), refreshCopilots()]);
+    renderTelemetry(s.body || {});
+    await Promise.all([
+      refreshConfiguredAgents(),
+      refreshWebsockets(),
+      refreshClients(),
+      refreshWorkers(),
+      refreshCopilots(),
+    ]);
     document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
   } catch (e) { document.getElementById('updated').textContent = 'error'; }
 }
@@ -9346,6 +12159,8 @@ refreshModelTestSamples();
 refreshCopilotModels(false);
 refreshApiModels();
 refreshModelConfigurator();
+refreshBackendConfigs();
+refreshCodexSuppliers();
 tick();
 setInterval(tick, 3000);
 </script>
@@ -9457,6 +12272,25 @@ _KIND_STORES.update(
 )
 
 
+def _record_worker_model_switch(
+    worker_id: str,
+    previous_model: str,
+    new_model: str,
+) -> None:
+    stats = _worker_model_switch_stats.setdefault(
+        worker_id,
+        {"count": 0},
+    )
+    stats.update(
+        {
+            "count": int(stats["count"]) + 1,
+            "previous_model": previous_model,
+            "new_model": new_model,
+            "changed_at": time.time(),
+        }
+    )
+
+
 def _apply_worker_registration(worker_id: str, registration: dict[str, Any]) -> None:
     models = registration.get("models")
     if isinstance(models, dict) and models:
@@ -9472,7 +12306,15 @@ def _apply_worker_registration(worker_id: str, registration: dict[str, Any]) -> 
         _worker_kinds[worker_id] = worker_kind.strip()
     runtime_model = registration.get("runtime_model")
     if isinstance(runtime_model, str) and runtime_model.strip():
-        _worker_runtime_models[worker_id] = runtime_model.strip()
+        next_model = runtime_model.strip()
+        previous_model = _worker_runtime_models.get(worker_id)
+        if previous_model and previous_model != next_model:
+            _record_worker_model_switch(
+                worker_id,
+                previous_model,
+                next_model,
+            )
+        _worker_runtime_models[worker_id] = next_model
     description = registration.get("description")
     if isinstance(description, str) and description.strip():
         _worker_descriptions[worker_id] = description.strip()
@@ -9513,7 +12355,11 @@ async def _serve_worker_socket(
             if isinstance(data, dict) and data.get("type") == "register":
                 _apply_worker_registration(worker_id, data)
             elif isinstance(data, dict):
-                await _handle_worker_message(worker_id, data)
+                await _handle_worker_message(
+                    worker_id,
+                    data,
+                    connection_id=connection_id,
+                )
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -9550,7 +12396,25 @@ async def emullm_socket(websocket: WebSocket) -> None:
     await _serve_worker_socket(websocket, worker_id, model_masks)
 
 
-async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
+async def _handle_worker_message(
+    worker_id: str,
+    data: dict[str, Any],
+    *,
+    connection_id: str | None = None,
+) -> None:
+    active_connection_id = connection_id or _worker_connection_ids.get(worker_id)
+    if data.get("type") == "keepalive_reply":
+        _mark_active_websocket_satisfied(
+            active_connection_id,
+            kind="keepalive",
+        )
+        return
+    if data.get("type") in ("model_changed", "model_change_error"):
+        control_id = str(data.get("id") or "")
+        future = _pending_worker_controls.get(control_id)
+        if future is not None and not future.done():
+            future.set_result(dict(data))
+        return
     if data.get("type") == "accept":
         request_id = str(data.get("id") or "")
         if request_id and request_id in _pending:
@@ -9605,6 +12469,11 @@ async def _handle_worker_message(worker_id: str, data: dict[str, Any]) -> None:
         future = _pending.pop(request_id, None)
         if future and not future.done():
             future.set_result(reply)
+            _mark_active_websocket_satisfied(
+                active_connection_id,
+                kind="client",
+                client_work=True,
+            )
 
 
 router.include_router(_copilot_api.router)

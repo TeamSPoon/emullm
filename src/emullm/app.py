@@ -11,6 +11,7 @@ emullm.supervisor.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ _BASE_DIR = Path(__file__).resolve().parent.parent
 async def _lifespan(app: FastAPI):
     from . import api as _api  # local import to avoid any import-order surprises
 
+    restart_handoff = os.environ.pop("EMULLM_RESTART_HANDOFF", "") == "1"
     config = _sup.load_config(_api._CONFIG_PATH)
     config = _sup.expand_agents(config)
     _api.apply_agent_policies(config)
@@ -79,8 +81,34 @@ async def _lifespan(app: FastAPI):
         connected=lambda worker_id: worker_id in _api._connected_workers,
     )
     _copilot.set_manager(copilot_manager)
+    idle_worker_task: asyncio.Task[None] | None = None
+    restart_reconcile_task: asyncio.Task[None] | None = None
     try:
-        started_copilots = copilot_manager.start_autostart()
+        started_copilots = (
+            []
+            if restart_handoff
+            else copilot_manager.start_autostart()
+        )
+        if restart_handoff:
+            async def reconcile_preserved_workers() -> None:
+                await asyncio.sleep(5)
+                started = await asyncio.to_thread(
+                    copilot_manager.start_autostart
+                )
+                print(
+                    "[emullm] restart handoff: preserved connected servants; "
+                    f"started missing: {', '.join(started) or '(none)'}",
+                    flush=True,
+                )
+
+            restart_reconcile_task = asyncio.create_task(
+                reconcile_preserved_workers()
+            )
+        idle_worker_task = asyncio.create_task(
+            _api.maintain_idle_copilot_workers(
+                initial_delay_seconds=8 if restart_handoff else 1
+            )
+        )
         if definitions:
             print(
                 f"[emullm] started {len(started_copilots)} headless Copilot servant(s): "
@@ -89,8 +117,25 @@ async def _lifespan(app: FastAPI):
             )
         yield
     finally:
+        if restart_reconcile_task is not None:
+            restart_reconcile_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await restart_reconcile_task
+        if idle_worker_task is not None:
+            idle_worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await idle_worker_task
         if copilot_manager is not None:
-            copilot_manager.stop_all()
+            if not _api._process_control.restart_in_progress():
+                for instance in copilot_manager.list():
+                    worker_id = str(instance["worker_id"])
+                    if instance.get("connected"):
+                        with contextlib.suppress(Exception):
+                            await _api._shutdown_connected_worker(
+                                worker_id,
+                                "server shutdown",
+                            )
+                copilot_manager.stop_all()
             _copilot.set_manager(None)
         if supervisor is not None:
             supervisor.stop_all()

@@ -81,6 +81,7 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(emullm_api, "_worker_models", {})
     monkeypatch.setattr(emullm_api, "_worker_kinds", {})
     monkeypatch.setattr(emullm_api, "_worker_runtime_models", {})
+    monkeypatch.setattr(emullm_api, "_worker_model_switch_stats", {})
     monkeypatch.setattr(emullm_api, "_worker_descriptions", {})
     monkeypatch.setattr(emullm_api, "_worker_capabilities", {})
     monkeypatch.setattr(emullm_api, "_worker_roles", {})
@@ -89,15 +90,30 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(emullm_api, "_pending", {})
     monkeypatch.setattr(emullm_api, "_pending_models", {})
     monkeypatch.setattr(emullm_api, "_worker_not_ready_until", {})
+    monkeypatch.setattr(emullm_api, "_worker_inflight", {})
+    monkeypatch.setattr(emullm_api, "_worker_reservations", {})
+    monkeypatch.setattr(emullm_api, "_model_inflight", {})
+    monkeypatch.setattr(emullm_api, "_worker_last_busy_at", {})
+    monkeypatch.setattr(emullm_api, "_worker_service_stats", {})
+    monkeypatch.setattr(emullm_api, "_model_service_stats", {})
+    monkeypatch.setattr(emullm_api, "_active_service_requests", {})
+    monkeypatch.setattr(emullm_api, "_waiting_for_worker", {})
     monkeypatch.setattr(emullm_api, "_admin_test_tasks", {})
     monkeypatch.setattr(emullm_api, "_active_websockets", {})
     monkeypatch.setattr(emullm_api, "_worker_connection_ids", {})
+    monkeypatch.setattr(emullm_api, "_openai_clients", {})
+    monkeypatch.setattr(emullm_api, "_openai_requests", {})
     monkeypatch.setattr(emullm_api, "_DOC_ALIASES", {})
     # No managed-worker supervisor by default (auto mode sets one).
     emullm_api._sup.set_supervisor(None)  # noqa: SLF001
     emullm_api._copilot_api.set_manager(None)  # noqa: SLF001
     # Reset config-derived per-agent/service policy so tests don't leak.
     emullm_api.clear_agent_policies()
+    monkeypatch.setattr(emullm_api, "_max_concurrent_calls", 8)
+    monkeypatch.setattr(emullm_api, "_idle_worker_target", 0)
+    monkeypatch.setattr(emullm_api, "_idle_grace_seconds", 30)
+    monkeypatch.setattr(emullm_api, "_idle_maintenance_paused", False)
+    monkeypatch.setattr(emullm_api, "_backend_fallback_delay_seconds", 0)
     emullm_api._model_fetch_cache.clear()
     emullm_api._round_robin_state.clear()
     # /emullm/storage/* derives its root from _RUNTIME_DIR directly, so
@@ -305,8 +321,254 @@ def test_on_demand_copilot_provisioner_uses_four_named_slots(monkeypatch) -> Non
         "!audio_input",
         "file_input",
     ]
-    with pytest.raises(HTTPException, match="all 4 on-demand Copilot workers are busy"):
+    with pytest.raises(HTTPException, match="all 4 elastic Copilot workers are busy"):
         emullm_api._provision_on_demand_copilot("model-5", entry)  # noqa: SLF001
+
+
+def test_busy_matching_model_launches_an_elastic_replica(monkeypatch) -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.instances = {
+                "worker-copilot-5": {
+                    "worker_id": "worker-copilot-5",
+                    "running": True,
+                    "connected": True,
+                    "config": {"model": "same-model"},
+                }
+            }
+
+        def list(self):
+            return list(self.instances.values())
+
+        def create(self, config, *, start=True):
+            self.instances[config.worker_id] = {
+                "worker_id": config.worker_id,
+                "running": start,
+                "connected": False,
+                "config": config.model_dump(mode="json"),
+            }
+
+    manager = FakeManager()
+    monkeypatch.setattr(emullm_api._copilot_api, "get_manager", lambda: manager)  # noqa: SLF001
+    emullm_api._worker_inflight["worker-copilot-5"] = 1  # noqa: SLF001
+    entry = {
+        "id": "copilot/same-model",
+        "on_demand": True,
+        "input_modalities": {},
+    }
+
+    worker_id, _, switched = emullm_api._provision_on_demand_copilot(  # noqa: SLF001
+        "same-model",
+        entry,
+    )
+
+    assert worker_id == "worker-copilot-6"
+    assert switched is False
+    assert manager.instances[worker_id]["config"]["model"] == "same-model"
+    assert emullm_api._worker_reservations[worker_id] == 1  # noqa: SLF001
+
+
+def test_full_elastic_pool_reuses_idle_worker_via_runtime_switch(
+    monkeypatch,
+) -> None:
+    class FakeManager:
+        @staticmethod
+        def list():
+            return [
+                {
+                    "worker_id": f"worker-copilot-{index}",
+                    "running": True,
+                    "connected": True,
+                    "selected_model": f"old-model-{index}",
+                    "config": {"model": f"old-model-{index}"},
+                }
+                for index in range(5, 9)
+            ]
+
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: FakeManager(),
+    )
+    worker_id, _, switched = emullm_api._provision_on_demand_copilot(  # noqa: SLF001
+        "new-model",
+        {"id": "copilot/new-model", "on_demand": True, "input_modalities": {}},
+    )
+    assert worker_id == "worker-copilot-5"
+    assert switched is True
+    assert emullm_api._worker_reservations[worker_id] == 1  # noqa: SLF001
+
+
+def test_server_switches_idle_worker_model_over_websocket() -> None:
+    class SwitchPeer:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+            await emullm_api._handle_worker_message(  # noqa: SLF001
+                "worker-copilot-5",
+                {
+                    "type": "model_changed",
+                    "id": payload["id"],
+                    "model": payload["model"],
+                },
+            )
+
+    peer = SwitchPeer()
+    emullm_api._connected_workers["worker-copilot-5"] = peer  # noqa: SLF001
+    asyncio.run(
+        emullm_api._set_worker_runtime_model(  # noqa: SLF001
+            "worker-copilot-5",
+            "new-model",
+            {
+                "capabilities": {},
+                "input_modalities": {
+                    "audio": {"enabled": True},
+                },
+            },
+        )
+    )
+    assert peer.sent[0]["type"] == "set_model"
+    assert peer.sent[0]["model"] == "new-model"
+    assert peer.sent[0]["modelmasks"] == ["copilot/new-model"]
+    assert "audio_input" in peer.sent[0]["capabilities"]
+
+
+def test_worker_registration_tracks_runtime_model_switches() -> None:
+    emullm_api._apply_worker_registration(  # noqa: SLF001
+        "worker-copilot-5",
+        {"runtime_model": "model-a"},
+    )
+    emullm_api._apply_worker_registration(  # noqa: SLF001
+        "worker-copilot-5",
+        {"runtime_model": "model-b"},
+    )
+    emullm_api._apply_worker_registration(  # noqa: SLF001
+        "worker-copilot-5",
+        {"runtime_model": "model-b"},
+    )
+    state = emullm_api.admin_state()
+    switches = state["worker_model_switches"]["worker-copilot-5"]
+    assert switches["count"] == 1
+    assert switches["previous_model"] == "model-a"
+    assert switches["new_model"] == "model-b"
+    assert state["team_model_switches"] == 1
+
+
+def test_simultaneous_call_limit_defaults_to_fifty(monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api, "_max_concurrent_calls", 50)
+    for index in range(50):
+        emullm_api._reserve_worker(f"worker-{index}")  # noqa: SLF001
+    with pytest.raises(HTTPException, match="maximum simultaneous call limit"):
+        emullm_api._reserve_worker("worker-51")  # noqa: SLF001
+
+
+def test_concurrency_and_backend_delay_config_apply_live() -> None:
+    emullm_api.apply_agent_policies(  # noqa: SLF001
+        {
+            "max_concurrent_calls": 30,
+            "idle_worker_target": 5,
+            "idle_grace_seconds": 30,
+            "backend_fallback_delay_seconds": 5,
+        }
+    )
+    assert emullm_api._max_concurrent_calls == 30  # noqa: SLF001
+    assert emullm_api._on_demand_copilot_limit() == 26  # noqa: SLF001
+    assert emullm_api._idle_worker_target == 5  # noqa: SLF001
+    assert emullm_api._idle_grace_seconds == 30  # noqa: SLF001
+    assert emullm_api._backend_fallback_delay_seconds == 5  # noqa: SLF001
+
+
+def test_idle_maintainer_restores_five_ready_workers(monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api, "_max_concurrent_calls", 50)
+    monkeypatch.setattr(emullm_api, "_idle_worker_target", 5)
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {f"worker-copilot-{index}": FakeWorker() for index in range(1, 5)}
+    )
+
+    async def ensure(
+        public_model_id,
+        backing_model,
+        *,
+        require_new=False,
+        warmup=False,
+    ):
+        assert (public_model_id, backing_model, require_new, warmup) == (
+            "copilot/auto",
+            "auto",
+            True,
+            True,
+        )
+        worker_id = "worker-copilot-5"
+        emullm_api._connected_workers[worker_id] = FakeWorker()  # noqa: SLF001
+        emullm_api._reserve_worker(worker_id)  # noqa: SLF001
+        return worker_id
+
+    monkeypatch.setattr(emullm_api, "_ensure_on_demand_copilot", ensure)
+
+    assert asyncio.run(
+        emullm_api.maintain_idle_copilot_workers_once()
+    ) == ["worker-copilot-5"]
+    assert emullm_api._idle_copilot_worker_count() == 5  # noqa: SLF001
+
+
+def test_idle_maintainer_scales_excess_elastic_workers_down(monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api, "_max_concurrent_calls", 50)
+    monkeypatch.setattr(emullm_api, "_idle_worker_target", 5)
+    class ShutdownPeer:
+        def __init__(self, worker_id):
+            self.worker_id = worker_id
+
+        async def send_json(self, payload):
+            assert payload["type"] == "shutdown"
+            emullm_api._connected_workers.pop(self.worker_id, None)  # noqa: SLF001
+
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            f"worker-copilot-{index}": ShutdownPeer(
+                f"worker-copilot-{index}"
+            )
+            for index in range(1, 7)
+        }
+    )
+
+    class FakeManager:
+        stopped: list[str] = []
+
+        @staticmethod
+        def list():
+            return [
+                {
+                    "worker_id": f"worker-copilot-{index}",
+                    "running": True,
+                    "connected": True,
+                }
+                for index in range(1, 7)
+            ]
+
+        def stop(self, worker_id):
+            self.stopped.append(worker_id)
+
+    manager = FakeManager()
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: manager,
+    )
+
+    assert asyncio.run(emullm_api.maintain_idle_copilot_workers_once()) == []
+    assert manager.stopped == []
+    assert emullm_api._idle_copilot_worker_count() == 5  # noqa: SLF001
+
+
+def test_worker_is_not_idle_during_configured_grace_period(monkeypatch) -> None:
+    monkeypatch.setattr(emullm_api, "_idle_grace_seconds", 30)
+    now = time.monotonic()
+    emullm_api._worker_last_busy_at["worker-copilot-5"] = now  # noqa: SLF001
+    assert emullm_api._worker_is_idle("worker-copilot-5") is False  # noqa: SLF001
+    emullm_api._worker_last_busy_at["worker-copilot-5"] = now - 31  # noqa: SLF001
+    assert emullm_api._worker_is_idle("worker-copilot-5") is True  # noqa: SLF001
 
 
 def test_model_configurator_lists_only_reserved_on_demand_slots(
@@ -472,6 +734,10 @@ def test_backend_wildcard_route_expands_configured_backends(
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "backend answered"
     assert calls[0][0] in {"one", "two"}
+    assert [
+        backend["name"]
+        for backend in emullm_api._route_backend_candidates("backend-one")  # noqa: SLF001
+    ] == ["one"]
 
 
 def test_list_models_includes_simulated_routes_and_backing_model_alias(
@@ -856,6 +1122,90 @@ def test_required_task_capability_prefers_declared_worker(
     assert coder.sent[0]["required_capabilities"] == ["code"]
 
 
+def test_worker_model_and_service_timing_are_aggregated(
+    client: TestClient,
+) -> None:
+    worker = FakeWorker(reply="timed answer")
+    emullm_api._connected_workers["timed-worker"] = worker  # noqa: SLF001
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "timed-worker/same",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    state = client.get("/emullm/admin/state").json()
+
+    assert response.status_code == 200
+    worker_stats = state["worker_service_stats"]["timed-worker"]
+    assert worker_stats["services"]["chat"]["attempts"] == 1
+    assert worker_stats["services"]["chat"]["served"] == 1
+    assert worker_stats["services"]["chat"]["average_seconds"] >= 0
+    model_stats = state["team_service_stats"]["models"]["timed-worker/same"]
+    assert model_stats["totals"]["attempts"] == 1
+    assert model_stats["totals"]["served"] == 1
+    assert state["team_service_stats"]["services"]["chat"]["served"] == 1
+
+
+def test_backend_fallback_delay_is_visible_as_waiting(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(emullm_api, "_backend_fallback_delay_seconds", 0.05)
+
+    async def proxy(*_args, **_kwargs):
+        return "backend answer"
+
+    monkeypatch.setattr(emullm_api, "_proxy_chat", proxy)
+    monkeypatch.setattr(
+        emullm_api,
+        "_all_backends",
+        lambda: [{"name": "test", "base_url": "https://example.test/v1"}],
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            emullm_api._relay_model_route_chain(  # noqa: SLF001
+                "vendor/model",
+                ["backend-test"],
+                "hello",
+                {"kind": "chat"},
+            )
+        )
+        await asyncio.sleep(0.01)
+        waiting = emullm_api._waiting_for_worker_snapshot()  # noqa: SLF001
+        assert len(waiting) == 1
+        assert waiting[0]["reason"] == "waiting before last-resort backend fallback"
+        assert emullm_api.admin_state()["concurrency"]["waiting_for_worker"] == 1
+        assert await task == "backend answer"
+        assert emullm_api._waiting_for_worker_snapshot() == []  # noqa: SLF001
+        state = emullm_api.admin_state()
+        backend = state["worker_service_stats"]["backend-test"]
+        assert backend["kind"] == "backend"
+        assert backend["services"]["chat"]["served"] == 1
+        assert state["team_service_stats"]["models"]["vendor/model"]["totals"][
+            "served"
+        ] == 1
+
+    asyncio.run(scenario())
+
+
+def test_configured_backend_is_visible_with_zero_statistics(monkeypatch) -> None:
+    monkeypatch.setattr(
+        emullm_api,
+        "_all_backends",
+        lambda: [{"name": "snet", "base_url": "https://example.test/v1"}],
+    )
+    state = emullm_api.admin_state()
+    backend = state["worker_service_stats"]["backend-snet"]
+    assert backend == {
+        "kind": "backend",
+        "active": 0,
+        "reserved": 0,
+        "services": {},
+    }
+
+
 @pytest.mark.parametrize(
     ("audio_data", "audio_format", "detail"),
     [
@@ -1062,12 +1412,204 @@ def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> N
         assert row["messages_out"] >= 1
         assert row["messages_in"] >= 1
         assert row["connected_seconds"] >= 0
+        assert row["last_satisfied_at"] is None
+        assert row["last_satisfied_seconds"] is None
+        assert row["last_client_work_at"] is None
+        assert row["last_client_work_seconds"] is None
+
+        async def satisfy_request() -> dict:
+            request_id = "satisfied-request"
+            future = asyncio.get_running_loop().create_future()
+            emullm_api._pending[request_id] = future  # noqa: SLF001
+            emullm_api._pending_models[request_id] = "copilot/test"  # noqa: SLF001
+            await emullm_api._handle_worker_message(  # noqa: SLF001
+                "tracked-servant",
+                {"type": "reply", "id": request_id, "content": "satisfied"},
+            )
+            return await future
+
+        assert asyncio.run(satisfy_request()) == {"content": "satisfied"}
+        satisfied_row = next(
+            row
+            for row in client.get("/emullm/admin/websockets").json()["connections"]
+            if row.get("worker_id") == "tracked-servant"
+        )
+        assert satisfied_row["last_satisfied_at"]
+        assert 0 <= satisfied_row["last_satisfied_seconds"] < 2
+        assert satisfied_row["last_satisfied_kind"] == "client"
+        assert satisfied_row["last_client_work_at"]
+        assert 0 <= satisfied_row["last_client_work_seconds"] < 2
+        assert "last_satisfied_at_epoch" not in satisfied_row
+        assert "last_client_work_at_epoch" not in satisfied_row
+
+        last_client_work_at = satisfied_row["last_client_work_at"]
+        asyncio.run(
+            emullm_api._handle_worker_message(  # noqa: SLF001
+                "tracked-servant",
+                {
+                    "type": "keepalive_reply",
+                    "id": "keepalive-1",
+                    "prompt_index": 0,
+                    "content": "stable",
+                },
+            )
+        )
+        keepalive_row = next(
+            row
+            for row in client.get("/emullm/admin/websockets").json()["connections"]
+            if row.get("worker_id") == "tracked-servant"
+        )
+        assert keepalive_row["last_satisfied_kind"] == "keepalive"
+        assert keepalive_row["last_client_work_at"] == last_client_work_at
         caps = client.get("/emullm/caps/tracked-servant").json()
         assert caps["worker_kind"] == "headless-copilot"
         assert caps["backing_model"] == "gpt-5.6-sol"
         assert caps["description"] == "Resident Copilot test servant."
 
     assert client.get("/emullm/admin/websockets").json()["connections"] == []
+
+
+def test_unknown_worker_reply_does_not_mark_websocket_satisfied() -> None:
+    connection_id = "ws-test"
+    emullm_api._active_websockets[connection_id] = {  # noqa: SLF001
+        "connection_id": connection_id,
+        "kind": "worker",
+        "endpoint": "/emullm/ws",
+        "client": "testclient:50000",
+        "connected_at": emullm_api._now_iso(),  # noqa: SLF001
+        "connected_at_epoch": time.time(),
+        "last_satisfied_at": None,
+        "last_satisfied_at_epoch": None,
+        "last_satisfied_kind": None,
+        "last_client_work_at": None,
+        "last_client_work_at_epoch": None,
+        "messages_in": 1,
+        "messages_out": 1,
+        "worker_id": "tracked-servant",
+    }
+    emullm_api._worker_connection_ids["tracked-servant"] = connection_id  # noqa: SLF001
+
+    asyncio.run(
+        emullm_api._handle_worker_message(  # noqa: SLF001
+            "tracked-servant",
+            {"type": "reply", "id": "not-pending", "content": "stale"},
+        )
+    )
+
+    row = emullm_api._active_websocket_rows()[0]  # noqa: SLF001
+    assert row["last_satisfied_at"] is None
+    assert row["last_satisfied_seconds"] is None
+    assert row["last_client_work_at"] is None
+    assert row["last_client_work_seconds"] is None
+
+
+def test_replaced_worker_socket_cannot_update_new_connection_activity() -> None:
+    now = time.time()
+    for connection_id in ("ws-old", "ws-new"):
+        emullm_api._active_websockets[connection_id] = {  # noqa: SLF001
+            "connection_id": connection_id,
+            "kind": "worker",
+            "endpoint": "/emullm/ws",
+            "client": "testclient:50000",
+            "connected_at": emullm_api._now_iso(),  # noqa: SLF001
+            "connected_at_epoch": now,
+            "last_satisfied_at": None,
+            "last_satisfied_at_epoch": None,
+            "last_satisfied_kind": None,
+            "last_client_work_at": None,
+            "last_client_work_at_epoch": None,
+            "messages_in": 0,
+            "messages_out": 0,
+            "worker_id": "reconnected-worker",
+        }
+    emullm_api._worker_connection_ids["reconnected-worker"] = "ws-new"  # noqa: SLF001
+
+    asyncio.run(
+        emullm_api._handle_worker_message(  # noqa: SLF001
+            "reconnected-worker",
+            {"type": "keepalive_reply", "id": "old-reply"},
+            connection_id="ws-old",
+        )
+    )
+
+    assert emullm_api._active_websockets["ws-old"]["last_satisfied_at"]  # noqa: SLF001
+    assert emullm_api._active_websockets["ws-new"]["last_satisfied_at"] is None  # noqa: SLF001
+
+
+def test_openai_http_client_inventory_tracks_logical_sessions(
+    client: TestClient,
+) -> None:
+    headers = {
+        "User-Agent": "symbolic-workbench-test/1.0",
+        "X-EmuLLM-Client-ID": "video-import",
+    }
+
+    assert client.get("/v1/models", headers=headers).status_code == 200
+    assert client.get("/v1/models/not-present", headers=headers).status_code == 200
+    inventory = client.get("/emullm/admin/clients").json()
+
+    assert inventory["count"] == 1
+    assert inventory["active_count"] == 0
+    assert inventory["active_requests"] == 0
+    assert inventory["request_count"] == 2
+    assert len(inventory["requests"]) == 2
+    assert all(request["active"] is False for request in inventory["requests"])
+    assert all(request["duration_seconds"] >= 0 for request in inventory["requests"])
+    logical_client = inventory["clients"][0]
+    assert logical_client["declared_id"] == "video-import"
+    assert logical_client["host"] == "testclient"
+    assert logical_client["user_agent"] == "symbolic-workbench-test/1.0"
+    assert logical_client["requests"] == 2
+    assert logical_client["connected"] is False
+    assert logical_client["last_method"] == "GET"
+    assert logical_client["last_endpoint"] == "/v1/models/not-present"
+    assert logical_client["last_status"] == 200
+    assert logical_client["first_seen_seconds"] >= 0
+    assert logical_client["last_seen_seconds"] >= 0
+    assert logical_client["last_completed_seconds"] >= 0
+    assert not any(key.endswith("_epoch") for key in logical_client)
+
+    assert client.get("/emullm/admin/clients").json()["clients"][0]["requests"] == 2
+
+
+def test_openai_client_and_request_tracking_caps_are_hard(
+    client: TestClient,
+) -> None:
+    now = time.time()
+    emullm_api._openai_clients.update(  # noqa: SLF001
+        {
+            f"client-{index}": {
+                "client_id": f"client-{index}",
+                "active_requests": 1,
+                "requests": 1,
+                "last_seen_at_epoch": now,
+            }
+            for index in range(emullm_api._MAX_OPENAI_CLIENTS)  # noqa: SLF001
+        }
+    )
+    response = client.get(
+        "/v1/models",
+        headers={"X-EmuLLM-Client-ID": "overflow-client"},
+    )
+    assert response.status_code == 200
+    assert len(emullm_api._openai_clients) == emullm_api._MAX_OPENAI_CLIENTS  # noqa: SLF001
+
+    emullm_api._openai_clients.clear()  # noqa: SLF001
+    headers = {"X-EmuLLM-Client-ID": "known-client"}
+    assert client.get("/v1/models", headers=headers).status_code == 200
+    emullm_api._openai_requests.clear()  # noqa: SLF001
+    emullm_api._openai_requests.update(  # noqa: SLF001
+        {
+            f"http-{index}": {
+                "request_id": f"http-{index}",
+                "active": True,
+                "started_at_epoch": now,
+            }
+            for index in range(emullm_api._MAX_OPENAI_REQUESTS)  # noqa: SLF001
+        }
+    )
+    assert client.get("/v1/models", headers=headers).status_code == 200
+    assert len(emullm_api._openai_requests) == emullm_api._MAX_OPENAI_REQUESTS  # noqa: SLF001
 
 
 def test_mailbox_chat_websocket_subscribes_and_publishes_events(client: TestClient) -> None:
@@ -2250,6 +2792,109 @@ def test_images_two_way_b64_json_returns_worker_bytes(client: TestClient) -> Non
     assert "url" not in entry
 
 
+def test_codex_copilot_model_can_generate_real_image_with_tools(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    raw = b"\x89PNG\r\n\x1a\nCODEX-GENERATED"
+    metadata = {
+        "id": "gpt-5.3-codex",
+        "name": "GPT-5.3 Codex",
+        "capabilities": {"type": "chat"},
+    }
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": [metadata], "source": "test"},
+    )
+    assert emullm_api._copilot_task_capabilities(  # noqa: SLF001
+        "gpt-5.3-codex",
+        metadata,
+    )["image_output"]["enabled"] is True
+
+    async def relay(*_args, **kwargs):
+        assert kwargs["kind"] == "image"
+        assert kwargs["required_capabilities"] == {"image_output"}
+        return {
+            "content": "EMULLM_IMAGE_FILE: emullm-generated-image.png",
+            "image_b64": base64.b64encode(raw).decode("ascii"),
+            "mime": "image/png",
+        }
+
+    monkeypatch.setattr(emullm_api, "_relay_full", relay)
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "copilot/gpt-5.3-codex",
+            "prompt": "a red circle",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    entry = response.json()["data"][0]
+    assert entry["source"] == "worker"
+    assert entry["mime_type"] == "image/png"
+    assert client.get(entry["url"]).content == raw
+
+
+def test_codex_image_edit_accepts_source_mask_and_returns_artifact(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    output = b"\x89PNG\r\n\x1a\nEDITED"
+    metadata = {
+        "id": "gpt-5.3-codex",
+        "name": "GPT-5.3 Codex",
+        "capabilities": {"type": "chat"},
+    }
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": [metadata], "source": "test"},
+    )
+    captured = {}
+
+    async def relay(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "image_b64": base64.b64encode(output).decode("ascii"),
+            "mime": "image/png",
+        }
+
+    monkeypatch.setattr(emullm_api, "_relay_full", relay)
+    response = client.post(
+        "/v1/images/edits",
+        data={
+            "model": "copilot/gpt-5.3-codex",
+            "prompt": "replace the background",
+            "size": "512x512",
+        },
+        files={
+            "image": ("private-source.png", b"source", "image/png"),
+            "mask": ("private-mask.png", b"mask", "image/png"),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    entry = response.json()["data"][0]
+    assert entry["operation"] == "edit"
+    assert entry["source"] == "worker"
+    assert entry["artifact"]["mime_type"] == "image/png"
+    assert client.get(entry["artifact"]["url"]).content == output
+    assert entry["inputs"]["image"]["name"] == "attachment-1"
+    assert entry["inputs"]["mask"]["name"] == "attachment-2"
+    assert entry["inputs"]["size"] == "512x512"
+    assert captured["kind"] == "image_edit"
+    assert captured["required_capabilities"] == {
+        "vision_input",
+        "image_output",
+    }
+    assert [item["name"] for item in captured["attachments"]] == [
+        "attachment-1",
+        "attachment-2",
+    ]
+
+
 def test_audio_speech_two_way_returns_worker_audio(client: TestClient) -> None:
     import base64
 
@@ -2613,6 +3258,56 @@ def test_admin_attachment_samples_are_listed_and_downloadable(
     assert download.content == b"RIFF sample"
     assert download.headers["content-type"].startswith("audio/wav")
     assert client.get("/emullm/admin/test-samples/missing").status_code == 404
+
+
+def test_bulk_stop_idle_pauses_maintenance_and_skips_recently_busy_workers(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    class ShutdownPeer:
+        def __init__(self, worker_id: str) -> None:
+            self.worker_id = worker_id
+
+        async def send_json(self, payload):
+            assert payload["type"] == "shutdown"
+            emullm_api._connected_workers.pop(self.worker_id, None)  # noqa: SLF001
+
+    class FakeManager:
+        @staticmethod
+        def list():
+            return [
+                {
+                    "worker_id": "worker-copilot-1",
+                    "running": True,
+                    "connected": True,
+                },
+                {
+                    "worker_id": "worker-copilot-2",
+                    "running": True,
+                    "connected": True,
+                },
+            ]
+
+    emullm_api._connected_workers.update(  # noqa: SLF001
+        {
+            "worker-copilot-1": ShutdownPeer("worker-copilot-1"),
+            "worker-copilot-2": ShutdownPeer("worker-copilot-2"),
+        }
+    )
+    emullm_api._worker_last_busy_at["worker-copilot-2"] = time.monotonic()  # noqa: SLF001
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "get_manager",
+        lambda: FakeManager(),
+    )
+
+    response = client.post("/emullm/admin/copilots/bulk/stop-idle")
+
+    assert response.status_code == 200
+    assert response.json()["affected"] == 1
+    assert response.json()["idle_maintenance_paused"] is True
+    assert "worker-copilot-1" not in emullm_api._connected_workers  # noqa: SLF001
+    assert "worker-copilot-2" in emullm_api._connected_workers  # noqa: SLF001
 
 
 @pytest.mark.parametrize("path", ["/v1/files", "/v1/assistants", "/v1/threads"])
@@ -3025,6 +3720,7 @@ def test_config_schema_endpoint(client: TestClient) -> None:
     props = schema["properties"]
     assert "agents" in props and "services" in props and "capability_fallback" in props
     assert "headless_copilots" in props
+    assert "codex_suppliers" in props
     # alias serves the same schema
     assert client.get("/emullm/admin/config/schema").json() == schema
 
@@ -3064,6 +3760,202 @@ def test_config_section_editor_preserves_unrelated_config_and_validates(
     assert deleted.status_code == 200
     assert "backends" not in deleted.json()["config"]
     assert client.put("/emullm/admin/config/section/nope", json={"value": {}}).status_code == 404
+
+
+def test_backend_config_page_crud_preserves_proxy_agent_metadata(
+    client: TestClient,
+) -> None:
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "agents": [
+                    {
+                        "kind": "agent",
+                        "id": "openai",
+                        "launch": "proxy",
+                        "name": "snet",
+                        "base_url": "https://old.example/v1",
+                        "api_key": "stored-secret",
+                        "default": True,
+                        "services": {"chat": {"behavior": "aggregate"}},
+                    },
+                    {"kind": "agent", "id": "mock", "launch": "mock"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    listing = client.get("/emullm/admin/backends/configured").json()
+    assert listing["count"] == 1
+    assert listing["backends"][0]["source"] == "agents"
+    assert listing["backends"][0]["has_api_key"] is True
+    assert "api_key" not in listing["backends"][0]
+
+    updated = client.put(
+        "/emullm/admin/backends/configured/agents/0",
+        json={
+            "name": "snet",
+            "base_url": "https://new.example/v1/",
+            "description": "updated",
+            "api_key_env": "SNET_API_KEY",
+            "model": "vendor/model",
+            "default": True,
+            "validation_interval": "1day",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    persisted = json.loads(emullm_api._CONFIG_PATH.read_text(encoding="utf-8"))  # noqa: SLF001
+    proxy = persisted["agents"][0]
+    assert proxy["base_url"] == "https://new.example/v1"
+    assert proxy["api_key"] == "stored-secret"
+    assert proxy["services"] == {"chat": {"behavior": "aggregate"}}
+    assert proxy["id"] == "openai"
+
+    created = client.post(
+        "/emullm/admin/backends/configured",
+        json={
+            "name": "backup",
+            "base_url": "http://backup.example/v1",
+            "model": "backup/model",
+            "default": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["backend"]["source"] == "backends"
+    persisted = json.loads(emullm_api._CONFIG_PATH.read_text(encoding="utf-8"))  # noqa: SLF001
+    assert persisted["agents"][0]["default"] is False
+    assert persisted["backends"][0]["default"] is True
+
+    duplicate = client.post(
+        "/emullm/admin/backends/configured",
+        json={"name": "backup", "base_url": "https://duplicate.example/v1"},
+    )
+    assert duplicate.status_code == 409
+    assert client.delete(
+        "/emullm/admin/backends/configured/backends/0"
+    ).status_code == 200
+    assert client.get("/emullm/admin/backends/configured").json()["count"] == 1
+
+
+def test_backend_config_rejects_stale_edits_and_preserves_malformed_file(
+    client: TestClient,
+) -> None:
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "backends": [
+                    {"name": "first", "base_url": "https://first.example/v1"},
+                    {"name": "second", "base_url": "https://second.example/v1"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale = client.put(
+        "/emullm/admin/backends/configured/backends/0",
+        json={
+            "name": "renamed",
+            "expected_name": "second",
+            "base_url": "https://renamed.example/v1",
+        },
+    )
+    assert stale.status_code == 409
+    assert json.loads(emullm_api._CONFIG_PATH.read_text(encoding="utf-8"))[  # noqa: SLF001
+        "backends"
+    ][0]["name"] == "first"
+
+    malformed = '{"backends": ['
+    emullm_api._CONFIG_PATH.write_text(malformed, encoding="utf-8")  # noqa: SLF001
+    response = client.post(
+        "/emullm/admin/backends/configured",
+        json={"name": "new", "base_url": "https://new.example/v1"},
+    )
+    assert response.status_code == 409
+    assert emullm_api._CONFIG_PATH.read_text(encoding="utf-8") == malformed  # noqa: SLF001
+
+
+def test_codex_supplier_page_defaults_to_copilot_and_supports_crud(
+    client: TestClient,
+) -> None:
+    initial = client.get("/emullm/admin/codex-suppliers").json()
+    assert initial["suppliers"] == [emullm_api._DEFAULT_CODEX_SUPPLIER]  # noqa: SLF001
+
+    created = client.post(
+        "/emullm/admin/codex-suppliers",
+        json={
+            "id": "remote-codex",
+            "name": "Remote Codex",
+            "kind": "openai-compatible",
+            "enabled": True,
+            "worker_pattern": "worker-codex-*",
+            "model_prefix": "remote/",
+            "model_patterns": ["codex-*"],
+            "base_url": "https://codex.example/v1",
+            "api_key_env": "CODEX_API_KEY",
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert [supplier["id"] for supplier in created.json()["suppliers"]] == [
+        "copilot",
+        "remote-codex",
+    ]
+
+    copilot = dict(emullm_api._DEFAULT_CODEX_SUPPLIER)  # noqa: SLF001
+    copilot["enabled"] = False
+    updated = client.put(
+        "/emullm/admin/codex-suppliers/copilot",
+        json=copilot,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["supplier"]["enabled"] is False
+    assert client.delete(
+        "/emullm/admin/codex-suppliers/remote-codex"
+    ).status_code == 200
+    assert client.get("/emullm/admin/codex-suppliers").json()["count"] == 1
+
+
+def test_codex_catalog_model_reports_configured_copilot_supplier() -> None:
+    entry = emullm_api._copilot_catalog_model_entry(  # noqa: SLF001
+        {"id": "gpt-5.3-codex", "name": "GPT-5.3-Codex"}
+    )
+    assert entry["codex_supplier"] == "copilot"
+
+
+def test_codex_supplier_prefers_priority_then_specific_pattern() -> None:
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "codex_suppliers": [
+                    {
+                        **emullm_api._DEFAULT_CODEX_SUPPLIER,  # noqa: SLF001
+                        "priority": 0,
+                    },
+                    {
+                        "id": "specific",
+                        "name": "Specific",
+                        "kind": "custom",
+                        "enabled": True,
+                        "priority": 0,
+                        "model_patterns": ["gpt-5.3-*"],
+                    },
+                    {
+                        "id": "priority",
+                        "name": "Priority",
+                        "kind": "custom",
+                        "enabled": True,
+                        "priority": 10,
+                        "model_patterns": ["*codex*"],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        emullm_api._codex_supplier_for_model("gpt-5.3-codex")["id"]  # noqa: SLF001
+        == "priority"
+    )
 
 
 def test_standalone_process_control_endpoints(client: TestClient, monkeypatch) -> None:
@@ -3618,6 +4510,10 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     assert "Headless Copilot servants" in html
     assert 'id="copilot-form"' in html
     assert 'id="cp-allow-all"' in html
+    assert 'id="cp-warmup"' not in html
+    assert 'id="cp-allow-all" type="checkbox" checked' in html
+    assert 'id="cp-custom-instructions" type="checkbox" checked' in html
+    assert 'id="cp-builtin-mcps" type="checkbox" checked' in html
     assert 'id="refresh-copilot-models"' in html
     assert 'id="cp-model-pool"' in html
     assert 'id="cp-model-picker"' in html
@@ -3625,7 +4521,6 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     assert 'id="cp-model-selector"' in html
     assert "updateReasoningOptions" in html
     assert "most-1" in html and "least-1" in html
-    assert 'id="cp-warmup"' in html
     assert 'id="cp-warmup-prompt"' in html
     assert 'id="cp-chunk-prompts"' in html
     assert 'id="cp-chunk-tokens"' in html
@@ -3654,16 +4549,30 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     assert 'id="model-config-json"' in html
     assert 'id="model-config-route"' in html
     assert 'id="model-route-order"' in html
+    assert 'id="model-route-specific-backends"' in html
     assert "data-route-move" in html
     assert 'id="model-config-audio"' in html
     assert 'id="model-config-code"' in html
+    assert 'id="model-config-image-output"' in html
     assert 'id="model-config-summary"' in html
     assert 'id="model-config-save"' in html
     assert 'id="model-config-load"' in html
     assert 'id="model-test-configure"' in html
     assert 'id="model-test-capabilities"' in html
+    assert 'id="image-generation-model"' in html
+    assert 'value="copilot/gpt-5.3-codex"' in html
+    assert 'id="image-generation-run"' in html
+    assert 'id="image-generation-preview"' in html
     assert 'id="model-test-samples"' in html
     assert "refreshModelTestSamples" in html
+    assert 'href="#backend-config"' in html
+    assert 'id="backend-form"' in html
+    assert 'id="backend-config-rows"' in html
+    assert 'href="#codex-suppliers"' in html
+    assert 'id="supplier-form"' in html
+    assert 'id="supplier-rows"' in html
+    assert "refreshBackendConfigs" in html
+    assert "refreshCodexSuppliers" in html
 
 
 def test_admin_page_javascript_has_valid_syntax(
@@ -3692,7 +4601,28 @@ def test_admin_page_javascript_has_valid_syntax(
     assert 'id="server-settings"' in html
     assert 'id="server-settings-save"' in html
     assert 'id="server-proxy-url"' in html
+    assert 'id="server-max-concurrent"' in html
+    assert 'id="server-idle-workers"' in html
+    assert 'id="server-idle-grace"' in html
+    assert 'id="server-backend-delay"' in html
     assert 'id="top-uptime"' in html
+    assert 'id="top-active-count"' in html
+    assert 'id="top-waiting-count"' in html
+    assert 'id="top-served-count"' in html
+    assert 'id="telemetry-services"' in html
+    assert 'id="telemetry-workers"' in html
+    assert 'id="telemetry-models"' in html
+    assert 'id="telemetry-footer-mode"' in html
+    assert 'id="telemetry-workers-toggle"' in html
+    assert 'id="telemetry-models-toggle"' in html
+    assert 'id="telemetry-workers-total"' in html
+    assert 'id="telemetry-models-total"' in html
+    assert 'data-stats-table="workers"' in html
+    assert 'data-stats-table="models"' in html
+    assert 'id="top-switch-count"' in html
+    assert 'id="copilot-start-all"' in html
+    assert 'id="copilot-stop-all"' in html
+    assert 'id="copilot-stop-idle"' in html
     assert "formatDuration" in html
     assert 'id="config-section-tabs"' in html
     assert 'id="config-section-editor"' in html

@@ -35,12 +35,19 @@ def test_manifest_uses_native_service_catalog() -> None:
     assert endpoints["workerWebSocket"]["path"] == "/emullm/ws"
     assert endpoints["mailboxWebSocket"]["path"] == "/emullm/mailbox/ws"
     assert endpoints["headlessCopilots"]["path"] == "/emullm/admin/copilots"
+    assert endpoints["bulkCopilotActions"]["path"].endswith("/{action}")
+    assert "/online-action/" in endpoints["onlineCopilotAction"]["path"]
     assert endpoints["chatCompletions"]["path"] == "/v1/chat/completions"
     assert endpoints["modelConfigurator"]["path"] == "/emullm/admin/model-config"
     assert endpoints["loadCopilotModel"]["path"].endswith("/{model_id}")
     assert endpoints["testMediaSamples"]["path"] == "/emullm/admin/test-samples"
+    assert endpoints["imageGenerations"]["path"] == "/v1/images/generations"
+    assert endpoints["imageEdits"]["path"] == "/v1/images/edits"
     assert endpoints["agents"]["path"] == "/emullm/admin/agents"
     assert endpoints["websocketInventory"]["path"] == "/emullm/admin/websockets"
+    assert endpoints["fastapiRequestInventory"]["path"] == "/emullm/admin/clients"
+    assert endpoints["backendConfigurator"]["path"] == "/emullm/admin/backends/configured"
+    assert endpoints["codexSuppliers"]["path"] == "/emullm/admin/codex-suppliers"
     assert endpoints["modelTestClient"]["path"] == "/emullm/admin/test-chat"
     assert endpoints["configSections"]["path"] == "/emullm/admin/config/section/{section}"
     assert endpoints["restart"]["path"] == "/emullm/admin/restart"
@@ -64,10 +71,21 @@ def test_manifest_uses_native_service_catalog() -> None:
     assert embedded_mode["config"]["plugin-lifecycle.standalone"] is False
 
 
-def test_embedded_router_includes_relay_routes_and_lifespan(monkeypatch) -> None:
+def test_embedded_router_includes_relay_routes_and_lifespan(
+    monkeypatch,
+    tmp_path,
+) -> None:
     host = FastAPI()
     host.include_router(embedded.create_router({}))
-    monkeypatch.setattr(app_module._sup, "load_config", lambda _path: {"mode": "mock"})
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"mode":"mock","idle_worker_target":0}', encoding="utf-8")
+    monkeypatch.setattr(api, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(api, "_RUNTIME_DIR", tmp_path / "runtime")
+    monkeypatch.setattr(
+        app_module._sup,
+        "load_config",
+        lambda _path: {"mode": "mock", "idle_worker_target": 0},
+    )
     previous_mode = api._SERVER_MODE
     api._SERVER_MODE = "recruit"
     try:
@@ -117,3 +135,33 @@ def test_standalone_main_runs_existing_app(monkeypatch) -> None:
     ]
     assert servers[0].ran is True
     assert process_control.shutdown_available() is False
+
+
+def test_restart_marks_worker_handoff_for_replacement(monkeypatch) -> None:
+    captured = {}
+
+    class FakeProcess:
+        pid = 4242
+
+        @staticmethod
+        def terminate():
+            return None
+
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(process_control, "_restart_in_progress", False)
+    monkeypatch.setattr(process_control.subprocess, "Popen", popen)
+    process_control.register_shutdown_callback(lambda: None)
+    monkeypatch.setattr(process_control, "schedule_shutdown", lambda _delay: True)
+    try:
+        assert process_control.schedule_restart(
+            "127.0.0.1",
+            8801,
+            delay_seconds=60,
+        ) == 4242
+        assert captured["env"]["EMULLM_RESTART_HANDOFF"] == "1"
+        assert process_control.restart_in_progress() is True
+    finally:
+        process_control.register_shutdown_callback(None)

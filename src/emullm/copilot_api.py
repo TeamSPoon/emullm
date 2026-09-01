@@ -145,15 +145,30 @@ class HeadlessCopilotConfig(BaseModel):
     )
     timeout_seconds: float = Field(default=900.0, ge=1.0, le=86_400.0)
     reconnect_seconds: float = Field(default=2.0, ge=0.1, le=300.0)
+    keepalive_interval_seconds: float = Field(
+        default=40.0,
+        ge=0.0,
+        le=3_600.0,
+        description=(
+            "Idle seconds between real text-only Copilot keepalive tasks; "
+            "zero disables anti-idle work."
+        ),
+    )
+    keepalive_timeout_seconds: float = Field(
+        default=3.0,
+        ge=0.1,
+        le=3.0,
+        description="Hard maximum duration for one anti-idle model task.",
+    )
     context: Literal["default", "long_context"] = "default"
     reasoning_effort: str | None = Field(
         default=None,
         description="Exact effort or selector: random, most-N, or least-N.",
     )
     max_ai_credits: float | None = Field(default=None, gt=0)
-    allow_all: bool = False
-    load_custom_instructions: bool = False
-    enable_builtin_mcps: bool = False
+    allow_all: bool = True
+    load_custom_instructions: bool = True
+    enable_builtin_mcps: bool = True
     chunk_long_prompts: bool = True
     chunk_tokens: int | None = Field(
         default=None,
@@ -254,6 +269,18 @@ def write_config_document(path: Path, document: dict[str, Any]) -> None:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def update_config_document(
+    path: Path,
+    mutator: Callable[[dict[str, Any]], Any],
+) -> Any:
+    """Atomically read, mutate, and replace one shared config document."""
+    with _CONFIG_IO_LOCK:
+        document = _read_config_document(path)
+        result = mutator(document)
+        write_config_document(path, document)
+        return result
 
 
 def resolve_copilot_command(configured: str | None = None) -> str:
@@ -706,11 +733,12 @@ class CopilotInstanceManager:
             )
 
     def _persist_locked(self) -> None:
-        document = _read_config_document(self.config_path)
-        document["headless_copilots"] = [
-            config.model_dump(mode="json") for config in self._configs.values()
-        ]
-        write_config_document(self.config_path, document)
+        def update(document: dict[str, Any]) -> None:
+            document["headless_copilots"] = [
+                config.model_dump(mode="json") for config in self._configs.values()
+            ]
+
+        update_config_document(self.config_path, update)
 
     def _require(self, worker_id: str) -> HeadlessCopilotConfig:
         try:
@@ -804,7 +832,7 @@ class CopilotInstanceManager:
 
     def _is_running(self, worker_id: str) -> bool:
         row = next(row for row in self._supervisor.status() if row["worker_id"] == worker_id)
-        return bool(row["running"])
+        return bool(row["running"] or self._connected(worker_id))
 
     def _graceful_stop(self, worker_id: str) -> bool:
         spec = next(spec for spec in self._supervisor.specs() if spec.worker_id == worker_id)
@@ -826,11 +854,17 @@ class CopilotInstanceManager:
         return self._supervisor.stop(worker_id)
 
     def start_autostart(self) -> list[str]:
+        started: list[str] = []
         with self._lock:
             for config in self._configs.values():
                 if config.autostart:
                     resolve_copilot_command(config.copilot_command)
-            return self._supervisor.start_autostart()
+                    if not self._connected(config.worker_id) and not self._is_running(
+                        config.worker_id
+                    ):
+                        if self._supervisor.start(config.worker_id):
+                            started.append(config.worker_id)
+        return started
 
     def stop_all(self) -> None:
         with self._lock:
@@ -843,15 +877,23 @@ class CopilotInstanceManager:
             process = next(
                 row for row in self._supervisor.status() if row["worker_id"] == worker_id
             )
+            connected = bool(self._connected(worker_id))
+            running = bool(process["running"] or connected)
             runtime = self._runtime_status(worker_id)
-            if not process["running"] and runtime:
+            if not running and runtime:
                 runtime = {**runtime, "running": False}
             return {
                 "worker_id": worker_id,
                 "kind": "headless-copilot",
-                "running": process["running"],
-                "connected": bool(self._connected(worker_id)),
-                "pid": process["pid"],
+                "running": running,
+                "connected": connected,
+                "external": bool(connected and not process["running"]),
+                "pid": (
+                    runtime.get("adapter_pid")
+                    if runtime and runtime.get("adapter_pid")
+                    else process["pid"]
+                ),
+                "launcher_pid": process["pid"],
                 "returncode": process["returncode"],
                 "session_id": str(config.session_id),
                 "model": config.model,
@@ -880,20 +922,27 @@ class CopilotInstanceManager:
         index = 1
         while (
             f"worker-copilot-{index}" in used
-            or 5 <= index <= 8
+            or 5 <= index <= 50
         ):
             index += 1
         return f"worker-copilot-{index}"
 
     def _selected_model(self, worker_id: str) -> str | None:
-        path = self._runtime_config_path(worker_id)
-        if not path.is_file():
-            return None
-        try:
-            value = json.loads(path.read_text(encoding="utf-8-sig")).get("selected_model")
-        except (OSError, json.JSONDecodeError, AttributeError):
-            return None
-        return str(value) if value else None
+        for path, key in (
+            (self._runtime_status_path(worker_id), "model"),
+            (self._runtime_config_path(worker_id), "selected_model"),
+        ):
+            if not path.is_file():
+                continue
+            try:
+                value = json.loads(
+                    path.read_text(encoding="utf-8-sig")
+                ).get(key)
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
+            if value:
+                return str(value)
+        return None
 
     def _selected_reasoning_effort(self, worker_id: str) -> str | None:
         path = self._runtime_config_path(worker_id)

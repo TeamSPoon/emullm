@@ -10,6 +10,7 @@ from typing import Any
 
 _lock = threading.RLock()
 _shutdown_callback: Callable[[], None] | None = None
+_restart_in_progress = False
 
 
 def register_shutdown_callback(callback: Callable[[], None] | None) -> None:
@@ -21,6 +22,11 @@ def register_shutdown_callback(callback: Callable[[], None] | None) -> None:
 def shutdown_available() -> bool:
     with _lock:
         return _shutdown_callback is not None
+
+
+def restart_in_progress() -> bool:
+    with _lock:
+        return _restart_in_progress
 
 
 def schedule_shutdown(delay_seconds: float = 0.5) -> bool:
@@ -41,9 +47,11 @@ def schedule_restart(
     delay_seconds: float = 0.5,
 ) -> int:
     """Start a detached helper, then gracefully stop the current server."""
+    global _restart_in_progress
     if not shutdown_available():
         raise RuntimeError("standalone process control is not available")
     env = os.environ.copy()
+    env["EMULLM_RESTART_HANDOFF"] = "1"
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
         kwargs["creationflags"] = 0x00000008 | 0x00000200
@@ -68,7 +76,11 @@ def schedule_restart(
         close_fds=True,
         **kwargs,
     )
+    with _lock:
+        _restart_in_progress = True
     if not schedule_shutdown(delay_seconds):
+        with _lock:
+            _restart_in_progress = False
         process.terminate()
         raise RuntimeError("standalone process control became unavailable")
     return process.pid

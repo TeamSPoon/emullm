@@ -75,6 +75,16 @@ real client <--HTTP-- (blocks on a Future) <--WS reply-- worker (writes {"type":
   Copilot servants abort the active SDK message without stopping their
   resident CLI runtime, and acknowledge with
   `{"type":"cancelled","id":...,"cancelled":true}`.
+- Each resident Copilot servant independently schedules a real text-only
+  anti-idle model interaction every 40 seconds by default. It rotates 50
+  bounded micro-tasks, aborts each after at most three seconds, and reports a
+  successful interaction as
+  `{"type":"keepalive_reply","id":...,"prompt_index":...,"duration_ms":...}`.
+  This frame updates WebSocket satisfaction age without entering client request
+  telemetry. A client request or model switch preempts an active keepalive.
+- Keepalive task timing is adaptive per worker/model. After two outcomes at or
+  above two seconds (timeouts included), that task is persisted as retired and
+  skipped. A model switch resets those rankings.
 - Any `model` string is accepted and forwarded unchanged. An exact configured
   `model_routes` entry takes precedence. A legacy string value names one
   worker; a list is an ordered failover chain of worker-ID glob patterns and
@@ -209,6 +219,14 @@ Request disposition frames are distinct:
 - `not_ready` with `reason` and `retry_after` is transient and records
   `LLM_NOT_READY`. The relay immediately tries the next candidate, excludes the
   deferred worker during its cooldown, then permits later offers again.
+- `keepalive_reply` is maintenance-only. It refreshes the socket's
+  `last_satisfied_at` clock but never its `last_client_work_at` clock.
+
+The admin inventory exposes two independent ages for each worker WebSocket:
+last satisfied interaction (client or keepalive) and last real client work.
+`GET /emullm/admin/clients` separately returns active/recent FastAPI `/v1`
+requests and logical clients, keyed by `X-EmuLLM-Client-ID` when present or by
+remote host plus User-Agent otherwise.
 
 ## Personas ("yourself/same", "yourself/percent25", ...)
 
@@ -241,12 +259,34 @@ model name as a new worker.
 
 Every authenticated Copilot SDK catalog entry is also exported as
 `copilot/<model-id>`. With no explicit route override, the first request lazily
-loads that exact backing model into one of four persistent `worker-copilot-5..8`
-slots. A matching running/stopped slot is reused, an empty slot is created, and
-a stopped slot loaded for another model can be reassigned with a fresh session.
-If four different slots are running, loading a fifth model fails rather than
-silently serving it with the wrong backing model. An explicit `model_routes`
-entry overrides this default and can target servant globs or real backend URLs.
+loads that exact backing model into the elastic `worker-copilot-N` pool.
+`max_concurrent_calls` defaults to 50 (4–50), reserving IDs 1–4 for baseline
+workers and 5–50 for elastic capacity. A matching idle worker is reserved; if
+matching workers are busy, another replica starts. At capacity, an idle elastic
+session can switch models with `session.setModel()` without restarting its
+resident CLI or discarding conversation history. The idle maintainer targets
+five zero-load workers by default. An explicit `model_routes` entry overrides
+the on-demand default.
+
+A worker is not idle until it has had zero active/reserved calls for
+`idle_grace_seconds` (default 30). Baseline/manual and idle-reserve workers warm
+once automatically; demand replicas do not. Excess idle elastic workers are
+stopped after the grace period. Bulk Start/Stop/Stop idle/Restart/New session
+controls are enabled according to each worker's online state and can pause or
+resume idle-pool maintenance.
+
+During standalone restart, connected servant processes are preserved and
+reconnect to the replacement server. Autostart reconciliation waits for that
+handoff and launches only missing workers, avoiding duplicate resident
+sessions.
+
+Real backend route targets are last resort. Before the first backend target,
+the request is intentionally held for `backend_fallback_delay_seconds` (default
+5), and that hold appears in the admin waiting counter. The admin telemetry
+panel reports active/waiting calls, per-worker/relayed-backend and team service time, averages,
+outcomes by service kind, request counts/timing by requested model, and runtime
+model-switch counts. Worker/model tables are sortable, show four rows by
+default, and offer cumulative-total or weighted-average footers.
 
 `emullm/default` is always present and resolves to the configured
 `services.model` default, while preserving `emullm/default` in the public
@@ -291,6 +331,48 @@ attachment transport, while audio comprehension is labeled `sdk_advertised`,
 `operator_declared`, `family_implied`, or `not_advertised`. Missing Copilot
 schema metadata is therefore not reported as a definite lack of support.
 
+Codex/code-family entries additionally expose:
+
+```json
+{
+  "task_capabilities": {
+    "image_output": {"enabled": true, "status": "tool_generated"}
+  },
+  "output_modalities": {
+    "image": {
+      "enabled": true,
+      "capability": "image_output",
+      "status": "tool_generated",
+      "media_types": ["image/png"]
+    }
+  }
+}
+```
+
+`POST /v1/images/generations` accepts JSON
+`{model,prompt,n,size,response_format}`. `POST /v1/images/edits` accepts
+multipart fields: required `image` and `prompt`; optional `mask`, `model`,
+`n`, `size`, and `response_format`. Source and mask filenames are neutralized.
+Both return `data[]` entries with `model`, `operation`, `source`,
+`mime_type`, and:
+
+```json
+{
+  "artifact": {
+    "source": "worker",
+    "file_id": "file-...",
+    "url": "/emullm/cloud/files/file-...",
+    "mime_type": "image/png",
+    "bytes": 12345
+  }
+}
+```
+
+Edits additionally include
+`inputs: {image: {file_id,url,mime_type,bytes,name}, mask: {...}|null, size}`.
+`source: "simulated"` identifies the deterministic placeholder so consumers
+can fall back to local inpainting without mistaking it for model output.
+
 For any media-bearing request, the relay derives `required_capabilities`
 (`vision_input` and/or `audio_input`) and includes them in the worker offer.
 Round-robin ordering is capability-aware: explicitly capable workers are tried
@@ -305,9 +387,21 @@ message produce `not_ready`, not `reject`.
 The route configurator exposes five literal shortcuts:
 `worker-in-name`, `worker-copilot-*`, `worker-codex-*`,
 `worker-unknown-*`, and `backend-*`. `worker-in-name` selects the worker prefix
-from the requested model ID. `backend-*` expands configured backend names;
+from the requested model ID. `backend-*` expands configured backend names, and
+the UI adds specific targets such as `backend-snet` for each configured backend;
 worker globs retain capability-aware round-robin and accept/reject/not-ready
 behavior.
+
+The admin control plane has dedicated provider configuration surfaces:
+
+- **Backends** unifies direct `backends[]` records with `launch: proxy` agents.
+  CRUD updates core URL/model/credential/default fields while preserving
+  advanced proxy-agent service catalogs. Inline API keys are redacted from
+  list responses and remain unchanged unless explicitly replaced or cleared.
+- **Codex suppliers** manages typed `codex_suppliers[]` declarations. The
+  default working supplier is enabled GitHub Copilot, mapped to
+  `worker-copilot-*`, the `copilot/` model prefix, and `*codex*` backing models.
+  Matching exported model records include `codex_supplier: "copilot"`.
 
 `POST /v1/chat/completions` also accepts an EMULLM extension,
 `required_capabilities`, for task tags such as `code` and `summarization`.

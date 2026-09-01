@@ -75,10 +75,12 @@ emit({
 });
 
 let active = null;
+let switchingModel = false;
+let currentModel = config.selected_model;
 let shuttingDown = false;
 
 async function handleRequest(message) {
-  if (active !== null) {
+  if (active !== null || switchingModel) {
     emit({
       type: "error",
       id: message.id,
@@ -122,6 +124,40 @@ async function handleRequest(message) {
     }
   } finally {
     if (active === current) active = null;
+  }
+}
+
+async function handleSetModel(message) {
+  const id = String(message.id ?? "");
+  const model = String(message.model ?? "").trim();
+  if (!model) {
+    emit({ type: "model_change_error", id, error: "model is required" });
+    return;
+  }
+  if (active !== null || switchingModel) {
+    emit({ type: "model_change_error", id, error: "Copilot session is busy" });
+    return;
+  }
+  if (model === currentModel) {
+    emit({ type: "model_changed", id, model, unchanged: true });
+    return;
+  }
+  switchingModel = true;
+  try {
+    await session.setModel(model, {
+      reasoningEffort: message.reasoning_effort ?? undefined,
+      contextTier: message.context ?? config.context,
+    });
+    currentModel = model;
+    emit({ type: "model_changed", id, model });
+  } catch (error) {
+    emit({
+      type: "model_change_error",
+      id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    switchingModel = false;
   }
 }
 
@@ -169,6 +205,8 @@ input.on("line", (line) => {
   }
   if (message.type === "request") {
     void handleRequest(message);
+  } else if (message.type === "set_model") {
+    void handleSetModel(message);
   } else if (message.type === "cancel") {
     void handleCancel(message);
   } else if (message.type === "shutdown") {
