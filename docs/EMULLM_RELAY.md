@@ -29,11 +29,11 @@ never need an API key or bearer token: `/v1/*` does not check
 It runs as its own standalone FastAPI service on its own port:
 
 ```
-python run.py               # 127.0.0.1:8801
-python run.py --port 9001
+python -m emullm.standalone            # 127.0.0.1:8801
+python -m emullm.standalone --port 9001
 ```
 
-`../run.py` serves `../src/emullm/app.py` (a `FastAPI` app that includes the
+`emullm.standalone` serves `../src/emullm/app.py` (a `FastAPI` app that includes the
 router from `../src/emullm/api.py`) with no `/api` prefix, so its routes sit at
 the bare `/v1/...` paths a real backend would use. All the code lives
 under the `../src/emullm` package (`api.py` for the router/relay logic,

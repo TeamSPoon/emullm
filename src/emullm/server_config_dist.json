@@ -275,7 +275,7 @@
    "priority": 0,
    "description": "Current Codex supplier: resident Copilot SDK workers serving Codex-family models.",
    "worker_pattern": "worker-copilot-*",
-   "model_prefix": "copilot/",
+   "model_prefix": "router/",
    "model_patterns": [
     "*codex*"
    ],
@@ -430,7 +430,7 @@
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/gemini-3.7-flash"
+    "router/gemini-3.7-flash"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -467,12 +467,12 @@
   },
   {
    "worker_id": "worker-copilot-6",
-   "session_id": "344a9903-37f1-4934-8950-9cd602631282",
+   "session_id": "45ce196b-4161-4c5f-9c63-c398c7c92c4f",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -511,21 +511,21 @@
   },
   {
    "worker_id": "worker-copilot-7",
-   "session_id": "627a5c7a-a158-4661-aefd-dde47a1fcaaf",
-   "model": "auto",
+   "session_id": "d9b0ddbc-73c2-4df8-ad82-248abc54ad2d",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -533,7 +533,7 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -555,21 +555,21 @@
   },
   {
    "worker_id": "worker-copilot-8",
-   "session_id": "9ee32465-4c6f-4449-9384-1efda504b9e0",
-   "model": "auto",
+   "session_id": "97c77122-6de4-490d-a05a-211c28881470",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -577,7 +577,7 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -599,21 +599,21 @@
   },
   {
    "worker_id": "worker-copilot-9",
-   "session_id": "b09383f6-6ccc-498f-92a4-013ee2c6eb2c",
-   "model": "auto",
+   "session_id": "5af8d80f-8de9-4071-bbfd-446b9ae10964",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -621,7 +621,7 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -643,12 +643,12 @@
   },
   {
    "worker_id": "worker-copilot-10",
-   "session_id": "1ed53915-314a-44be-8388-ccd8a25d0969",
+   "session_id": "a9a60579-adc3-4d9b-b31f-20fe8d4be9fe",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -687,12 +687,12 @@
   },
   {
    "worker_id": "worker-copilot-11",
-   "session_id": "e3ee953f-e510-46b4-b2ae-9dea24231fd3",
+   "session_id": "bc5768ee-7705-45b1-8f5a-4e1fc49c866f",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -731,12 +731,12 @@
   },
   {
    "worker_id": "worker-copilot-12",
-   "session_id": "c77c1d07-9a6b-4104-9342-93e22b23485d",
+   "session_id": "966f47fa-8840-41c7-8126-ce2ac395f584",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -775,21 +775,21 @@
   },
   {
    "worker_id": "worker-copilot-13",
-   "session_id": "328954e6-67ab-438a-8522-546c160e434d",
-   "model": "auto",
+   "session_id": "985b88db-d562-48ab-9ea7-c30712a6b09b",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -797,7 +797,7 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -819,21 +819,21 @@
   },
   {
    "worker_id": "worker-copilot-14",
-   "session_id": "022f4776-42e7-4c53-afc9-17b819681706",
-   "model": "auto",
+   "session_id": "19df03f2-dcf9-4b78-9dec-0938cd37846b",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -841,7 +841,7 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -863,12 +863,12 @@
   },
   {
    "worker_id": "worker-copilot-15",
-   "session_id": "58b8b216-bb34-4f44-9e35-23fb097dfcf2",
+   "session_id": "0d65117f-7af1-4e1b-8396-4d4440196280",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -907,21 +907,21 @@
   },
   {
    "worker_id": "worker-copilot-16",
-   "session_id": "614be810-0227-4de3-aea6-95d9ddbd26b3",
-   "model": "auto",
+   "session_id": "3e059b47-d460-464e-83a7-8891a05473d7",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -929,7 +929,7 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -951,21 +951,21 @@
   },
   {
    "worker_id": "worker-copilot-17",
-   "session_id": "d52d8338-0a8d-4ff6-a861-4279cb699b9d",
-   "model": "auto",
+   "session_id": "43613585-6788-4b9d-9ce0-486f49cee1e9",
+   "model": "gpt-5.3-codex",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/gpt-5.3-codex"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
-    "!vision_input",
+    "vision_input",
     "!audio_input",
     "file_input",
-    "!code",
-    "!image_generation",
-    "!image_output",
+    "code",
+    "image_generation",
+    "image_output",
     "summarization"
    ],
    "system_prompt": "Act as the model requested by the OpenAI-compatible caller. Answer the request directly and return only the assistant response that should be sent to the caller.",
@@ -973,7 +973,7 @@
    "host_ws_url": null,
    "copilot_command": null,
    "autostart": false,
-   "warmup": true,
+   "warmup": false,
    "warmup_prompt": "Startup warmup: reply only READY.",
    "timeout_seconds": 900.0,
    "reconnect_seconds": 2.0,
@@ -995,12 +995,12 @@
   },
   {
    "worker_id": "worker-copilot-18",
-   "session_id": "85d2c73e-7aaa-4361-b3e2-9fe65f253b1a",
+   "session_id": "1141429c-2566-4309-9956-3c7168468a4d",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -1039,12 +1039,12 @@
   },
   {
    "worker_id": "worker-copilot-19",
-   "session_id": "199b0dbf-c9f5-44ba-a531-7ae964ce9aac",
+   "session_id": "09d8581c-be80-4ed7-bd84-3e41618e6afa",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -1083,12 +1083,12 @@
   },
   {
    "worker_id": "worker-copilot-20",
-   "session_id": "5c3432f1-eb5f-46c3-be94-0db9055c381c",
+   "session_id": "d648edf4-6d70-4490-8194-865122f7e99e",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -1127,12 +1127,12 @@
   },
   {
    "worker_id": "worker-copilot-21",
-   "session_id": "5fc82a55-4549-4144-8ff9-23c86d2dbfff",
+   "session_id": "9155a33f-4439-4ff9-9add-b2b120f20309",
    "model": "auto",
    "model_pool": [],
    "model_selector": "random",
    "modelmasks": [
-    "copilot/auto"
+    "router/auto"
    ],
    "role": "on-demand-copilot",
    "capabilities": [
@@ -1685,7 +1685,7 @@
    }
   },
   "worker-copilot-1/same": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1702,9 +1702,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1714,7 +1711,7 @@
    }
   },
   "worker-copilot-1/percent125": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1731,9 +1728,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1743,7 +1737,7 @@
    }
   },
   "worker-copilot-1/percent100": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1760,9 +1754,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1772,7 +1763,7 @@
    }
   },
   "worker-copilot-1/percent75": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1789,9 +1780,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1801,7 +1789,7 @@
    }
   },
   "worker-copilot-1/percent25": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1818,9 +1806,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1830,7 +1815,7 @@
    }
   },
   "worker-copilot-1/percent10": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1847,9 +1832,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1859,7 +1841,7 @@
    }
   },
   "worker-copilot-2/same": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1876,9 +1858,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1888,7 +1867,7 @@
    }
   },
   "worker-copilot-2/percent125": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1905,9 +1884,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1917,7 +1893,7 @@
    }
   },
   "worker-copilot-2/percent100": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1934,9 +1910,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1946,7 +1919,7 @@
    }
   },
   "worker-copilot-2/percent75": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1963,9 +1936,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -1975,7 +1945,7 @@
    }
   },
   "worker-copilot-2/percent25": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -1992,9 +1962,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2004,7 +1971,7 @@
    }
   },
   "worker-copilot-2/percent10": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2021,9 +1988,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2033,7 +1997,7 @@
    }
   },
   "worker-copilot-3/same": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2050,9 +2014,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2062,7 +2023,7 @@
    }
   },
   "worker-copilot-3/percent125": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2079,9 +2040,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2091,7 +2049,7 @@
    }
   },
   "worker-copilot-3/percent100": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2108,9 +2066,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2120,7 +2075,7 @@
    }
   },
   "worker-copilot-3/percent75": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2137,9 +2092,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2149,7 +2101,7 @@
    }
   },
   "worker-copilot-3/percent25": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2166,9 +2118,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2178,7 +2127,7 @@
    }
   },
   "worker-copilot-3/percent10": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2195,9 +2144,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2207,7 +2153,7 @@
    }
   },
   "worker-copilot-4/same": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2224,9 +2170,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2236,7 +2179,7 @@
    }
   },
   "worker-copilot-4/percent125": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2253,9 +2196,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2265,7 +2205,7 @@
    }
   },
   "worker-copilot-4/percent100": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2282,9 +2222,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2294,7 +2231,7 @@
    }
   },
   "worker-copilot-4/percent75": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2311,9 +2248,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2323,7 +2257,7 @@
    }
   },
   "worker-copilot-4/percent25": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2340,9 +2274,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {
@@ -2352,7 +2283,7 @@
    }
   },
   "worker-copilot-4/percent10": {
-   "hidden": true,
+   "hidden": false,
    "patch": {
     "on_demand": false,
     "simulated": true,
@@ -2369,9 +2300,6 @@
     },
     "task_capabilities": {
      "code": {
-      "enabled": false
-     },
-     "image_output": {
       "enabled": false
      },
      "summarization": {

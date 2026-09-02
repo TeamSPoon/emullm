@@ -19,7 +19,7 @@ set "BASE_URL=http://%HOST%:%PORT%"
 
 echo [run_server_and_tests] Starting server on %BASE_URL% ...
 for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command ^
-    "$p = Start-Process -FilePath '.venv\Scripts\python.exe' -ArgumentList 'run.py','--host','%HOST%','--port','%PORT%','--no-reload' -WindowStyle Hidden -PassThru; $p.Id"`) do set "SERVER_PID=%%P"
+    "$p = Start-Process -FilePath '.venv\Scripts\python.exe' -ArgumentList '-m','emullm.standalone','%HOST%','%PORT%' -WindowStyle Hidden -PassThru; $p.Id"`) do set "SERVER_PID=%%P"
 
 if not defined SERVER_PID (
     echo [run_server_and_tests] Failed to start server.

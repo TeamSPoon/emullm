@@ -79,6 +79,8 @@ def isolate_emullm_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     # the next one).
     monkeypatch.setattr(emullm_api, "_connected_workers", {})
     monkeypatch.setattr(emullm_api, "_native_worker_ids", set())
+    monkeypatch.setattr(emullm_api, "_worker_teams", {})
+    monkeypatch.setattr(emullm_api, "_worker_team_of", {})
     monkeypatch.setattr(emullm_api, "_worker_models", {})
     monkeypatch.setattr(emullm_api, "_worker_kinds", {})
     monkeypatch.setattr(emullm_api, "_worker_runtime_models", {})
@@ -149,7 +151,7 @@ def test_list_models_includes_personas(client: TestClient) -> None:
         for model_id in ids
     )
     assert "emullm/default" in ids
-    assert any(model_id.startswith("copilot/") for model_id in ids)
+    assert any(model_id.startswith("router/") for model_id in ids)
 
 
 def test_emullm_default_alias_relays_through_configured_default(
@@ -409,8 +411,8 @@ def test_list_models_exports_complete_copilot_catalog_with_provenance(
 
     models = {entry["id"]: entry for entry in client.get("/v1/models").json()["data"]}
 
-    assert {"copilot/auto", "copilot/gemini-test"}.issubset(models)
-    gemini = models["copilot/gemini-test"]
+    assert {"router/auto", "router/gemini-test"}.issubset(models)
+    gemini = models["router/gemini-test"]
     assert gemini["owned_by"] == "github-copilot"
     assert gemini["backing_model"] == "gemini-test"
     assert gemini["on_demand"] is True
@@ -421,7 +423,7 @@ def test_list_models_exports_complete_copilot_catalog_with_provenance(
     assert gemini["input_modalities"]["audio"]["enabled"] is True
     assert gemini["task_capabilities"]["code"]["enabled"] is False
     assert gemini["task_capabilities"]["summarization"]["enabled"] is True
-    assert client.get("/v1/models/copilot/gemini-test").json()["id"] == "copilot/gemini-test"
+    assert client.get("/v1/models/router/gemini-test").json()["id"] == "router/gemini-test"
 
 
 def test_model_configurator_persists_model_patch_visibility_and_route(
@@ -670,7 +672,105 @@ def test_full_elastic_pool_reuses_idle_worker_via_runtime_switch(
     assert emullm_api._worker_reservations[worker_id] == 1  # noqa: SLF001
 
 
-def test_server_switches_idle_worker_model_over_websocket() -> None:
+def test_ensure_on_demand_copilot_switches_with_catalog_entry(monkeypatch) -> None:
+    """Regression: the runtime-switch branch passed an undefined name
+    (``model_entry``) instead of the resolved catalog ``entry``, so every
+    on-demand model that needed a runtime switch (e.g. copilot/gpt-5.3-codex)
+    raised NameError -> HTTP 500. This drives the real function body to make
+    sure the resolved entry reaches _set_worker_runtime_model."""
+
+    entry = {"id": "copilot/gpt-5.3-codex", "on_demand": True, "input_modalities": {}}
+
+    class FakeManager:
+        @staticmethod
+        def get(worker_id):
+            return {"worker_id": worker_id, "running": True, "connected": True}
+
+    monkeypatch.setattr(
+        emullm_api, "_copilot_model_metadata", lambda backing: {"id": backing}  # noqa: SLF001
+    )
+    monkeypatch.setattr(
+        emullm_api, "_copilot_catalog_model_entry", lambda metadata: entry  # noqa: SLF001
+    )
+    monkeypatch.setattr(
+        emullm_api, "_apply_model_catalog_override", lambda value: value  # noqa: SLF001
+    )
+    monkeypatch.setattr(
+        emullm_api,
+        "_provision_on_demand_copilot",  # noqa: SLF001
+        lambda backing, catalog_entry, **kwargs: ("worker-copilot-5", FakeManager(), True),
+    )
+
+    captured: dict = {}
+
+    async def fake_switch(worker_id, backing_model, model_entry):
+        captured["worker_id"] = worker_id
+        captured["backing_model"] = backing_model
+        captured["entry"] = model_entry
+
+    monkeypatch.setattr(emullm_api, "_set_worker_runtime_model", fake_switch)  # noqa: SLF001
+
+    worker_id = asyncio.run(
+        emullm_api._ensure_on_demand_copilot(  # noqa: SLF001
+            "copilot/gpt-5.3-codex",
+            "gpt-5.3-codex",
+        )
+    )
+
+    assert worker_id == "worker-copilot-5"
+    assert captured["entry"] is entry
+    assert captured["backing_model"] == "gpt-5.3-codex"
+
+
+def test_best_match_copilot_backing_prefers_exact_then_family(monkeypatch) -> None:
+    """When no worker will accept the requested Copilot model, substitution
+    picks the closest available model: an exact id wins outright; otherwise a
+    same-family match (e.g. codex -> code) is preferred over mere name
+    similarity; the public model id is left for the caller to preserve."""
+
+    catalog = [
+        {"id": "gpt-5.6-sol"},
+        {"id": "gpt-5.5"},
+        {"id": "kimi-k2.7-code"},
+        {"id": "mai-code-1.1-flash"},
+        {"id": "claude-opus-5"},
+        {"id": "gpt-5.3-codex"},
+    ]
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": catalog, "source": "test"},
+    )
+    monkeypatch.setattr(emullm_api, "_worker_runtime_models", {}, raising=False)  # noqa: SLF001
+
+    # Exact id present -> returned unchanged.
+    assert emullm_api._best_match_copilot_backing("gpt-5.3-codex") == "gpt-5.3-codex"  # noqa: SLF001
+
+    # Exact id absent (e.g. renamed/removed) -> a code-family model is chosen
+    # over a merely name-similar gpt-* model.
+    substitute = emullm_api._best_match_copilot_backing("gpt-6-codex")  # noqa: SLF001
+    assert substitute in {"kimi-k2.7-code", "mai-code-1.1-flash", "gpt-5.3-codex"}
+    assert "code" in substitute
+
+    # Excluding the exact model (simulating "this one was rejected") still
+    # yields a different, same-family substitute.
+    excluded = emullm_api._best_match_copilot_backing(  # noqa: SLF001
+        "gpt-5.3-codex", exclude={"gpt-5.3-codex"}
+    )
+    assert excluded != "gpt-5.3-codex"
+    assert "code" in excluded
+
+
+def test_best_match_copilot_backing_empty_catalog(monkeypatch) -> None:
+    monkeypatch.setattr(
+        emullm_api._copilot_api,  # noqa: SLF001
+        "copilot_models",
+        lambda **_kwargs: {"models": [], "source": "test"},
+    )
+    assert emullm_api._best_match_copilot_backing("gpt-5.3-codex") is None  # noqa: SLF001
+
+
+
     class SwitchPeer:
         def __init__(self) -> None:
             self.sent: list[dict] = []
@@ -702,7 +802,7 @@ def test_server_switches_idle_worker_model_over_websocket() -> None:
     )
     assert peer.sent[0]["type"] == "set_model"
     assert peer.sent[0]["model"] == "new-model"
-    assert peer.sent[0]["modelmasks"] == ["copilot/new-model"]
+    assert peer.sent[0]["modelmasks"] == ["router/new-model"]
     assert "audio_input" in peer.sent[0]["capabilities"]
 
 
@@ -838,7 +938,7 @@ def test_idle_maintainer_restores_five_ready_workers(monkeypatch) -> None:
         warmup=False,
     ):
         assert (public_model_id, backing_model, require_new, warmup) == (
-            "copilot/auto",
+            "router/auto",
             "auto",
             True,
             True,
@@ -1508,6 +1608,58 @@ def test_on_demand_model_moves_to_next_servant_when_primary_is_not_ready(
     assert emullm_api._worker_retry_delay("worker-copilot-6") == 0  # noqa: SLF001
 
 
+def test_on_demand_model_substitutes_best_match_when_exact_backing_rejected(
+    monkeypatch,
+) -> None:
+    """When the exact requested Copilot backing can't be served (every worker
+    rejects it), the relay switches a worker to the best-match substitute and
+    reprompts it, while keeping the public model id the caller asked for -- we
+    can switch a worker's model at runtime without asking, so an unavailable or
+    rejected model is served by the closest available one."""
+
+    ensured_backings: list[str] = []
+    relay_calls: list[tuple[str, str, str]] = []  # (worker_id, public_model, instruction)
+
+    async def ensure(_public_model_id, backing_model):
+        ensured_backings.append(backing_model)
+        return "worker-codex" if backing_model == "gpt-5.3-codex" else "worker-sub"
+
+    async def relay(worker_id, model, _prompt_text, instruction, **_kwargs):
+        relay_calls.append((worker_id, model, instruction or ""))
+        if worker_id == "worker-codex":
+            raise emullm_api._WorkerRejected(worker_id, "model unavailable")  # noqa: SLF001
+        return {"content": "substitute answered"}
+
+    monkeypatch.setattr(
+        emullm_api, "_copilot_backing_model", lambda _model: "gpt-5.3-codex"
+    )
+    monkeypatch.setattr(
+        emullm_api,
+        "_best_match_copilot_backing",
+        lambda requested, exclude=None: (
+            "kimi-k2.7-code" if "gpt-5.3-codex" in (exclude or set()) else "gpt-5.3-codex"
+        ),
+    )
+    monkeypatch.setattr(emullm_api, "_ensure_on_demand_copilot", ensure)
+    monkeypatch.setattr(emullm_api, "_route_worker_candidates", lambda *_a, **_k: [])
+    monkeypatch.setattr(emullm_api, "_check_and_record_usage", lambda _worker_id: None)
+    monkeypatch.setattr(emullm_api, "_relay_to_worker", relay)
+
+    result = asyncio.run(
+        emullm_api._relay_full("copilot/legacy-codex", "hello")  # noqa: SLF001
+    )
+
+    assert result == {"content": "substitute answered"}
+    # Switched from the exact backing to the best-match substitute at runtime.
+    assert ensured_backings == ["gpt-5.3-codex", "kimi-k2.7-code"]
+    # Reprompted the substitute worker after the switch.
+    assert [call[0] for call in relay_calls] == ["worker-codex", "worker-sub"]
+    # Public model id the caller asked for is preserved on every attempt.
+    assert all(call[1] == "copilot/legacy-codex" for call in relay_calls)
+    # The worker was told to be the substitute backing model.
+    assert "kimi-k2.7-code" in relay_calls[1][2]
+
+
 def test_chat_completion_identifies_selected_worker(client: TestClient) -> None:
     worker = FakeWorker(reply="identified")
     emullm_api._connected_workers["identified-worker"] = worker  # noqa: SLF001
@@ -1800,7 +1952,9 @@ def test_worker_websocket_generates_an_identity_and_applies_model_masks(client: 
     with client.websocket_connect("/emullm/ws?modelmasks=vendor/*,gpt-*") as websocket:
         hello = websocket.receive_json()
         worker_id = hello["worker_id"]
-        assert re.fullmatch(r"worker-unknown-[0-9a-f]{16}", worker_id)
+        # An unidentified socket is named after its client ip/port so operators
+        # can see where it came from (the in-process test client is testclient:50000).
+        assert worker_id == "worker-unknown-testclient-50000"
         assert hello["modelmasks"] == ["vendor/*", "gpt-*"]
         assert emullm_api._worker_model_masks[worker_id] == ("vendor/*", "gpt-*")  # noqa: SLF001
 
@@ -1811,16 +1965,64 @@ def test_worker_websocket_without_model_masks_accepts_all_models(client: TestCli
         assert "all-model-servant" not in emullm_api._worker_model_masks  # noqa: SLF001
 
 
-def test_duplicate_worker_websocket_is_shut_down_without_replacing_first(client: TestClient) -> None:
+def test_duplicate_worker_name_joins_as_fallback_team_member(client: TestClient) -> None:
     with client.websocket_connect("/emullm/ws?worker_id=unique-servant") as first:
         assert first.receive_json() == {"type": "hello", "worker_id": "unique-servant"}
         original = emullm_api._connected_workers["unique-servant"]  # noqa: SLF001
         with client.websocket_connect("/emullm/ws?worker_id=unique-servant") as duplicate:
-            assert duplicate.receive_json() == {"type": "hello", "worker_id": "unique-servant"}
-            shutdown = duplicate.receive_json()
-            assert shutdown["type"] == "shutdown"
-            assert "already connected" in shutdown["reason"]
+            hello = duplicate.receive_json()
+            # A conflicting name is admitted as a fallback under a derived id and
+            # joins the same team instead of being shut down.
+            assert hello["worker_id"] == "unique-servant-2"
+            assert hello["team"] == "unique-servant"
+            assert hello["fallback"] is True
+            # The original primary keeps its identity and leads the team.
+            assert emullm_api._connected_workers["unique-servant"] is original  # noqa: SLF001
+            assert emullm_api._worker_teams["unique-servant"] == [  # noqa: SLF001
+                "unique-servant",
+                "unique-servant-2",
+            ]
         assert emullm_api._connected_workers["unique-servant"] is original  # noqa: SLF001
+
+
+def test_worker_can_rename_itself_at_any_time(client: TestClient) -> None:
+    with client.websocket_connect("/emullm/ws?worker_id=nameless") as websocket:
+        assert websocket.receive_json() == {"type": "hello", "worker_id": "nameless"}
+        websocket.send_json({"type": "identify", "worker_id": "renamed-worker"})
+        frame = websocket.receive_json()
+        assert frame["type"] == "renamed"
+        assert frame["worker_id"] == "renamed-worker"
+        assert frame["team"] == "renamed-worker"
+        assert frame["fallback"] is False
+        assert "renamed-worker" in emullm_api._connected_workers  # noqa: SLF001
+        assert "nameless" not in emullm_api._connected_workers  # noqa: SLF001
+        assert "nameless" not in emullm_api._worker_teams  # noqa: SLF001
+
+
+def test_worker_rename_conflict_becomes_team_fallback(client: TestClient) -> None:
+    with client.websocket_connect("/emullm/ws?worker_id=leader") as leader:
+        assert leader.receive_json() == {"type": "hello", "worker_id": "leader"}
+        with client.websocket_connect("/emullm/ws?worker_id=follower") as follower:
+            assert follower.receive_json() == {"type": "hello", "worker_id": "follower"}
+            follower.send_json({"type": "identify", "worker_id": "leader"})
+            frame = follower.receive_json()
+            assert frame["type"] == "renamed"
+            assert frame["worker_id"] == "leader-2"
+            assert frame["team"] == "leader"
+            assert frame["fallback"] is True
+            assert emullm_api._worker_teams["leader"] == ["leader", "leader-2"]  # noqa: SLF001
+
+
+def test_worker_in_name_route_reaches_the_whole_team(client: TestClient) -> None:
+    with client.websocket_connect("/emullm/ws?worker_id=pool") as primary:
+        assert primary.receive_json()["worker_id"] == "pool"
+        with client.websocket_connect("/emullm/ws?worker_id=pool") as fallback:
+            assert fallback.receive_json()["worker_id"] == "pool-2"
+            # Addressing the team name reaches the primary first, then fallbacks.
+            candidates = emullm_api._route_worker_candidates(  # noqa: SLF001
+                "pool/gpt-5.6-sol", "worker-in-name"
+            )
+            assert candidates == ["pool", "pool-2"]
 
 
 def test_websocket_inventory_tracks_worker_frame_counts(client: TestClient) -> None:
@@ -2528,6 +2730,718 @@ def test_proxy_mode_forwards_to_backend(client: TestClient, monkeypatch: pytest.
     assert response.json()["choices"][0]["message"]["content"] == "backend says hi"
     assert calls["url"] == "http://backend.test/v1/chat/completions"
     assert calls["payload"]["model"] == "gpt-x"  # backend model overrides the client's model id
+
+
+def test_direct_backend_model_routes_to_named_backend(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model named ``backend-<name>/<served>`` hits that backend directly and
+    forwards <served> upstream -- no proxy mode and no configured route needed."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "backends": [
+                    {"name": "snet", "base_url": "http://snet.test/v1"},
+                    {"name": "other", "base_url": "http://other.test/v1"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "snet says hi"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "backend-snet/gpt-4o", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "snet says hi"
+    assert calls["url"] == "http://snet.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "gpt-4o"  # the served suffix is forwarded upstream
+
+
+def test_direct_backend_model_forwards_multi_slash_model_id(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the first slash selects the backend; the rest is the served model id,
+    so ``backend-snet/openai/foo`` and ``backend-snet/other/foo`` disambiguate."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"backends": [{"name": "snet", "base_url": "http://snet.test/v1"}]}),
+        encoding="utf-8",
+    )
+    seen: list[str] = []
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        seen.append(payload["model"])
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+
+    for served in ("openai/foo", "other/foo"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": f"backend-snet/{served}", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 200
+    assert seen == ["openai/foo", "other/foo"]
+
+
+def test_direct_backend_model_404_when_backend_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Addressing an unknown backend name fails clearly rather than silently
+    falling back to a worker/default. Nothing upstream errored -- the address
+    just names no configured backend -- so it is a 404 (not found)."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"backends": [{"name": "snet", "base_url": "http://snet.test/v1"}]}),
+        encoding="utf-8",
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "backend-nope/gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 404
+
+
+def test_direct_backend_model_slashless_dash_form(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slashless ``backend-<name>-<served>`` model splits at the configured
+    backend name, forwarding the remaining dash-joined id upstream."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"backends": [{"name": "snet", "base_url": "http://snet.test/v1"}]}),
+        encoding="utf-8",
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "backend-snet-other-foo", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert calls["url"] == "http://snet.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "other-foo"
+
+
+def test_direct_backend_model_slashless_prefers_longest_name(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When two backend names share a prefix, the slashless form matches the
+    longest configured name, so 'snet-other' wins over 'snet'."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "backends": [
+                    {"name": "snet", "base_url": "http://snet.test/v1"},
+                    {"name": "snet-other", "base_url": "http://snet-other.test/v1"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "backend-snet-other-foo", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert calls["url"] == "http://snet-other.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "foo"
+
+
+def test_direct_backend_model_dashed_name_with_slashed_served(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dash-joined backend name combined with a slash-separated served id is
+    parsed uniformly: the name is stripped, the post-slash tail is forwarded."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps(
+            {
+                "backends": [
+                    {"name": "snet", "base_url": "http://snet.test/v1"},
+                    {"name": "snet-other", "base_url": "http://snet-other.test/v1"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "backend-snet-other/openai/foo", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert calls["url"] == "http://snet-other.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "openai/foo"
+
+
+def test_direct_backend_model_slash_is_opaque_boundary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slashes are opaque: the backend/agent name is scanned only within the
+    segment before the first '/', and the marker must be dash-joined
+    ('backend-<name>'). So 'backend/snet-openai-foo' never resolves to backend
+    'snet' -- the slash prevents merging 'backend' + 'snet' into 'backend-snet'."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"backends": [{"name": "snet", "base_url": "http://snet.test/v1"}]}),
+        encoding="utf-8",
+    )
+    # Dash-joined marker: name is found and stripped from the pre-slash segment.
+    assert (
+        emullm_api._normalize_direct_backend_model("backend-snet-openai-foo")  # noqa: SLF001
+        == "backend-snet/openai-foo"
+    )
+    # A slash right after "backend" is an opaque boundary; we never see
+    # "backend-snet", so the address is left unchanged (-> unresolved downstream).
+    assert (
+        emullm_api._normalize_direct_backend_model("backend/snet-openai-foo")  # noqa: SLF001
+        == "backend/snet-openai-foo"
+    )
+    # A slash after the name keeps the tail verbatim; the name is not scanned
+    # across the slash.
+    assert (
+        emullm_api._normalize_direct_backend_model("backend-snet/openai/foo")  # noqa: SLF001
+        == "backend-snet/openai/foo"
+    )
+
+
+def test_direct_backend_model_token_after_provider_prefix(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 'backend-<name>' token embedded after a provider prefix is stripped,
+    the prefix is preserved across the slash, and the request routes to the
+    named backend: 'openai/backend-snet-asi1' -> backend snet, served
+    'openai/asi1'."""
+    emullm_api._CONFIG_PATH.write_text(  # noqa: SLF001
+        json.dumps({"backends": [{"name": "snet", "base_url": "http://snet.test/v1"}]}),
+        encoding="utf-8",
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "openai/backend-snet-asi1", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert calls["url"] == "http://snet.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "openai/asi1"
+    # The public model id the caller asked for is echoed back unchanged.
+    assert response.json()["model"] == "openai/backend-snet-asi1"
+
+
+# ---------------------------------------------------------------------------
+# Resolution-order DSL: error directives, server tail, default route,
+# named-route steps, route-list references, and single-visit de-duplication.
+# ---------------------------------------------------------------------------
+
+
+def _configure_routes(config: dict) -> None:
+    """Write a config to the isolated config path (so _all_backends() sees the
+    backends/proxy-agents) and apply it (so the routing globals populate)."""
+    emullm_api._CONFIG_PATH.write_text(json.dumps(config), encoding="utf-8")  # noqa: SLF001
+    emullm_api.apply_agent_policies(config)  # noqa: SLF001
+
+
+def _stub_backends_by_status(
+    monkeypatch: pytest.MonkeyPatch,
+    statuses: dict[str, int],
+    replies: dict[str, str] | None = None,
+) -> list[str]:
+    """Make each backend name deterministically raise ``HTTPException(<status>)``
+    or return a canned reply, and record the order backends are actually tried.
+
+    Patching ``_proxy_chat_with_stats`` (rather than ``_http_post_json``) is what
+    lets a test produce a *specific* 4xx/5xx: ``_proxy_chat`` otherwise wraps any
+    upstream failure as a 502, which would defeat error-class directives."""
+    replies = replies or {}
+    attempted: list[str] = []
+
+    async def fake_pcs(backend, model, prompt_text, instruction, service_kind):
+        name = str(backend.get("name") or "")
+        attempted.append(name)
+        if name in statuses:
+            raise HTTPException(status_code=statuses[name], detail=f"{name} {statuses[name]}")
+        return replies.get(name, f"{name} reply")
+
+    monkeypatch.setattr(emullm_api, "_proxy_chat_with_stats", fake_pcs)  # noqa: SLF001
+    return attempted
+
+
+def test_error_directive_match_unit() -> None:
+    m = emullm_api._error_directive_match  # noqa: SLF001
+    assert m("backend-x", 500) is None  # not a directive
+    assert m("worker-copilot-*", 404) is None
+    assert m("error", None) is False  # nothing has failed yet
+    assert m("error", 500) is True  # bare error == any prior failure
+    assert m("error_any", 400) is True
+    assert m("error_4xx", 404) is True
+    assert m("error_4xx", 503) is False  # wrong class
+    assert m("error_5xx", 502) is True
+    assert m("error_502", 502) is True
+    assert m("error_502", 503) is False  # exact code only
+    assert m("ERROR-5XX", 500) is True  # case- and separator-insensitive
+
+
+def test_named_route_scope_unit() -> None:
+    s = emullm_api._named_route_scope  # noqa: SLF001
+    assert s("named_agent_route") == "agent"
+    assert s("named-agent-route") == "agent"
+    assert s("NAMED_BACKEND_ROUTE") == "backend"
+    assert s("named_agent_or_backend_route") is None  # combined token removed
+    assert s("backend-snet") is None
+    assert s("worker-copilot-*") is None
+
+
+def test_router_error_target_unit() -> None:
+    t = emullm_api._router_error_target  # noqa: SLF001
+    assert t("backend-x") is None  # not a synthetic responder
+    assert t("error_404") is None  # a directive, not router/error
+    assert t("router/error_404") == 404
+    assert t("router/error_502") == 502
+    assert t("router/error_4xx") == 400  # class -> representative status
+    assert t("router/error_5xx") == 500
+    assert t("router/error") == 500  # bare -> 500
+    assert t("router/error_any") == 500
+    assert t("ROUTER-ERROR-404") == 404  # case- and separator-insensitive
+    assert t("router_error_503") == 503
+
+
+def test_expand_route_references_inlines_named_lists() -> None:
+    emullm_api._model_routes.clear()  # noqa: SLF001
+    emullm_api._model_routes.update(  # noqa: SLF001
+        {"leaf": ["backend-a", "backend-b"], "root": ["backend-x", "leaf"]}
+    )
+    assert emullm_api._expand_route_references(["root"]) == [  # noqa: SLF001
+        "backend-x",
+        "backend-a",
+        "backend-b",
+    ]
+
+
+def test_expand_route_references_mutual_cycle_is_blank() -> None:
+    emullm_api._model_routes.clear()  # noqa: SLF001
+    emullm_api._model_routes.update({"a": ["b"], "b": ["a"]})  # noqa: SLF001
+    # Two lists pointing only at each other flatten to nothing.
+    assert emullm_api._expand_route_references(["a"]) == []  # noqa: SLF001
+    assert emullm_api._expand_route_references(["b"]) == []  # noqa: SLF001
+
+
+def test_expand_route_references_cycle_keeps_the_one_real_place() -> None:
+    emullm_api._model_routes.clear()  # noqa: SLF001
+    # a -> b, b -> [backend-x, a]: the a<->b cycle resolves to that one real
+    # place from either entry point (the back-reference is dropped).
+    emullm_api._model_routes.update({"a": ["b"], "b": ["backend-x", "a"]})  # noqa: SLF001
+    assert emullm_api._expand_route_references(["a"]) == ["backend-x"]  # noqa: SLF001
+    assert emullm_api._expand_route_references(["b"]) == ["backend-x"]  # noqa: SLF001
+
+
+def test_error_directive_4xx_stops_chain_before_backup(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "backends": [
+                {"name": "primary", "base_url": "http://primary.test/v1"},
+                {"name": "backup", "base_url": "http://backup.test/v1"},
+            ],
+            "model_routes": {"m": ["backend-primary", "error_4xx", "backend-backup"]},
+        }
+    )
+    attempted = _stub_backends_by_status(monkeypatch, {"primary": 404})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 404
+    assert attempted == ["primary"]  # backup never tried on a client error
+
+
+def test_error_directive_4xx_falls_through_on_5xx(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "backends": [
+                {"name": "primary", "base_url": "http://primary.test/v1"},
+                {"name": "backup", "base_url": "http://backup.test/v1"},
+            ],
+            "model_routes": {"m": ["backend-primary", "error_4xx", "backend-backup"]},
+        }
+    )
+    attempted = _stub_backends_by_status(
+        monkeypatch, {"primary": 503}, replies={"backup": "backup ok"}
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "backup ok"
+    assert attempted == ["primary", "backup"]
+
+
+def test_bare_error_directive_propagates_last_status(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "backends": [{"name": "primary", "base_url": "http://primary.test/v1"}],
+            "model_routes": {"m": ["backend-primary", "error"]},
+        }
+    )
+    _stub_backends_by_status(monkeypatch, {"primary": 429})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 429
+
+
+def test_server_routes_tail_serves_after_model_chain(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "backends": [
+                {"name": "primary", "base_url": "http://primary.test/v1"},
+                {"name": "tail", "base_url": "http://tail.test/v1"},
+            ],
+            "model_routes": {"m": ["backend-primary"]},
+            "server_routes": ["backend-tail"],
+        }
+    )
+    attempted = _stub_backends_by_status(
+        monkeypatch, {"primary": 500}, replies={"tail": "tail ok"}
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "tail ok"
+    assert attempted == ["primary", "tail"]
+
+
+def test_error_directive_stops_before_server_tail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "backends": [
+                {"name": "primary", "base_url": "http://primary.test/v1"},
+                {"name": "tail", "base_url": "http://tail.test/v1"},
+            ],
+            "model_routes": {"m": ["backend-primary", "error_5xx"]},
+            "server_routes": ["backend-tail"],
+        }
+    )
+    attempted = _stub_backends_by_status(monkeypatch, {"primary": 502})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+    assert attempted == ["primary"]  # server tail not reached
+
+
+def test_default_model_route_used_for_unspecified_model(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "backends": [
+                {"name": "primary", "base_url": "http://primary.test/v1"},
+                {"name": "tail", "base_url": "http://tail.test/v1"},
+            ],
+            "default_model_route": ["backend-primary"],
+            "server_routes": ["backend-tail"],
+        }
+    )
+    attempted = _stub_backends_by_status(
+        monkeypatch, {"primary": 500}, replies={"tail": "tail ok"}
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "unrouted-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "tail ok"
+    assert attempted == ["primary", "tail"]
+
+
+def test_route_list_reference_is_expanded_inline(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Model "m" references the named list "pool"; the chain flattens to
+    # [backend-a, backend-b] and fails over from a to b.
+    _configure_routes(
+        {
+            "backends": [
+                {"name": "a", "base_url": "http://a.test/v1"},
+                {"name": "b", "base_url": "http://b.test/v1"},
+            ],
+            "model_routes": {"m": ["backend-a", "pool"], "pool": ["backend-b"]},
+        }
+    )
+    attempted = _stub_backends_by_status(monkeypatch, {"a": 500}, replies={"b": "b ok"})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "b ok"
+    assert attempted == ["a", "b"]
+
+
+def test_repeated_place_is_visited_only_once(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # backend-a appears in the model chain and again in the server tail; the
+    # second occurrence is skipped rather than retried.
+    _configure_routes(
+        {
+            "backends": [
+                {"name": "a", "base_url": "http://a.test/v1"},
+                {"name": "b", "base_url": "http://b.test/v1"},
+            ],
+            "model_routes": {"m": ["backend-a"]},
+            "server_routes": ["backend-a", "backend-b"],
+        }
+    )
+    attempted = _stub_backends_by_status(monkeypatch, {"a": 500}, replies={"b": "b ok"})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "b ok"
+    assert attempted == ["a", "b"]  # only one attempt at backend "a"
+
+
+def test_chain_exhaustion_propagates_upstream_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No error directive, but the only place actually returned a 502; when the
+    # order is exhausted that real upstream error is propagated (not masked as
+    # a 404).
+    _configure_routes(
+        {
+            "backends": [{"name": "primary", "base_url": "http://primary.test/v1"}],
+            "model_routes": {"m": ["backend-primary"]},
+        }
+    )
+    _stub_backends_by_status(monkeypatch, {"primary": 502})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+
+
+def test_chain_exhaustion_404_when_nothing_matched(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The route names a backend that is not configured, so nothing is ever tried
+    # and nothing errors upstream -- the model could not be routed anywhere, a 404.
+    _configure_routes(
+        {
+            "backends": [{"name": "real", "base_url": "http://real.test/v1"}],
+            "model_routes": {"m": ["backend-ghost"]},
+        }
+    )
+    monkeypatch.setattr(
+        emullm_api,
+        "_http_post_json",
+        lambda *a, **k: pytest.fail("no backend should be contacted"),  # noqa: SLF001
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 404
+
+
+def test_router_error_target_returns_synthetic_status(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A route pointed at a synthetic error responder reliably answers that
+    # status without any backend being contacted.
+    _configure_routes({"model_routes": {"probe": ["router/error_404"]}})
+    monkeypatch.setattr(
+        emullm_api,
+        "_http_post_json",
+        lambda *a, **k: pytest.fail("no backend should be contacted"),  # noqa: SLF001
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "probe", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 404
+
+
+def test_router_error_target_falls_through_to_real_backend(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without an error directive, the synthetic error is just a failed place; the
+    # chain still fails over to a working backend after it.
+    _configure_routes(
+        {
+            "backends": [{"name": "real", "base_url": "http://real.test/v1"}],
+            "model_routes": {"m": ["router/error_500", "backend-real"]},
+        }
+    )
+    _stub_backends_by_status(monkeypatch, {}, {"real": "real ok"})
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "real ok"
+
+
+def test_router_error_target_stops_at_matching_directive(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The synthetic error records a real upstream status, so a following error
+    # directive can act on it: a 4xx is caught and propagated, never reaching the
+    # backup.
+    _configure_routes(
+        {
+            "backends": [{"name": "backup", "base_url": "http://backup.test/v1"}],
+            "model_routes": {"m": ["router/error_404", "error_4xx", "backend-backup"]},
+        }
+    )
+    monkeypatch.setattr(
+        emullm_api,
+        "_http_post_json",
+        lambda *a, **k: pytest.fail("backup must not be contacted"),  # noqa: SLF001
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 404
+
+
+def test_named_agent_route_resolves_proxy_agent(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "agents": [
+                {"id": "snet", "name": "snet", "launch": "proxy", "base_url": "http://snet.test/v1"}
+            ],
+            "backends": [{"name": "vend", "base_url": "http://vend.test/v1"}],
+            "model_routes": {"openai/backend-snet-asi1": ["named_agent_route"]},
+        }
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)  # noqa: SLF001
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "openai/backend-snet-asi1", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert calls["url"] == "http://snet.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "openai/asi1"
+
+
+def test_named_backend_route_skips_agent_scope(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # snet is a proxy *agent*, so a backend-scoped step does not resolve it; the
+    # step is a no-op and, with nothing else in the chain and nothing upstream
+    # erroring, the request is a 404 (nothing could serve the model).
+    _configure_routes(
+        {
+            "agents": [
+                {"id": "snet", "name": "snet", "launch": "proxy", "base_url": "http://snet.test/v1"}
+            ],
+            "model_routes": {"y/backend-snet-asi1": ["named_backend_route"]},
+        }
+    )
+    monkeypatch.setattr(
+        emullm_api,
+        "_http_post_json",
+        lambda *a, **k: pytest.fail("no backend should be contacted"),  # noqa: SLF001
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "y/backend-snet-asi1", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 404
+
+
+def test_named_backend_route_resolves_plain_backend(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_routes(
+        {
+            "agents": [
+                {"id": "snet", "name": "snet", "launch": "proxy", "base_url": "http://snet.test/v1"}
+            ],
+            "backends": [{"name": "vend", "base_url": "http://vend.test/v1"}],
+            "model_routes": {"x/backend-vend-foo": ["named_backend_route"]},
+        }
+    )
+    calls: dict = {}
+
+    def fake_post(url, headers, payload, timeout=60.0):
+        calls["url"] = url
+        calls["payload"] = payload
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(emullm_api, "_http_post_json", fake_post)  # noqa: SLF001
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "x/backend-vend-foo", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert calls["url"] == "http://vend.test/v1/chat/completions"
+    assert calls["payload"]["model"] == "x/foo"
 
 
 def test_proxy_mode_502_without_backend(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5063,6 +5977,54 @@ def test_standalone_process_control_endpoints(client: TestClient, monkeypatch) -
     assert restart.json()["helper_pid"] == 4242
 
 
+def test_emullm_runtime_layout_and_config_seeding(tmp_path, monkeypatch) -> None:
+    """The emullm_runtime container is created on first run, holds
+    config/logs/metrics/state, seeds server_config.json from the shipped default,
+    and honours env overrides regardless of where the package is installed."""
+    from emullm import paths
+
+    for var in (
+        "EMULLM_RUNTIME_DIR",
+        "EMULLM_CONFIG_DIR",
+        "EMULLM_CONFIG_FILE",
+        "EMULLM_LOG_DIR",
+        "EMULLM_DATA_DIR",
+        "EMULLM_STATE_DIR",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    root = tmp_path / "emullm_runtime"
+    rt = paths.EmullmRuntime(root=root)
+
+    # Everything the server creates lives under the single container.
+    assert rt.config_file == root / "config" / "server_config.json"
+    assert rt.logs_dir == root / "logs"
+
+    # First run creates the layout and seeds config from the packaged default.
+    seeded = rt.ensure_layout()
+    assert seeded == root / "config" / "server_config.json"
+    assert seeded.is_file()
+    assert rt.dist_config_reference.is_file()
+    assert rt.logs_dir.is_dir() and rt.metrics_dir.is_dir() and rt.state_dir.is_dir()
+    doc = json.loads(seeded.read_text(encoding="utf-8"))
+    assert "max_concurrent_calls" in doc  # came from the shipped default
+
+    # Seeding is one-shot: existing settings are preserved on the next run.
+    seeded.write_text('{"mode": "mock"}', encoding="utf-8")
+    rt.ensure_layout()
+    assert json.loads(seeded.read_text(encoding="utf-8")) == {"mode": "mock"}
+
+    # An explicit config-file override always wins, independent of the container.
+    override = tmp_path / "override.json"
+    monkeypatch.setenv("EMULLM_CONFIG_FILE", str(override))
+    assert paths.EmullmRuntime(root=root).config_file == override
+
+    # EMULLM_RUNTIME_DIR relocates the whole container, wherever emullm is installed.
+    monkeypatch.delenv("EMULLM_CONFIG_FILE", raising=False)
+    monkeypatch.setenv("EMULLM_RUNTIME_DIR", str(tmp_path / "custom"))
+    assert paths.EmullmRuntime().root == tmp_path / "custom"
+
+
 def test_process_controls_reject_embedded_mode(client: TestClient, monkeypatch) -> None:
     monkeypatch.setattr(emullm_api._process_control, "schedule_shutdown", lambda: False)  # noqa: SLF001
     monkeypatch.setattr(  # noqa: SLF001
@@ -5688,7 +6650,7 @@ def test_admin_page_renders_html(client: TestClient) -> None:
     assert 'id="model-test-configure"' in html
     assert 'id="model-test-capabilities"' in html
     assert 'id="image-generation-model"' in html
-    assert 'value="copilot/gpt-5.3-codex"' in html
+    assert 'value="router/gpt-5.3-codex"' in html
     assert 'id="image-generation-run"' in html
     assert 'id="image-generation-preview"' in html
     assert 'id="model-test-samples"' in html

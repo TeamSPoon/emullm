@@ -11,6 +11,19 @@ runners:
 
 Select the runner with ``EMULLM_PLUGIN_MODE=standalone|embedded``
 (default: ``standalone``).
+
+This file is also the single canonical way to start the relay by hand::
+
+    python plugin.py                 # 127.0.0.1:8801
+    python plugin.py --port 9001
+    python plugin.py --reload        # development autoreload
+    python -m emullm.standalone      # equivalent module form
+
+``main`` is a thin delegate to :func:`emullm.standalone.main` (the former
+``run.py`` / ``emullm-serve`` runners have been folded into it). On both the
+loader path and the manual path we first create the ``emullm_runtime`` container
+(config, logs, metrics, state) so a fresh or non-editable install works out of
+the box.
 """
 
 from __future__ import annotations
@@ -24,6 +37,17 @@ _HERE = Path(__file__).resolve().parent
 _SOURCE_ROOT = _HERE / "src"
 if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
+
+
+def _bootstrap() -> None:
+    """Create the emullm_runtime container + seed config on first run."""
+    try:
+        from emullm import paths
+
+        paths.ensure_layout()
+    except Exception:
+        # Best-effort: the individual entry points also call ensure_layout.
+        pass
 
 
 def _mode() -> str:
@@ -56,6 +80,7 @@ def resolve_ui_pages(manifest: dict[str, Any], pages: list[dict[str, Any]]) -> l
 def create_router(manifest: dict[str, Any] | None = None):
     """Delegate to the selected runner's ``create_router``."""
 
+    _bootstrap()
     if _mode() == "embedded":
         from emullm.embedded import create_router as _create_router
     else:
@@ -63,4 +88,21 @@ def create_router(manifest: dict[str, Any] | None = None):
     return _create_router(manifest)
 
 
-__all__ = ["create_router", "resolve_ui_pages"]
+def main(argv: list[str] | None = None) -> None:
+    """Start the relay directly (``python plugin.py ...``).
+
+    Thin delegate to the canonical runner :func:`emullm.standalone.main`, also
+    reachable as ``python -m emullm.standalone``.
+    """
+
+    _bootstrap()
+    from emullm.standalone import main as _main
+
+    _main(argv)
+
+
+__all__ = ["create_router", "resolve_ui_pages", "main"]
+
+
+if __name__ == "__main__":
+    main()

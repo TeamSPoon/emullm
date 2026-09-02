@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 runtime/
+# Writable, runtime-mutated data. Everything the server creates lives under the
+# single emullm_runtime container (config, logs, metrics, state, records); the
+# older data/ location is kept ignored for backwards compatibility.
+emullm_runtime/
+data/
 .pytest_cache/
 *.egg-info/
 .venv/

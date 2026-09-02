@@ -1313,7 +1313,10 @@ def test_windows_copilot_shim_resolves_to_sdk_runtime_entrypoint(tmp_path) -> No
 
 
 def test_default_config_includes_random_model_headless_copilot_one() -> None:
-    config = json.loads((Path(__file__).parents[1] / "config.json").read_text(encoding="utf-8"))
+    # The shipped default now travels as package data so it is present in wheels
+    # (see emullm.paths.DIST_CONFIG_PATH); validate that packaged template.
+    dist = Path(__file__).parents[1] / "src" / "emullm" / "server_config_dist.json"
+    config = json.loads(dist.read_text(encoding="utf-8"))
     assert config["max_concurrent_calls"] == 21
     assert 0 <= config["idle_worker_target"] <= config["max_concurrent_calls"]
     assert 0 <= config["idle_grace_seconds"] <= 3_600

@@ -1,8 +1,8 @@
 """Standalone FastAPI app for the emullm relay.
 
 Exposes the emullm router as its own app so it can run on its own port
-(see run.py). Point OpenAI-compatible clients at http://<host>/v1 -- no
-API key/token required -- and connect workers at
+(see :mod:`emullm.standalone`). Point OpenAI-compatible clients at
+http://<host>/v1 -- no API key/token required -- and connect workers at
 ws://<host>/emullm/ws?worker_id=<worker_id>.
 
 In `auto` mode (EMULLM_MODE=auto) the app also starts its own worker
@@ -29,6 +29,10 @@ _BASE_DIR = Path(__file__).resolve().parent.parent
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
     from . import api as _api  # local import to avoid any import-order surprises
+
+    # First-run bootstrap: create the emullm_runtime container (config, logs,
+    # metrics, state) and seed the live config before anything reads it.
+    _api._paths.ensure_layout()
 
     restart_handoff = os.environ.pop("EMULLM_RESTART_HANDOFF", "") == "1"
     config = _sup.load_config(_api._CONFIG_PATH)
@@ -75,7 +79,7 @@ async def _lifespan(app: FastAPI):
     copilot_manager = _copilot.CopilotInstanceManager(
         config_path=_api._CONFIG_PATH,
         runtime_dir=_api._RUNTIME_DIR / "headless_copilots",
-        base_dir=_api._CONFIG_PATH.parent,
+        base_dir=_api._PLUGIN_ROOT,
         default_host_ws_url=os.environ.get("EMULLM_HOST_WS_URL", "ws://127.0.0.1:8801"),
         definitions=definitions or [],
         connected=lambda worker_id: worker_id in _api._connected_workers,

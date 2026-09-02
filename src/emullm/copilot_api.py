@@ -173,7 +173,7 @@ def default_anti_idle_prompts() -> list[AntiIdlePromptConfig]:
 class AntiIdleConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    enabled: bool = False
     interval_seconds: float = Field(default=60.0, ge=0.0, le=3_600.0)
     timeout_seconds: float = Field(default=10.0, ge=0.1, le=10.0)
     slow_budget_seconds: float = Field(default=8.0, ge=0.1, le=10.0)

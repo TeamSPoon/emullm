@@ -140,6 +140,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import difflib
 from contextvars import ContextVar
 from fnmatch import fnmatchcase
 import hashlib
@@ -169,6 +170,7 @@ from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.datastructures import UploadFile
 
 from . import copilot_api as _copilot_api
+from . import paths as _paths
 from . import process_control as _process_control
 from .test_media import test_media_samples
 from . import supervisor as _sup
@@ -785,6 +787,18 @@ def _check_and_record_usage(worker_id: str) -> None:
 # connected" like a single-worker design would.
 _connected_workers: dict[str, WebSocket] = {}
 _native_worker_ids: set[str] = set()
+# Team/name registry. A worker declares a *name* (its team) either at connect
+# time (the ``worker_id`` query parameter) or at any point afterwards via an
+# ``identify`` frame. The first worker to claim a name becomes the primary and
+# takes it verbatim as its connection id; a later worker requesting the same
+# name is not rejected -- it is admitted as a *fallback* under a derived unique
+# id (``name-2``, ``name-3`` ...) and joins the same team. Addressing the name
+# then reaches the whole team, primary first, so a conflicting name forms a
+# fallback pool instead of a collision. ``_worker_teams`` maps a team name ->
+# ordered member connection ids (primary first); ``_worker_team_of`` is the
+# reverse map from a connection id to its team name.
+_worker_teams: dict[str, list[str]] = {}
+_worker_team_of: dict[str, str] = {}
 _worker_lock = asyncio.Lock()
 _pending: dict[str, "asyncio.Future[Any]"] = {}
 _pending_models: dict[str, str] = {}
@@ -1984,12 +1998,127 @@ def _set_worker_model_masks(worker_id: str, masks: tuple[str, ...] | None) -> No
         _worker_model_masks[worker_id] = masks
 
 
-def _new_automatic_worker_id() -> str:
-    """Create a collision-resistant mailbox-safe identity for an anonymous socket."""
+def _sanitize_worker_id_part(value: str) -> str:
+    """Reduce an arbitrary string (e.g. a client host) to a mailbox/filesystem
+    safe token: lowercase alphanumerics, other runs collapsed to single dashes."""
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def _new_automatic_worker_id(websocket: "WebSocket | None" = None) -> str:
+    """Create a collision-resistant mailbox-safe identity for an anonymous socket.
+
+    A socket that connects without a ``worker_id`` (it never identifies itself)
+    is named ``worker-unknown-<ip>-<port>`` after its client address, so an
+    operator can see where the unidentified connection came from. When the client
+    address is unavailable -- or that identity is somehow already taken (e.g. a
+    quick reconnect from the same port) -- a random suffix keeps the id unique.
+    """
+    client = getattr(websocket, "client", None) if websocket is not None else None
+    host = _sanitize_worker_id_part(str(getattr(client, "host", "") or "")) if client else ""
+    port = getattr(client, "port", None) if client else None
+    if host:
+        base = f"worker-unknown-{host}-{port}" if port else f"worker-unknown-{host}"
+        if base not in _connected_workers:
+            return base
+    else:
+        base = "worker-unknown"
     while True:
-        worker_id = f"worker-unknown-{uuid.uuid4().hex[:16]}"
+        worker_id = f"{base}-{uuid.uuid4().hex[:12]}"
         if worker_id not in _connected_workers:
             return worker_id
+
+
+def _assign_worker_identity(requested: str) -> tuple[str, bool]:
+    """Resolve a requested worker *name* to an actual, unique connection id.
+
+    Caller must hold ``_worker_lock``. The first worker to claim a name takes it
+    verbatim and is the team primary (``is_fallback`` is ``False``). A later
+    worker requesting a name that is already connected is admitted under a
+    derived unique id (``name-2``, ``name-3`` ...) and reported as a fallback,
+    so a conflicting name forms a fallback pool instead of being refused.
+    """
+    if requested not in _connected_workers:
+        return requested, False
+    base = requested
+    # Reserve room for the ``-N`` suffix within the mailbox id length budget.
+    max_base = _MAILBOX_MAX_ID_LENGTH - 6
+    if len(base) > max_base:
+        base = base[:max_base].rstrip("._-") or requested[:max_base]
+    index = 2
+    while True:
+        candidate = f"{base}-{index}"
+        if candidate not in _connected_workers:
+            return candidate, True
+        index += 1
+
+
+def _join_worker_team(team: str, worker_id: str) -> None:
+    """Record ``worker_id`` as a member of ``team`` (caller holds _worker_lock)."""
+    members = _worker_teams.setdefault(team, [])
+    if worker_id not in members:
+        if worker_id == team:
+            members.insert(0, worker_id)  # the primary always leads its team
+        else:
+            members.append(worker_id)
+    _worker_team_of[worker_id] = team
+
+
+def _leave_worker_team(worker_id: str) -> None:
+    """Drop ``worker_id`` from its team (caller holds _worker_lock)."""
+    team = _worker_team_of.pop(worker_id, None)
+    if team is None:
+        return
+    members = _worker_teams.get(team)
+    if members and worker_id in members:
+        members.remove(worker_id)
+    if not members:
+        _worker_teams.pop(team, None)
+
+
+def _team_members_for(name: str) -> list[str]:
+    """Ordered, still-connected members of the team ``name`` (primary first)."""
+    members = _worker_teams.get(name)
+    if members:
+        connected = [member for member in members if member in _connected_workers]
+        if connected:
+            return connected
+    return [name] if name in _connected_workers else []
+
+
+def _rename_worker_state(old_id: str, new_id: str) -> None:
+    """Migrate every per-connection worker mapping from old_id to new_id.
+
+    Caller must hold ``_worker_lock``. Team membership is handled separately by
+    the caller so the worker can move to the team of its newly declared name.
+    """
+    if old_id == new_id or old_id not in _connected_workers:
+        return
+    _connected_workers[new_id] = _connected_workers.pop(old_id)
+    if old_id in _native_worker_ids:
+        _native_worker_ids.discard(old_id)
+        _native_worker_ids.add(new_id)
+    for mapping in (
+        _worker_connection_ids,
+        _worker_model_masks,
+        _worker_models,
+        _worker_kinds,
+        _worker_runtime_models,
+        _worker_descriptions,
+        _worker_capabilities,
+        _worker_roles,
+        _worker_model_switch_stats,
+        _worker_not_ready_until,
+        _worker_last_busy_at,
+        _worker_usage,
+        _worker_service_stats,
+        _worker_service_behavior,
+    ):
+        if old_id in mapping:
+            mapping[new_id] = mapping.pop(old_id)
+    with _worker_load_lock:
+        for mapping in (_worker_inflight, _worker_reservations):
+            if old_id in mapping:
+                mapping[new_id] = mapping.pop(old_id)
 
 
 def _worker_load(worker_id: str) -> int:
@@ -2510,6 +2639,8 @@ _observers: dict[str, Any] = {}                           # worker_id -> True | 
 _agent_descriptions: dict[str, str] = {}                  # worker_id -> user-facing description
 _service_descriptions: dict[str, str] = {}                # service -> user-facing description
 _model_routes: dict[str, str | list[str]] = {}            # full model id -> worker or ordered target chain
+_server_routes: list[str] = []                            # server-wide resolution-order tail (targets + directives)
+_default_model_route: str | list[str] | None = None       # resolution order for models with no route of their own
 _server_description: str | None = None                    # user-facing server description
 _advertised_base: list[str] = []                          # services.models (manual base)
 _advertised_default: str | None = None                    # services.model (default advertised)
@@ -2570,6 +2701,17 @@ def _normalise_model_route(value: Any) -> str | list[str] | None:
     return None
 
 
+def _as_route_list(route: str | list[str] | None) -> list[str]:
+    """Coerce a normalized route (an exact target, an ordered chain, or nothing)
+    to a plain target list, so a single-target and a multi-target route can be
+    concatenated with the server-wide tail uniformly."""
+    if route is None:
+        return []
+    if isinstance(route, str):
+        return [route]
+    return list(route)
+
+
 def _model_id(entry: Any) -> str | None:
     """A model-list entry may be a bare id string or a node object
     (``{"id": ..., "validation_startedAt": ..., ...}``); return its id
@@ -2603,12 +2745,15 @@ def clear_agent_policies() -> None:
     global _validation_interval_override, _max_concurrent_calls
     global _idle_worker_target, _idle_grace_seconds
     global _backend_fallback_delay_seconds
+    global _default_model_route
     _worker_service_behavior.clear()
     _service_fallback.clear()
     _observers.clear()
     _agent_descriptions.clear()
     _service_descriptions.clear()
     _model_routes.clear()
+    _server_routes.clear()
+    _default_model_route = None
     _server_description = None
     _advertised_base.clear()
     _advertised_default = None
@@ -2632,6 +2777,7 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
     global _validation_interval_override, _max_concurrent_calls
     global _idle_worker_target, _idle_grace_seconds
     global _backend_fallback_delay_seconds
+    global _default_model_route
     clear_agent_policies()
     if not isinstance(config, dict):
         return
@@ -2757,6 +2903,19 @@ def apply_agent_policies(config: dict[str, Any]) -> None:
             normalized = _normalise_model_route(route)
             if isinstance(mid, str) and mid and normalized:
                 _model_routes[mid] = normalized
+    # Server-wide resolution-order tail: tried after a model's own route (or the
+    # default route) is exhausted, unless an error directive terminated the chain
+    # first. May contain worker/backend targets and error directives.
+    server_chain = _normalise_model_route(config.get("server_routes"))
+    _server_routes[:] = _as_route_list(server_chain)
+    # Default model route: the resolution order used for a model that does not
+    # specify its own route. Accepts a nested ``default.model_route`` or a flat
+    # top-level ``default_model_route``.
+    default_route: Any = config.get("default_model_route")
+    default_section = config.get("default")
+    if default_route is None and isinstance(default_section, dict):
+        default_route = default_section.get("model_route")
+    _default_model_route = _normalise_model_route(default_route)
 
 
 _INTERVAL_UNITS = {
@@ -3665,9 +3824,26 @@ def _dataurl_to_b64(url: str | None) -> str | None:
     return None
 
 
+# The public prefix advertised for Copilot-backed models. We expose these under
+# a neutral ``router/`` namespace rather than ``copilot/`` so the catalog does
+# not broadcast how heavily the Copilot pool is used. The legacy ``copilot/``
+# prefix is still accepted on input for backward compatibility with older
+# clients and on-disk configs.
+_PUBLIC_MODEL_PREFIX = "router/"
+_PUBLIC_MODEL_PREFIX_ALIASES = ("router/", "copilot/")
+
+
+def _strip_public_model_prefix(model_id: str) -> str | None:
+    """Return the backing model id when ``model_id`` carries a recognized public
+    prefix (``router/`` or the legacy ``copilot/``), else ``None``."""
+    for prefix in _PUBLIC_MODEL_PREFIX_ALIASES:
+        if model_id.startswith(prefix):
+            return model_id[len(prefix) :]
+    return None
+
 
 def _copilot_public_model_id(backing_model: str) -> str:
-    return f"copilot/{backing_model}"
+    return f"{_PUBLIC_MODEL_PREFIX}{backing_model}"
 
 
 def _resolved_emullm_default_model() -> str:
@@ -3777,11 +3953,90 @@ def _copilot_model_metadata(backing_model: str) -> dict[str, Any] | None:
 
 
 def _copilot_backing_model(public_model_id: str) -> str | None:
-    prefix = "copilot/"
-    if not public_model_id.startswith(prefix):
+    backing_model = _strip_public_model_prefix(public_model_id)
+    if backing_model is None:
         return None
-    backing_model = public_model_id[len(prefix) :]
     return backing_model if _copilot_model_metadata(backing_model) is not None else None
+
+
+_COPILOT_FAMILY_WEIGHTS: dict[str, int] = {
+    "codex": 6,
+    "code": 5,
+    "sonnet": 4,
+    "opus": 4,
+    "haiku": 4,
+    "fable": 4,
+    "claude": 3,
+    "gemini": 3,
+    "grok": 3,
+    "kimi": 3,
+    "mai": 3,
+    "o1": 3,
+    "o3": 3,
+    "o4": 3,
+    "flash": 2,
+    "pro": 2,
+    "mini": 2,
+    "gpt": 1,
+}
+
+
+def _copilot_family_tokens(name: str) -> set[str]:
+    lowered = name.lower()
+    return {token for token in _COPILOT_FAMILY_WEIGHTS if token in lowered}
+
+
+def _best_match_copilot_backing(
+    requested_backing: str,
+    *,
+    exclude: set[str] | None = None,
+) -> str | None:
+    """Return the available Copilot backing model that best matches the
+    requested one, so a socket worker can be handed a model it will actually
+    accept when the exact request is unavailable or rejected.
+
+    The public model id the caller asked for is preserved by the caller; this
+    only decides what backing model gets sent to the worker ("lie to the
+    socket worker"). Selection prefers models that share a name family
+    (e.g. a ``*codex*`` request maps to another codex/code model), then falls
+    back to raw name similarity, then to a model a worker is already running.
+    Returns ``None`` only when no Copilot models are available at all.
+    """
+    excluded = set(exclude or ())
+    try:
+        catalog = _copilot_api.copilot_models().get("models", [])
+    except Exception:  # pragma: no cover - defensive; catalog lookup is best effort
+        return None
+    ids = [
+        str(entry.get("id"))
+        for entry in catalog
+        if entry.get("id") and str(entry.get("id")) not in excluded
+    ]
+    if not ids:
+        return None
+    if requested_backing in ids:
+        return requested_backing
+    requested_lower = requested_backing.lower()
+    requested_families = _copilot_family_tokens(requested_backing)
+    running_models = {
+        runtime_model
+        for worker_id, runtime_model in _worker_runtime_models.items()
+        if worker_id in _connected_workers
+    }
+
+    def _score(candidate: str) -> tuple[int, float, int]:
+        candidate_families = _copilot_family_tokens(candidate)
+        family_score = sum(
+            _COPILOT_FAMILY_WEIGHTS[token]
+            for token in requested_families & candidate_families
+        )
+        similarity = difflib.SequenceMatcher(
+            None, requested_lower, candidate.lower()
+        ).ratio()
+        already_running = 1 if candidate in running_models else 0
+        return (family_score, similarity, already_running)
+
+    return max(ids, key=_score)
 
 
 def _copilot_input_modalities(
@@ -4246,9 +4501,115 @@ def _backend_model_for(model: str, backend: dict[str, Any]) -> str:
     """The model id to send upstream: forward a real backend model id as-is;
     for a local persona/default, use the backend's configured model."""
     worker_id, suffix = _split_model_id(model)
+    # A model addressed directly at a named backend ("backend-<name>/<served>")
+    # forwards <served> upstream; a bare "backend-<name>" (or ".../same") uses
+    # the backend's configured model.
+    if worker_id.startswith("backend-"):
+        if suffix and suffix != "same":
+            return suffix
+        return str(backend.get("model") or model)
     if model == _DEFAULT_MODEL_ID or _models_for(worker_id).get(suffix) is not None:
         return str(backend.get("model") or model)
     return model
+
+
+def _proxy_agent_names() -> set[str]:
+    """Names of agents that launch as proxies (``launch: proxy``). These become
+    ``backends`` entries via :func:`expand_agents`, so a name in this set is an
+    *agent*; any other configured backend name is a plain *backend*. Used to
+    scope the named-route steps (``named_agent_route`` vs ``named_backend_route``)
+    to the right subset while both still route through the merged backend list."""
+    config = _read_config()
+    agents = config.get("agents")
+    names: set[str] = set()
+    if isinstance(agents, list):
+        for agent in agents:
+            if not isinstance(agent, dict) or agent.get("enabled") is False:
+                continue
+            if str(agent.get("launch") or "").strip().lower() != "proxy":
+                continue
+            worker_id = str(agent.get("id") or agent.get("worker_id") or "").strip()
+            name = str(agent.get("name") or worker_id or "").strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def _direct_route_names(scope: str) -> list[str]:
+    """Configured backend/agent names the direct-address scan may match, filtered
+    by ``scope``: ``"agent"`` (proxy agents only), ``"backend"`` (plain backends
+    only), or ``"any"`` (both). Names come from the merged backend list so the
+    resolved ``backend-<name>`` target routes identically regardless of scope."""
+    all_names = [str(backend.get("name") or "") for backend in _all_backends()]
+    all_names = [name for name in all_names if name]
+    if scope == "any":
+        return all_names
+    agent_names = _proxy_agent_names()
+    if scope == "agent":
+        return [name for name in all_names if name in agent_names]
+    return [name for name in all_names if name not in agent_names]
+
+
+def _normalize_direct_backend_model(model: str, scope: str = "any") -> str:
+    """Resolve a direct backend address by scanning for a configured name.
+
+    Scans ``model`` for a ``backend-<name>`` token, where ``<name>`` is a
+    configured backend or agent name (agents that launch as proxies appear in
+    ``_all_backends``). ``scope`` narrows which names are eligible -- ``"agent"``
+    for proxy agents, ``"backend"`` for plain backends, or ``"any"`` for both.
+    The token is removed from the string and the request is routed to that
+    backend; whatever remains becomes the served model id. The LONGEST matching
+    name wins, so with backends ``snet`` and ``snet-other`` the request
+    ``backend-snet-other-foo`` resolves to ``snet-other`` serving ``foo``.
+
+    Slashes are opaque boundaries the scan never sees through: the token must be
+    contiguous, so ``backend-snet`` can only be recognized when ``backend`` and
+    the name are dash-joined -- ``backend/snet-openai-foo`` never resolves to
+    backend ``snet``. The token may appear after a ``/`` though, and the text on
+    either side of it is stitched back together, so a provider prefix survives:
+    ``openai/backend-snet-asi1`` -> route to ``snet`` forwarding ``openai/asi1``.
+    A slash immediately after the name stays the name/served boundary, so
+    ``backend-snet/openai/foo`` forwards ``openai/foo`` verbatim.
+
+    Returns the input unchanged when no ``backend-<name>`` token matches a
+    configured name in ``scope``, so an unknown ``backend-`` address still
+    surfaces as a clear ``503`` downstream rather than being mis-split.
+    """
+    names = _direct_route_names(scope)
+    marker = "backend-"
+    best: tuple[int, int, str] | None = None  # (start, name_end, name)
+    search_from = 0
+    while True:
+        idx = model.find(marker, search_from)
+        if idx == -1:
+            break
+        search_from = idx + 1
+        # Left boundary: the token must start the string or follow a slash, so a
+        # dash-prefixed lookalike ("mybackend-snet") is never matched.
+        if idx != 0 and model[idx - 1] != "/":
+            continue
+        after = model[idx + len(marker) :]
+        candidate: str | None = None
+        for name in names:
+            # Right boundary: end of string, a dash, or a slash.
+            if after == name or after.startswith(f"{name}-") or after.startswith(f"{name}/"):
+                if candidate is None or len(name) > len(candidate):
+                    candidate = name
+        if candidate is None:
+            continue
+        name_end = idx + len(marker) + len(candidate)
+        if best is None or len(candidate) > len(best[2]):
+            best = (idx, name_end, candidate)
+    if best is None:
+        return model
+    start, name_end, name = best
+    prefix = model[:start]
+    suffix = model[name_end:]
+    # Drop the single separator left dangling where the token was removed.
+    if suffix[:1] in ("-", "/"):
+        suffix = suffix[1:]
+    served = prefix + suffix if suffix else prefix.rstrip("/")
+    return f"backend-{name}/{served}" if served else f"backend-{name}"
 
 
 def _route_backend(target: str) -> dict[str, Any]:
@@ -4344,10 +4705,11 @@ def _route_worker_candidates(
 ) -> list[str]:
     if target == "worker-in-name":
         worker_id, _ = _split_model_id(model)
-        if worker_id not in _connected_workers:
+        candidates = _team_members_for(worker_id)
+        if not candidates:
             return []
         return _capability_ordered_workers(
-            [worker_id],
+            candidates,
             required_capabilities,
         )
     requested_backing = _copilot_backing_model(model)
@@ -4384,29 +4746,313 @@ async def _wait_before_backend_fallback(model: str, target: str) -> None:
         _clear_waiting_for_worker(wait_id)
 
 
+_ERROR_DIRECTIVE_RE = re.compile(r"^error(?:[-_](any|\d{3}|[1-5]xx))?$", re.IGNORECASE)
+
+
+def _error_directive_match(entry: str, status: int | None) -> bool | None:
+    """Classify a resolution-order entry as an error directive.
+
+    An entry like ``error``/``error_any``, ``error_4xx``/``error_5xx`` (an HTTP
+    status class), or ``error_<NNN>`` (an exact status) is a *stop directive*
+    rather than a routable target. Because a successful target returns
+    immediately, a directive is only ever reached after the preceding targets
+    have failed. When reached, it consults the status of the most recent failed
+    attempt (``status``):
+
+    - returns ``True`` (stop the chain, propagate that error) when the directive
+      matches -- ``any`` matches any prior failure, ``Nxx`` matches that class,
+      and an exact code matches only itself;
+    - returns ``False`` (skip the directive, keep trying later targets) when it
+      does not match or nothing has failed yet;
+    - returns ``None`` when ``entry`` is not an error directive at all.
+    """
+    matched = _ERROR_DIRECTIVE_RE.match(entry.strip())
+    if not matched:
+        return None
+    spec = (matched.group(1) or "any").lower()
+    if status is None:
+        return False
+    if spec == "any":
+        return True
+    if spec.endswith("xx"):
+        return status // 100 == int(spec[0])
+    return status == int(spec)
+
+
+_ROUTER_ERROR_RE = re.compile(
+    r"^router[\/_-]error(?:[\/_-](any|\d{3}|[1-5]xx))?$", re.IGNORECASE
+)
+
+
+def _router_error_target(entry: str) -> int | None:
+    """Classify a resolution-order entry as a *synthetic error responder* and
+    return the HTTP status it produces, or ``None`` when ``entry`` is not one.
+
+    Unlike an error *directive* (:func:`_error_directive_match`), which merely
+    inspects the most recent failure and decides whether to stop, a
+    ``router/error_<NNN>`` target is a *place* that, when reached, always
+    "returns" that error. It exists so an operator can point a route at a known
+    failure for testing -- e.g. ``{"probe-404": ["router/error_404"]}`` makes
+    that model id reliably answer ``404`` -- without standing up a broken
+    backend. Recognized forms (``/``, ``-``, or ``_`` separators are
+    interchangeable): ``router/error_<NNN>`` for an exact status,
+    ``router/error_4xx``/``router/error_5xx`` for a class (mapped to ``400``/
+    ``500``), and a bare ``router/error`` or ``router/error_any`` (``500``).
+
+    Because it behaves like a backend that actually errored, it records a real
+    upstream error status: a following error directive can act on it and, if the
+    order is otherwise exhausted, that status is propagated at the terminal.
+    """
+    matched = _ROUTER_ERROR_RE.match(entry.strip())
+    if not matched:
+        return None
+    spec = (matched.group(1) or "any").lower()
+    if spec == "any":
+        return 500
+    if spec.endswith("xx"):
+        return int(spec[0]) * 100
+    return int(spec)
+
+
+_NAMED_ROUTE_SCOPES = {
+    "named_agent_route": "agent",
+    "named_backend_route": "backend",
+}
+
+
+def _named_route_scope(entry: str) -> str | None:
+    """Classify a resolution-order entry as a named-route step and return its
+    scan scope: ``"agent"`` (``named_agent_route``) or ``"backend"``
+    (``named_backend_route``). Returns ``None`` when ``entry`` is not a
+    named-route step.
+
+    A named-route step scans the *request's* model id for a configured
+    agent/backend name (see :func:`_normalize_direct_backend_model`) and, when
+    the id names one in scope, routes straight to it -- forwarding the served
+    suffix upstream. It is a no-op (skipped) when the id names nothing in scope.
+    Placing this token in a resolution order lets an operator choose exactly
+    where the name-scan happens among ordinary targets and error directives,
+    e.g. ``["named_agent_route", "worker-copilot-*"]`` tries direct agent
+    addressing first and otherwise serves from the Copilot pool. Hyphens and
+    underscores are interchangeable separators."""
+    return _NAMED_ROUTE_SCOPES.get(entry.strip().lower().replace("-", "_"))
+
+
+# Reserved names a resolution order may use to reference the server-wide lists.
+_SERVER_ROUTE_ALIASES = ("server_routes", "server_route")
+_DEFAULT_ROUTE_ALIASES = ("default_model_route", "default_route", "default")
+
+
+def _named_route_lists() -> dict[str, list[str]]:
+    """Named resolution orders that a chain entry may reference *by name*.
+
+    A resolution order may contain the name of another configured route list;
+    it is expanded inline at that position (see
+    :func:`_expand_route_references`). The recognized names are the per-model
+    route keys (``_model_routes``) plus the reserved server-wide names
+    ``server_routes``/``server_route`` and
+    ``default_model_route``/``default_route``/``default``. Names are matched
+    case-insensitively.
+    """
+    lists: dict[str, list[str]] = {}
+    for name, route in _model_routes.items():
+        key = str(name).strip().lower()
+        if key:
+            lists[key] = _as_route_list(route)
+    if _server_routes:
+        for alias in _SERVER_ROUTE_ALIASES:
+            lists[alias] = list(_server_routes)
+    if _default_model_route is not None:
+        default_list = _as_route_list(_default_model_route)
+        for alias in _DEFAULT_ROUTE_ALIASES:
+            lists[alias] = default_list
+    return lists
+
+
+def _expand_route_references(
+    targets: list[str],
+    *,
+    _seen: frozenset[str] = frozenset(),
+    _lists: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """Flatten a resolution order, expanding any entry that names another
+    configured route list (:func:`_named_route_lists`) into that list's targets,
+    recursively. A reference currently being expanded is *dropped* when it recurs,
+    so a cycle contributes nothing rather than looping forever or leaving the
+    list's name behind as a bogus target. Two lists that reference only each
+    other therefore flatten to an empty order; if one of them also names a real
+    place, both flatten to that one place. Entries that are not route-list names
+    -- plain targets, error directives, named-route steps -- pass through
+    unchanged. This only *expands* references; per-place de-duplication ("once a
+    place is looked at, never look there again") happens while the flattened
+    order is walked in :func:`_relay_model_route_chain`."""
+    lists = _named_route_lists() if _lists is None else _lists
+    expanded: list[str] = []
+    for target in targets:
+        key = target.strip().lower()
+        if key in lists:
+            if key in _seen:
+                # Cycle: this list is already being expanded above us. Drop the
+                # back-reference so mutual references resolve to their union of
+                # real places (or to nothing when there are none).
+                continue
+            expanded.extend(
+                _expand_route_references(
+                    lists[key],
+                    _seen=_seen | {key},
+                    _lists=lists,
+                )
+            )
+        else:
+            expanded.append(target)
+    return expanded
+
+
 async def _relay_model_route_chain(
     model: str,
     targets: list[str],
     prompt_text: str,
     extra: dict[str, Any] | None,
+    *,
+    wait_before_backend: bool = True,
 ) -> Any:
-    """Try worker-ID globs and OpenAI-compatible backend URLs in order."""
+    """Try worker-ID globs and OpenAI-compatible backend URLs in order.
+
+    ``wait_before_backend`` gates the "wait for a worker before falling back to
+    a backend" delay. It stays on for configured multi-target routes, but a
+    request that addresses a backend *directly* ("backend-<name>/<served>") has
+    no worker to wait for, so the caller passes ``False`` to hit it at once.
+
+    A resolution order may also contain **error directives** (``error_4xx``,
+    ``error_5xx``, ``error_<NNN>``, or a bare ``error``) that stop the chain and
+    propagate the most recent upstream error instead of continuing to fall back.
+    See :func:`_error_directive_match` for the matching rules. This lets an
+    operator gate fallback on the error class, e.g.
+    ``["backend-primary", "error_4xx", "backend-backup"]`` returns a client
+    error from the primary as-is but still fails over to the backup on a 5xx.
+
+    A chain may also contain a named-route step -- ``named_agent_route`` or
+    ``named_backend_route`` (:func:`_named_route_scope`) -- that resolves the
+    request's model id against the configured agent/backend names in that scope
+    and routes to a match; it is skipped when the id names nothing in scope.
+
+    A chain may also contain a **synthetic error responder** --
+    ``router/error_<NNN>``, ``router/error_4xx``/``router/error_5xx``, or a bare
+    ``router/error`` (:func:`_router_error_target`) -- a *place* that always
+    "returns" that status. Unlike an error directive it does not inspect the
+    prior failure; it produces its own error, useful for exercising fallback and
+    client error handling without a broken backend.
+
+    An entry may reference another configured route list *by name*
+    (:func:`_named_route_lists`); it is expanded inline before the order is
+    walked (:func:`_expand_route_references`). Finally, every *place to look* is
+    consulted at most once: once a target has been attempted, a later repeat of
+    it -- whether written twice, pulled in by a reference, or duplicated by the
+    server-wide tail -- is skipped rather than retried. Error directives are
+    exempt, since they are control-flow markers rather than places, and may recur.
+
+    When the whole order is exhausted without serving the request, the terminal
+    outcome depends on whether anything upstream actually errored: if a backend
+    or worker returned an error status, that status is propagated; otherwise --
+    the model simply could not be routed to any configured/available place -- the
+    request fails with ``404`` (not found) rather than ``503``.
+    """
     instruction = f"You are serving model id '{model}'. Emulate that model faithfully."
     required_capabilities = _required_input_capabilities(extra)
     service_kind = str((extra or {}).get("kind") or "chat")
+    targets = _expand_route_references(targets)
     failures: list[str] = []
+    last_status: int | None = None
+    # An error status *actually returned* by an upstream attempt (a backend or
+    # worker that responded with an error), as opposed to a mere absence (nothing
+    # configured/connected to try). It decides the terminal outcome below: if the
+    # whole order is exhausted and something upstream really errored, that status
+    # is propagated; if nothing errored -- the model simply could not be routed
+    # anywhere -- the request is a 404.
+    error_status: int | None = None
     backend_delay_complete = False
+    visited: set[str] = set()
     for target in targets:
+        directive = _error_directive_match(target, last_status)
+        if directive is not None:
+            # An error directive, not a routable target.
+            if directive:
+                detail = "; ".join(failures) if failures else "no prior failure"
+                raise HTTPException(
+                    status_code=last_status or 503,
+                    detail=(
+                        f"route chain stopped by '{target}' for model "
+                        f"'{model}' ({detail})"
+                    ),
+                )
+            continue
+        # "Once a place to look is looked at, it is never looked at again":
+        # skip a target already attempted earlier in this (flattened) order.
+        place = target.strip().lower()
+        if place in visited:
+            continue
+        visited.add(place)
+        synthetic_error = _router_error_target(target)
+        if synthetic_error is not None:
+            # A synthetic error responder: a place that always "returns" this
+            # status (for testing fallback/error handling). Record it like a real
+            # upstream error so error directives can act on it and the terminal
+            # outcome propagates it.
+            failures.append(f"{target}: synthetic error {synthetic_error}")
+            last_status = synthetic_error
+            error_status = synthetic_error
+            continue
+        scope = _named_route_scope(target)
+        if scope is not None:
+            # Scan the request's model id for a configured agent/backend name in
+            # this scope; route to it (forwarding the served suffix) when it
+            # resolves, else treat the step as a no-op and keep going.
+            normalized = _normalize_direct_backend_model(model, scope)
+            if not normalized.startswith("backend-"):
+                continue
+            backend_target, _ = _split_model_id(normalized)
+            backend_candidates = _route_backend_candidates(backend_target)
+            if not backend_candidates:
+                failures.append(f"{target}: '{backend_target}' not configured")
+                last_status = 503
+                continue
+            served_reply = None
+            for backend in backend_candidates:
+                backend_name = str(backend.get("name") or backend_target)
+                try:
+                    served_reply = await _proxy_chat_with_stats(
+                        backend,
+                        normalized,
+                        prompt_text,
+                        instruction,
+                        service_kind,
+                    )
+                except HTTPException as error:
+                    failures.append(f"backend-{backend_name}: {error.detail}")
+                    last_status = error.status_code
+                    error_status = error.status_code
+                    served_reply = None
+                    continue
+                await _mirror_to_observers(
+                    f"backend-{backend_name}",
+                    model,
+                    prompt_text,
+                    served_reply,
+                )
+                return served_reply
+            continue
         is_backend = target.startswith(
             ("http://", "https://", "backend-")
         )
         if is_backend and not backend_delay_complete:
-            await _wait_before_backend_fallback(model, target)
+            if wait_before_backend:
+                await _wait_before_backend_fallback(model, target)
             backend_delay_complete = True
         if target.startswith("backend-"):
             backend_candidates = _route_backend_candidates(target)
             if not backend_candidates:
                 failures.append(f"{target}: no configured backend matched")
+                last_status = 503
                 continue
             for backend in backend_candidates:
                 backend_name = str(backend.get("name") or target)
@@ -4420,6 +5066,8 @@ async def _relay_model_route_chain(
                     )
                 except HTTPException as error:
                     failures.append(f"backend-{backend_name}: {error.detail}")
+                    last_status = error.status_code
+                    error_status = error.status_code
                     continue
                 await _mirror_to_observers(
                     f"backend-{backend_name}",
@@ -4440,6 +5088,8 @@ async def _relay_model_route_chain(
                 )
             except HTTPException as error:
                 failures.append(f"{target}: {error.detail}")
+                last_status = error.status_code
+                error_status = error.status_code
                 continue
             await _mirror_to_observers(target, model, prompt_text, reply)
             return reply
@@ -4455,6 +5105,7 @@ async def _relay_model_route_chain(
                 candidates = [replica, *candidates]
         if not candidates:
             failures.append(f"{target}: no connected worker matched")
+            last_status = 503
             continue
         for worker_id in candidates:
             try:
@@ -4471,24 +5122,37 @@ async def _relay_model_route_chain(
                 failures.append(
                     f"{worker_id}: not ready ({error.reason})"
                 )
+                last_status = 503
                 continue
             except _WorkerRejected as error:
                 failures.append(f"{worker_id}: {error.reason}")
+                last_status = 503
                 continue
             except HTTPException as error:
                 _release_worker_reservation(worker_id)
                 failures.append(f"{worker_id}: {error.detail}")
+                last_status = error.status_code
+                error_status = error.status_code
                 continue
             if result is _PASS:
                 failures.append(f"{worker_id}: disconnected before accepting")
+                last_status = 503
                 continue
             await _mirror_to_observers(worker_id, model, prompt_text, _reply_content(result))
             return result
 
     detail = "; ".join(failures) if failures else "the route chain is empty"
+    if error_status is not None:
+        # Something upstream actually returned an error; propagate it.
+        raise HTTPException(
+            status_code=error_status,
+            detail=f"all configured routes failed for model '{model}' ({detail})",
+        )
+    # Nothing upstream errored -- the whole resolution order was exhausted without
+    # any place that could serve the model. That is a "not found", not a failure.
     raise HTTPException(
-        status_code=503,
-        detail=f"all configured routes failed for model '{model}' ({detail})",
+        status_code=404,
+        detail=f"no route served model '{model}' ({detail})",
     )
 
 
@@ -4702,7 +5366,7 @@ async def _ensure_on_demand_copilot(
                     await _set_worker_runtime_model(
                         worker_id,
                         backing_model,
-                        model_entry,
+                        entry,
                     )
                 return worker_id
             _mark_waiting_for_worker(
@@ -5005,9 +5669,11 @@ async def _relay_full(
 
     configured_route = _model_routes.get(model)
     if isinstance(configured_route, list):
+        # A model's own chain, then the server-wide tail. An error directive in
+        # the model portion can still terminate before the tail is reached.
         return await _relay_model_route_chain(
             model,
-            configured_route,
+            [*configured_route, *_server_routes],
             prompt_text,
             extra or None,
         )
@@ -5024,65 +5690,131 @@ async def _relay_full(
             required_capabilities=resolved_capabilities,
         )
 
-    if configured_route is None and (
-        backing_model := _copilot_backing_model(model)
-    ):
-        primary_worker_id = await _ensure_on_demand_copilot(model, backing_model)
-        worker_ids = list(dict.fromkeys([
-            primary_worker_id,
-            *_route_worker_candidates(
-                model,
-                "worker-copilot-*",
-                resolved_capabilities,
-            ),
-        ]))
+    # A model addressed directly at a named backend routes straight to that
+    # backend, forwarding the served suffix upstream -- symmetric with
+    # "worker-<id>/<served>" routing to a connected worker. The "backend-<name>"
+    # token may appear anywhere at a slash/start boundary (e.g. a provider prefix
+    # like "openai/backend-snet-asi1"); _normalize_direct_backend_model resolves
+    # it against the configured backend names. When it resolves, dispatch;
+    # otherwise fall through to normal routing.
+    if configured_route is None and "backend-" in model:
+        normalized = _normalize_direct_backend_model(model)
+        if normalized.startswith("backend-"):
+            backend_target, _ = _split_model_id(normalized)
+            return await _relay_model_route_chain(
+                normalized,
+                [backend_target],
+                prompt_text,
+                extra or None,
+                wait_before_backend=False,
+            )
+
+    requested_backing_prefixed = (
+        _strip_public_model_prefix(model)
+        if configured_route is None and _capability_alias_spec(model) is None
+        else None
+    )
+    if requested_backing_prefixed is not None:
+        requested_backing = requested_backing_prefixed
         failures: list[str] = []
-        for worker_id in worker_ids:
-            try:
-                _check_and_record_usage(worker_id)
-            except HTTPException as error:
-                if worker_id == primary_worker_id:
-                    _release_worker_reservation(worker_id)
-                failures.append(f"{worker_id}: {error.detail}")
+        tried_backings: set[str] = set()
+        # Try the exact requested backing first (when it is in the catalog),
+        # then - only if that can't be served - the closest available Copilot
+        # model as a runtime substitute. We can switch a worker's model on the
+        # fly and reprompt it, so an unavailable/renamed/rejected model is
+        # served by the best match instead of failing; the public model id the
+        # caller asked for is preserved throughout ("lie to the socket worker").
+        # Bounded to two attempts (exact + one substitute) to avoid churning
+        # through the whole catalog.
+        for attempt in range(2):
+            if attempt == 0:
+                backing_model = _copilot_backing_model(model)
+            else:
+                backing_model = _best_match_copilot_backing(
+                    requested_backing, exclude=tried_backings
+                )
+            if backing_model is None or backing_model in tried_backings:
                 continue
+            tried_backings.add(backing_model)
+
             try:
-                result = await _relay_to_worker(
+                primary_worker_id = await _ensure_on_demand_copilot(model, backing_model)
+            except HTTPException as error:
+                failures.append(f"backing '{backing_model}': {error.detail}")
+                continue
+            worker_ids = list(dict.fromkeys([
+                primary_worker_id,
+                *_route_worker_candidates(
+                    model,
+                    "worker-copilot-*",
+                    resolved_capabilities,
+                ),
+            ]))
+            for worker_id in worker_ids:
+                try:
+                    _check_and_record_usage(worker_id)
+                except HTTPException as error:
+                    if worker_id == primary_worker_id:
+                        _release_worker_reservation(worker_id)
+                    failures.append(f"{worker_id}: {error.detail}")
+                    continue
+                try:
+                    result = await _relay_to_worker(
+                        worker_id,
+                        model,
+                        prompt_text,
+                        (
+                            f"You are the GitHub Copilot backing model '{backing_model}'. "
+                            "Answer directly at your native capability."
+                        ),
+                        wait=len(worker_ids) == 1,
+                        extra=extra or None,
+                    )
+                except _WorkerNotReady as error:
+                    failures.append(f"{worker_id}: not ready ({error.reason})")
+                    continue
+                except _WorkerRejected as error:
+                    failures.append(f"{worker_id}: rejected ({error.reason})")
+                    continue
+                except HTTPException as error:
+                    failures.append(f"{worker_id}: {error.detail}")
+                    continue
+                if result is _PASS:
+                    failures.append(f"{worker_id}: disconnected before accepting")
+                    continue
+                await _mirror_to_observers(
                     worker_id,
                     model,
                     prompt_text,
-                    (
-                        f"You are the GitHub Copilot backing model '{backing_model}'. "
-                        "Answer directly at your native capability."
-                    ),
-                    wait=len(worker_ids) == 1,
-                    extra=extra or None,
+                    _reply_content(result),
                 )
-            except _WorkerNotReady as error:
-                failures.append(f"{worker_id}: not ready ({error.reason})")
-                continue
-            except _WorkerRejected as error:
-                failures.append(f"{worker_id}: rejected ({error.reason})")
-                continue
-            except HTTPException as error:
-                failures.append(f"{worker_id}: {error.detail}")
-                continue
-            if result is _PASS:
-                failures.append(f"{worker_id}: disconnected before accepting")
-                continue
-            await _mirror_to_observers(
-                worker_id,
-                model,
-                prompt_text,
-                _reply_content(result),
+                return result
+            # No worker completed with this backing; the next attempt switches a
+            # worker to the best-match substitute and reprompts it.
+
+        if tried_backings:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"no eligible servant completed model '{model}' "
+                    f"({'; '.join(failures) or 'no candidates'})"
+                ),
             )
-            return result
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"no eligible servant completed model '{model}' "
-                f"({'; '.join(failures) or 'no candidates'})"
-            ),
-        )
+
+    # A model that specifies no route of its own falls back to the server-wide
+    # default resolution order (default.model_route), then the server-wide tail.
+    # Applies only when one of those is configured; otherwise the generic
+    # per-model serving path below is unchanged. Reached after the default-model,
+    # direct-backend, and copilot special cases so those keep precedence.
+    if configured_route is None:
+        effective = [*_as_route_list(_default_model_route), *_server_routes]
+        if effective:
+            return await _relay_model_route_chain(
+                model,
+                effective,
+                prompt_text,
+                extra or None,
+            )
 
     resolved_worker_id, _, persona = _require_model(model)
     if _numeric_copilot_worker_id(resolved_worker_id):
@@ -6389,7 +7121,7 @@ async def images_edits(request: Request) -> dict[str, Any]:
     prompt = str(form.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
-    model = str(form.get("model") or "copilot/gpt-5.3-codex")
+    model = str(form.get("model") or "router/gpt-5.3-codex")
     response_format = str(form.get("response_format") or "url")
     if response_format not in {"url", "b64_json"}:
         raise HTTPException(
@@ -6695,9 +7427,7 @@ async def specific_worker_audio_speech(worker_id: str, body: AudioSpeechRequest)
 # lifecycle is durable, but there is no hosted agent runtime. Fine-tune input
 # is validated and jobs are recorded, but no training is performed.
 # ---------------------------------------------------------------------------
-_RUNTIME_DIR = Path(
-    os.environ.get("EMULLM_RUNTIME_DIR") or (Path(__file__).resolve().parent.parent / "runtime")
-)
+_RUNTIME_DIR = _paths.RUNTIME_DIR
 _MAX_FILE_BYTES = max(1, int(os.environ.get("EMULLM_MAX_FILE_BYTES", str(512 * 1024 * 1024))))
 _ALLOWED_FILE_PURPOSES = {"assistants", "batch", "fine-tune", "vision", "user_data", "evals", "output"}
 
@@ -9216,6 +9946,8 @@ def admin_state() -> dict[str, Any]:
         "advertised_model": _cat["model"],
         "model_agents": model_failover_map(),
         "model_routes": dict(_model_routes),
+        "server_routes": list(_server_routes),
+        "default_model_route": _default_model_route,
     }
 
 
@@ -9522,9 +10254,36 @@ def admin_stop_worker(worker_id: str) -> dict[str, Any]:
 # --- config.json (typed schema + read/write) ------------------------------
 # A small persisted config document the admin page edits, validated against
 # the schema below on write (unknown top-level keys are rejected so a
-# hand-edited file catches typos). Location: EMULLM_CONFIG_FILE, else
-# <repo root>/config.json.
-_CONFIG_PATH = Path(os.environ.get("EMULLM_CONFIG_FILE") or (Path(__file__).resolve().parent.parent.parent / "config.json"))
+# hand-edited file catches typos).
+#
+# This document is runtime-mutable (the admin page and the anti-idle toggle
+# rewrite it), so it must live in a writable, git-ignored config directory
+# rather than beside the package sources under ``src/``.
+#
+# All path resolution lives in :mod:`emullm.paths`, the single source of truth
+# shared with ``standalone.py`` and the workbench ``plugin.py`` loader. Importing
+# it here also creates the config/runtime layout and seeds ``server_config.json``
+# on first run, which is what makes non-editable installs work out of the box.
+#
+# Location precedence (see ``emullm.paths``):
+#   1. ``EMULLM_CONFIG_FILE`` (explicit override), else
+#   2. ``<config dir>/server_config.json`` where the config dir is
+#      ``EMULLM_CONFIG_DIR`` (legacy ``EMULLM_DATA_DIR``) or ``<base>/config``.
+_PLUGIN_ROOT = _paths.PLUGIN_ROOT
+_CONFIG_DIR = _paths.CONFIG_DIR
+_DATA_DIR = _CONFIG_DIR  # legacy alias retained for callers/tests
+_DIST_CONFIG_PATH = _paths.DIST_CONFIG_PATH
+
+
+def _resolve_config_path() -> Path:
+    """Ensure the layout exists (first-run bootstrap) and return the live config."""
+    try:
+        return _paths.ensure_layout()
+    except Exception:
+        return _paths.config_file()
+
+
+_CONFIG_PATH = _resolve_config_path()
 
 
 class WorkerConfig(BaseModel):
@@ -9630,7 +10389,7 @@ _DEFAULT_CODEX_SUPPLIER = CodexSupplierConfig(
         "Current Codex supplier: resident Copilot SDK workers serving Codex-family models."
     ),
     worker_pattern="worker-copilot-*",
-    model_prefix="copilot/",
+    model_prefix="router/",
     model_patterns=["*codex*"],
     command="copilot",
 ).model_dump(mode="json")
@@ -9730,6 +10489,15 @@ class ModelCatalogOverrideConfig(BaseModel):
     patch: dict[str, Any] = Field(default_factory=dict)
 
 
+class DefaultRoutingConfig(BaseModel):
+    """The ``default`` section. ``model_route`` is the resolution order used for
+    a model that specifies no route of its own -- an exact target or an ordered
+    worker-glob/backend chain (which may include error directives)."""
+
+    model_config = ConfigDict(extra="allow")
+    model_route: str | list[str] | None = None
+
+
 class EmullmConfig(BaseModel):
     """The full config.json schema. Every field is optional (omit to fall
     back to the matching env var / default); unknown top-level keys are
@@ -9753,6 +10521,9 @@ class EmullmConfig(BaseModel):
         le=300,
     )
     model_routes: dict[str, str | list[str]] | None = None  # model id -> worker or ordered targets
+    server_routes: list[str] | None = None  # server-wide resolution-order tail (targets + error directives)
+    default_model_route: str | list[str] | None = None  # flat alias for default.model_route
+    default: DefaultRoutingConfig | None = None  # default.model_route for models without their own route
     model_catalog_overrides: dict[str, ModelCatalogOverrideConfig] | None = None
     capability_fallback: Literal["stub", "wait", "error"] | None = None
     validation_interval_default: str | int | float | None = None  # inherited default cadence
@@ -9860,11 +10631,41 @@ _MAX_ADMIN_TEST_ATTACHMENTS_TOTAL_BYTES = max(
 AdminTestChatRequest.model_rebuild()
 
 
+# Only *operational tuning* keys are backfilled from the shipped default when a
+# live config predates them. Behavioral inventory (agents, backends, workers,
+# headless_copilots, mock_workers, codex_suppliers, services, mock) and routing
+# tables (model_routes, model_catalog_overrides) are deliberately EXCLUDED: a
+# raw config read must reflect exactly what the operator authored, so backfill
+# never resurrects the sample inventory or hijacks backend/route selection.
+_CONFIG_BACKFILL_SETTING_KEYS = (
+    "max_concurrent_calls",
+    "idle_worker_target",
+    "idle_grace_seconds",
+    "backend_fallback_delay_seconds",
+    "validation_interval_default",
+    "validation_interval",
+    "subagent_launch",
+    "subagent_model",
+    "anti_idle",
+    "capability_fallback",
+)
+
+
 def _read_config() -> dict[str, Any]:
     try:
         if _CONFIG_PATH.is_file():
             data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                # Backfill only missing *settings* keys from the shipped default,
+                # so an older config keeps working after new tuning knobs are
+                # introduced. In-memory only -- never written back (the admin
+                # write path validates against the config model, which rejects
+                # unknown top-level keys). Inventory/routing keys are excluded so
+                # runtime selection reflects exactly the operator's file.
+                defaults = _paths.read_config_defaults()
+                for key in _CONFIG_BACKFILL_SETTING_KEYS:
+                    if key in defaults:
+                        data.setdefault(key, defaults[key])
                 return data
     except (OSError, ValueError):
         pass
@@ -10821,7 +11622,7 @@ async def admin_load_copilot_model(model_id: str) -> dict[str, Any]:
     if backing_model is None:
         raise HTTPException(
             status_code=422,
-            detail="only exported copilot/<model-id> entries can be loaded on demand",
+            detail="only exported router/<model-id> entries can be loaded on demand",
         )
     worker_id = await _ensure_on_demand_copilot(model_id, backing_model)
     _release_worker_reservation(worker_id)
@@ -11959,7 +12760,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
       <label>Kind<select id="supplier-kind"><option value="copilot">copilot</option><option value="codex-cli">codex-cli</option><option value="openai-compatible">openai-compatible</option><option value="custom">custom</option></select></label>
       <label>Priority<input id="supplier-priority" type="number" min="-10000" max="10000" value="0"></label>
       <label>Worker pattern<input id="supplier-worker-pattern" placeholder="worker-codex-*"></label>
-      <label>Model prefix<input id="supplier-model-prefix" placeholder="copilot/"></label>
+      <label>Model prefix<input id="supplier-model-prefix" placeholder="router/"></label>
       <label>Model patterns<input id="supplier-model-patterns" placeholder="*codex*,gpt-5.3-*"></label>
       <label>Command<input id="supplier-command" placeholder="copilot or codex"></label>
       <label>Base URL<input id="supplier-base-url" placeholder="https://provider.example/v1"></label>
@@ -11987,7 +12788,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   <label>Task timeout (seconds, maximum 10)<input id="anti-idle-timeout" type="number" min="0.1" max="10" step="0.1" value="10"></label>
   <label>Slow budget (seconds)<input id="anti-idle-slow-budget" type="number" min="0.1" max="10" step="0.1" value="8"></label>
 </div>
-<div class="checks"><label><input id="anti-idle-enabled" type="checkbox" checked> scheduler enabled (applies immediately)</label></div>
+<div class="checks"><label><input id="anti-idle-enabled" type="checkbox"> scheduler enabled (applies immediately)</label></div>
 <div class="two-column">
   <div>
     <div class="table-wrap stats-scroll" style="max-height:430px">
@@ -12217,7 +13018,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   on-demand flags, or persist an ordered route to servants and real backends.</p>
 <div class="model-config-layout">
   <div>
-    <label>Filter models<input id="model-config-search" placeholder="copilot/, audio, worker..."></label>
+    <label>Filter models<input id="model-config-search" placeholder="router/, audio, worker..."></label>
     <label class="sr-only" for="model-config-list">Exported models (multiple selection allowed)</label>
     <select id="model-config-list" size="18" multiple></select>
     <div class="sub">Use Ctrl/Command or Shift to select multiple models for bulk edits.</div>
@@ -12309,7 +13110,7 @@ _ADMIN_PAGE_HTML = """<!doctype html>
   Copilot model generates a workspace PNG with tools; the result explicitly says whether
   it came from a worker or the simulated placeholder.</p>
 <div class="form-grid">
-  <label>Image model<input id="image-generation-model" value="copilot/gpt-5.3-codex"></label>
+  <label>Image model<input id="image-generation-model" value="router/gpt-5.3-codex"></label>
   <label>Image prompt<input id="image-generation-prompt" value="A bright red circle centered on a clean white background"></label>
 </div>
 <button id="image-generation-run" type="button">Generate test image</button>
@@ -13764,6 +14565,12 @@ function modelConfigTask(model, name) {
   return !!(model && model.task_capabilities && model.task_capabilities[name] &&
     model.task_capabilities[name].enabled);
 }
+function isOnDemandModelId(modelId) {
+  // Copilot-backed models are advertised under the neutral "router/" prefix;
+  // "copilot/" is still recognized for legacy configs.
+  return typeof modelId === 'string' &&
+    (modelId.startsWith('router/') || modelId.startsWith('copilot/'));
+}
 function syncModelConfigCheckboxes(model) {
   const override = (modelConfigMeta.overrides || {})[selectedModelConfigId] || {};
   field('model-config-export').checked = override.hidden !== true;
@@ -13775,7 +14582,7 @@ function syncModelConfigCheckboxes(model) {
   field('model-config-code').checked = modelConfigTask(model, 'code');
   field('model-config-image-output').checked = modelConfigTask(model, 'image_output');
   field('model-config-summary').checked = modelConfigTask(model, 'summarization');
-  field('model-config-load').disabled = !model.id.startsWith('copilot/') || !model.on_demand;
+  field('model-config-load').disabled = !isOnDemandModelId(model.id) || !model.on_demand;
 }
 function applyModelConfigCheckboxes() {
   const model = modelConfigJson(); if (!model) return;
@@ -13803,7 +14610,7 @@ function applyModelConfigCheckboxes() {
   }
   field('model-config-json').value = JSON.stringify(model, null, 2);
   field('model-config-load').disabled = !selectedModelConfigIds.length ||
-    !selectedModelConfigIds.every(modelId => modelId.startsWith('copilot/')) ||
+    !selectedModelConfigIds.every(isOnDemandModelId) ||
     !model.on_demand;
 }
 function renderModelConfigSlots() {
@@ -13876,7 +14683,7 @@ function renderSelectedModelConfig() {
   field('model-config-route').value = Array.isArray(route) ? route.join('\\n') : (route || '');
   syncModelConfigCheckboxes(model);
   field('model-config-load').disabled = !selectedModelConfigIds.every(
-    modelId => modelId.startsWith('copilot/')
+    isOnDemandModelId
   ) || !field('model-config-ondemand').checked;
   syncModelRouteShortcuts();
 }
@@ -13985,7 +14792,7 @@ field('model-config-clear-route').addEventListener('click', () => {
   field('model-config-msg').className = 'msg';
 });
 field('model-config-load').addEventListener('click', async () => {
-  const modelIds = selectedModelConfigIds.filter(modelId => modelId.startsWith('copilot/'));
+  const modelIds = selectedModelConfigIds.filter(isOnDemandModelId);
   if (!modelIds.length || modelIds.length !== selectedModelConfigIds.length) return;
   field('model-config-load').disabled = true;
   field('model-config-msg').textContent = 'loading ' + modelIds.length + ' on-demand worker(s)...';
@@ -14610,6 +15417,54 @@ def admin_set_model_routes(body: ModelRoutesRequest) -> dict[str, Any]:
     return {"model_routes": dict(_model_routes)}
 
 
+class ServerRoutesRequest(BaseModel):
+    routes: str | list[str] | None = None
+
+
+@router.get("/admin/emullm/server_routes")
+@router.get("/emullm/admin/server_routes")
+def admin_get_server_routes() -> dict[str, Any]:
+    return {
+        "server_routes": list(_server_routes),
+        "default_model_route": _default_model_route,
+    }
+
+
+@router.post("/admin/emullm/server_routes")
+@router.post("/emullm/admin/server_routes")
+def admin_set_server_routes(body: ServerRoutesRequest) -> dict[str, Any]:
+    """Set the server-wide resolution-order tail at runtime.
+
+    The tail is tried after a model's own route (or the default route) is
+    exhausted, unless an error directive terminated the chain first. It may hold
+    worker-ID globs, OpenAI-compatible backend URLs, and error directives
+    (``error_4xx``/``error_5xx``/``error_<NNN>``/``error``). An empty value
+    clears it.
+    """
+    _server_routes[:] = _as_route_list(_normalise_model_route(body.routes))
+    return {"server_routes": list(_server_routes)}
+
+
+class DefaultRouteRequest(BaseModel):
+    route: str | list[str] | None = None
+
+
+@router.get("/admin/emullm/default_route")
+@router.get("/emullm/admin/default_route")
+def admin_get_default_route() -> dict[str, Any]:
+    return {"default_model_route": _default_model_route}
+
+
+@router.post("/admin/emullm/default_route")
+@router.post("/emullm/admin/default_route")
+def admin_set_default_route(body: DefaultRouteRequest) -> dict[str, Any]:
+    """Set the default model route at runtime -- the resolution order used for a
+    model that specifies no route of its own. An empty value clears it."""
+    global _default_model_route
+    _default_model_route = _normalise_model_route(body.route)
+    return {"default_model_route": _default_model_route}
+
+
 @router.post("/admin/emullm/reset")
 @router.post("/emullm/admin/reset")
 def admin_reset() -> dict[str, Any]:
@@ -14706,59 +15561,112 @@ def _apply_worker_registration(worker_id: str, registration: dict[str, Any]) -> 
         _set_worker_model_masks(worker_id, _normalise_model_masks(registration["modelmasks"]))
 
 
+async def _handle_worker_identify(
+    websocket: WebSocket,
+    connection_id: str,
+    current_id: str,
+    data: dict[str, Any],
+) -> str | None:
+    """Let a connected worker (re)declare its name at any time.
+
+    A worker may send ``{"type": "identify", "worker_id": "<name>"}`` (``rename``
+    and ``name`` are accepted as synonyms, and ``name`` as the field) at any point
+    to claim or change its name. A name that is already taken is not refused: the
+    worker is admitted as a *fallback* under a derived id and joins that name's
+    team. Returns the worker's new connection id when it changed, else ``None``.
+    """
+    requested = str(data.get("worker_id") or data.get("name") or "").strip()
+    if not requested or requested == current_id:
+        return None
+    try:
+        _mailbox_id(requested)
+    except ValueError:
+        await _tracked_ws_send_json(
+            websocket,
+            connection_id,
+            {"type": "identify_error", "reason": "invalid worker name", "worker_id": current_id},
+        )
+        return None
+    async with _worker_lock:
+        if _connected_workers.get(current_id) is not websocket:
+            return None
+        new_id, is_fallback = _assign_worker_identity(requested)
+        if new_id == current_id:
+            return None
+        _leave_worker_team(current_id)
+        _rename_worker_state(current_id, new_id)
+        _join_worker_team(requested, new_id)
+        _worker_connection_ids[new_id] = connection_id
+    _update_active_websocket(connection_id, worker_id=new_id)
+    _ensure_worker_mailbox(new_id)
+    frame = {"type": "renamed", "worker_id": new_id, "team": requested, "fallback": is_fallback}
+    await _tracked_ws_send_json(websocket, connection_id, frame)
+    _track_worker_socket_frame(
+        connection_id,
+        "lifecycle",
+        {"type": "renamed", "worker_id": new_id, "previous": current_id, "team": requested, "fallback": is_fallback},
+    )
+    return new_id
+
+
 async def _serve_worker_socket(
     websocket: WebSocket, worker_id: str, model_masks: tuple[str, ...] | None
 ) -> None:
     """Serve one native worker connection after its query parameters are parsed."""
+    requested_name = worker_id
     try:
-        _mailbox_id(worker_id)
+        _mailbox_id(requested_name)
     except ValueError:
         await websocket.close(code=1008)
         return
     await websocket.accept()
+    async with _worker_lock:
+        worker_id, is_fallback = _assign_worker_identity(requested_name)
+        _connected_workers[worker_id] = websocket
+        _native_worker_ids.add(worker_id)
+        _join_worker_team(requested_name, worker_id)
+        _set_worker_model_masks(worker_id, model_masks)
     connection_id = _register_active_websocket(
         websocket,
         "worker",
         worker_id=worker_id,
         modelmasks=list(model_masks) if model_masks is not None else None,
     )
-    _ensure_worker_mailbox(worker_id)
-    duplicate = False
     async with _worker_lock:
-        duplicate = worker_id in _connected_workers
-        if not duplicate:
-            _connected_workers[worker_id] = websocket
-            _native_worker_ids.add(worker_id)
-            _worker_connection_ids[worker_id] = connection_id
-            _set_worker_model_masks(worker_id, model_masks)
-    if not duplicate:
-        _record_worker_connection(worker_id, model_masks)
-        _track_worker_socket_frame(
-            connection_id,
-            "lifecycle",
-            {"type": "connected", "modelmasks": list(model_masks or [])},
-        )
+        _worker_connection_ids[worker_id] = connection_id
+    _ensure_worker_mailbox(worker_id)
+    _record_worker_connection(worker_id, model_masks)
+    _track_worker_socket_frame(
+        connection_id,
+        "lifecycle",
+        {
+            "type": "connected",
+            "modelmasks": list(model_masks or []),
+            "team": requested_name,
+            "fallback": is_fallback,
+        },
+    )
     try:
         hello: dict[str, Any] = {"type": "hello", "worker_id": worker_id}
         if model_masks is not None:
             hello["modelmasks"] = list(model_masks)
+        if is_fallback or worker_id != requested_name:
+            hello["team"] = requested_name
+            hello["fallback"] = is_fallback
         await _tracked_ws_send_json(websocket, connection_id, hello)
-        if duplicate:
-            reason = f"duplicate worker_id '{worker_id}' is already connected"
-            await _tracked_ws_send_json(
-                websocket,
-                connection_id,
-                {"type": "shutdown", "reason": reason},
-            )
-            _track_worker_socket_frame(
-                connection_id,
-                "lifecycle",
-                {"type": "duplicate-rejected", "reason": reason},
-            )
-            return
         while True:
             data = await _tracked_ws_receive_json(websocket, connection_id)
-            if isinstance(data, dict) and data.get("type") == "register":
+            if isinstance(data, dict) and data.get("type") in ("identify", "rename", "name"):
+                worker_id = await _handle_worker_identify(websocket, connection_id, worker_id, data) or worker_id
+            elif isinstance(data, dict) and data.get("type") == "register":
+                declared = data.get("worker_id") or data.get("name")
+                if isinstance(declared, str) and declared.strip():
+                    worker_id = (
+                        await _handle_worker_identify(
+                            websocket, connection_id, worker_id, {"worker_id": declared}
+                        )
+                        or worker_id
+                    )
                 _apply_worker_registration(worker_id, data)
             elif isinstance(data, dict):
                 await _handle_worker_message(
@@ -14782,6 +15690,7 @@ async def _serve_worker_socket(
                 _native_worker_ids.discard(worker_id)
                 _worker_connection_ids.pop(worker_id, None)
                 _worker_model_masks.pop(worker_id, None)
+                _leave_worker_team(worker_id)
                 disconnected = True
         _track_worker_socket_frame(
             connection_id,
@@ -14801,7 +15710,7 @@ async def emullm_socket(websocket: WebSocket) -> None:
     parameters. Omit ``worker_id`` to receive a generated identity in the
     hello frame, and omit ``modelmasks`` to accept offers for every model.
     """
-    worker_id = (websocket.query_params.get("worker_id") or "").strip() or _new_automatic_worker_id()
+    worker_id = (websocket.query_params.get("worker_id") or "").strip() or _new_automatic_worker_id(websocket)
     raw_masks = websocket.query_params.getlist("modelmasks")
     model_masks = _normalise_model_masks(raw_masks) if raw_masks else None
     await _serve_worker_socket(websocket, worker_id, model_masks)

@@ -22,7 +22,7 @@ test = [
 ]
 
 [project.scripts]
-emullm-serve = "emullm.cli:main"
+emullm-serve = "emullm.standalone:main"
 emullm-chat = "emullm.chat:main"
 
 [tool.setuptools]
@@ -32,7 +32,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-emullm = ["*.mjs"]
+emullm = ["*.mjs", "server_config_dist.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

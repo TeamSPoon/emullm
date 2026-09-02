@@ -62,12 +62,15 @@ def test_manifest_uses_native_service_catalog() -> None:
         "protocol": "http",
         "format": "json",
     }
-    assert 'default="127.0.0.1"' in (
-        Path(__file__).parents[1] / "run.py"
-    ).read_text(encoding="utf-8")
-    assert "standalone.main([args.host, str(args.port)])" in (
-        Path(__file__).parents[1] / "run.py"
-    ).read_text(encoding="utf-8")
+    plugin_root = Path(__file__).parents[1]
+    # run.py has been merged into emullm.standalone (the single canonical runner,
+    # also reachable as ``python plugin.py`` and via the ``emullm-serve`` script).
+    assert not (plugin_root / "run.py").exists()
+    standalone_src = (plugin_root / "src" / "emullm" / "standalone.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"emullm.app:app"' in standalone_src
+    assert "reload=True" in standalone_src
     modes = manifest["runtimeModes"]
     assert modes["default"] == modes["current"] == "standalone"
     assert {mode["id"] for mode in modes["available"]} == {"standalone", "embedded"}
@@ -133,6 +136,7 @@ def test_standalone_main_runs_existing_app(monkeypatch) -> None:
 
     monkeypatch.setattr("uvicorn.Config", fake_config)
     monkeypatch.setattr("uvicorn.Server", fake_server)
+    monkeypatch.setattr("emullm.paths.ensure_layout", lambda: None)
     monkeypatch.setenv("EMULLM_HOST", "before-test")
     monkeypatch.setenv("EMULLM_HTTP_PORT", "1")
     standalone.main(["127.0.0.2", "9911"])

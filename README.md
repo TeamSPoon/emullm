@@ -35,13 +35,22 @@ servant-process and filesystem inspection is explicitly offloaded with
 Assumes Python 3.12+ is installed (see
 [Installing prerequisites](#installing-prerequisites) if not).
 
+> **You most likely need a GitHub Copilot account.** The relay itself is
+> keyless, but its built-in **headless Copilot servants** answer requests by
+> driving the [GitHub Copilot CLI](https://docs.github.com/copilot), which
+> requires an active **GitHub Copilot subscription** (individual, Business, or
+> Enterprise) and a one-time `copilot` (or `gh copilot`) login on this machine.
+> Without it, you can still run the server and connect your own human/agent
+> workers, but the bundled `worker-copilot-*` servants and the `copilot/<model>`
+> backends will not start.
+
 Windows (PowerShell):
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[test]"
-python run.py                 # serves on http://127.0.0.1:8801
+python -m emullm.standalone     # serves on http://127.0.0.1:8801
 ```
 
 macOS/Linux:
@@ -50,7 +59,7 @@ macOS/Linux:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[test]"
-python run.py                 # serves on http://127.0.0.1:8801
+python -m emullm.standalone     # serves on http://127.0.0.1:8801
 ```
 
 Then, in a second terminal with the environment activated, connect a
@@ -67,7 +76,7 @@ key or token is required.**
 ## Run the relay
 
 ```console
-python run.py                 # serves on http://127.0.0.1:8801
+python -m emullm.standalone     # serves on http://127.0.0.1:8801
 ```
 
 Then point any OpenAI-compatible client at `http://127.0.0.1:8801/v1`.
@@ -93,9 +102,17 @@ python -m emullm.worker --host-ws-url ws://127.0.0.1:8801
 
 Every native servant uses the one endpoint:
 `ws://127.0.0.1:8801/emullm/ws`. Supply an optional identity as
-`?worker_id=worker-copilot-1`; if omitted, the server assigns a
-`worker-unknown-<random>` identity and returns it in the first `hello` frame. Supply
-an optional comma-separated glob list as
+`?worker_id=worker-copilot-1`; if omitted, the server names the connection
+`worker-unknown-<ip>-<port>` after its client address (falling back to a random
+suffix when the address is unavailable or already taken) and returns it in the
+first `hello` frame. A worker may (re)declare its name at any time by sending
+`{"type":"identify","worker_id":"<name>"}` (the `register` frame's `worker_id`
+does the same); the server replies with a `renamed` frame. A name that is
+already connected is **not** rejected -- the worker is admitted as a *fallback*
+under a derived id (`<name>-2`, `<name>-3`, ...) and joins that name's *team*, so
+a conflicting name forms a fallback pool (the `hello`/`renamed` frame then
+carries `team` and `fallback` fields). Addressing a team name reaches the whole
+team, primary first. Supply an optional comma-separated glob list as
 `?worker_id=worker-copilot-1&modelmasks=openai/*,gpt-*`; omitting `modelmasks`
 makes the servant eligible for every model. Unlisted model IDs are always
 forwarded unchanged in the request frame. A servant may explicitly send
@@ -307,6 +324,27 @@ capacity gate, preserving workers for independent clients and prompts.
 `services.model` default (or `worker-copilot-n/percent100` when none is configured).
 Giving that alias its own `route_targets` in the Models configurator overrides
 the resolved default route.
+
+A client may also address a target **directly** in the model id, with no
+configured `model_routes` entry: `worker-<id>/<served>` sends the request
+straight to that connected worker, and a `backend-<name>` token sends it
+straight to that named backend (from config `backends`). The token is found by
+**scanning** the model id for a configured backend/agent name and removing it;
+whatever is left becomes the served model id forwarded upstream. The **longest
+configured name** wins, so with backends `snet` and `snet-other`,
+`backend-snet-other-foo` resolves to backend `snet-other` serving `foo`. Both
+the slash form `backend-snet/openai/foo` (served `openai/foo`) and the slashless
+dash form `backend-snet-asi1` (served `asi1`) work. A bare `backend-<name>` (or
+`.../same`) forwards the backend's configured `model`.
+
+The token may appear **anywhere** at a start-of-string or post-`/` boundary, and
+the text on either side is stitched back together, so a provider prefix is
+preserved: `openai/backend-snet-asi1` routes to backend `snet` forwarding
+`openai/asi1`. Slashes are opaque boundaries the scan never sees through: the
+`backend-<name>` token must be contiguous (dash-joined), so
+`backend/snet-openai-foo` never resolves to backend `snet`. Direct backend
+addressing skips the wait-for-a-worker fallback delay and returns `503` if no
+configured backend name matches.
 
 The aggregate catalog hides `yourself/*` and every concrete
 `worker-copilot-<number>/*` entry, including workers created later. It advertises
@@ -614,8 +652,10 @@ Chat client (`emullm.chat`):
 
 ### Command-line defaults
 
-- **Server** (`python run.py` / `emullm-serve`): `--host` (`127.0.0.1`),
-  `--port` (`8801`), `--no-reload`.
+- **Server** (`python -m emullm.standalone` / `python plugin.py` / `emullm-serve`):
+  `--host` (`127.0.0.1`), `--port` (`8801`), `--reload` (development autoreload;
+  off by default). Positional `host port` are also accepted
+  (`python -m emullm.standalone 127.0.0.1 8801`).
 - **Worker** (`python -m emullm.worker`): optional `--worker-id` (server
   assigns one when omitted), `--modelmasks` (comma-separated glob patterns;
   omitted means all models), `--host-ws-url` (`ws://127.0.0.1:8801`),
