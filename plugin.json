@@ -7,7 +7,7 @@
   "entrypoint": "plugin.py",
   "scan": "startup",
   "routePrefix": "/emullm",
-  "adminPage": "/emullm",
+  "adminPage": "/emullm/admin",
   "configPage": "http://127.0.0.1:5173/emullm/admin/",
   "mailboxEndpoint": {
     "path": "/mailbox/mailboxes",
