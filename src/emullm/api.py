@@ -6577,12 +6577,17 @@ _TOOL_RELAY_PREAMBLE = (
     "(its machine, files, and shell). You cannot and must not execute those "
     "yourself; when one is needed, EMIT the tool call so the caller runs it.\n\n"
     "Caller tools:\n{tools}\n\n"
-    "When you want to call one or more caller tools, reply with ONLY this JSON "
-    "object and nothing else -- no prose, no explanation, no markdown code fences:\n"
+    "PROTOCOL CONTRACT -- follow it exactly or the caller cannot run the call:\n"
+    "1. Call ONLY tools whose names appear in the list above; never invent a tool.\n"
+    "2. Each call's \"arguments\" MUST be a JSON object that matches that tool's "
+    "parameters schema exactly -- correct property names, types, and required "
+    "fields; add no extra keys.\n"
+    "3. To make one or more calls, reply with ONLY this JSON object and nothing "
+    "else -- no prose, no explanation, no markdown code fences:\n"
     '{{"tool_calls": [{{"name": "<tool_name>", "arguments": {{<json args>}}}}]}}\n'
-    "You may include multiple entries to call several caller tools at once. If you "
-    "do NOT need a caller tool, reply normally with your final answer (using your "
-    "own internal abilities as needed)."
+    "4. If you do NOT need a caller tool, reply normally with your final answer "
+    "text (using your own internal abilities as needed) and do not emit the "
+    "envelope."
 )
 
 
