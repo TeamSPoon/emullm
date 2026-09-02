@@ -88,6 +88,19 @@ def create_router(manifest: dict[str, Any] | None = None):
     return _create_router(manifest)
 
 
+def create_admin_router(manifest: dict[str, Any] | None = None):
+    """Suppress the workbench's generic admin descriptor.
+
+    EMULLM serves its own full operations console (see ``configPage``), reached
+    through ``web_proxy`` at the plugin prefix. Returning ``None`` tells the
+    loader NOT to mount a manifest-backed descriptor router -- otherwise that
+    descriptor would sit at ``adminPage`` and shadow the proxied console (e.g.
+    ``GET /emullm/admin`` would return JSON instead of the console HTML).
+    """
+
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
     """Start the relay directly (``python plugin.py ...``).
 
@@ -101,7 +114,7 @@ def main(argv: list[str] | None = None) -> None:
     _main(argv)
 
 
-__all__ = ["create_router", "resolve_ui_pages", "main"]
+__all__ = ["create_router", "create_admin_router", "resolve_ui_pages", "main"]
 
 
 if __name__ == "__main__":
