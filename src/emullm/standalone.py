@@ -1,13 +1,19 @@
 """Standalone runner: run EMULLM as its own OS process.
 
-Two entry points:
+Entry points:
 
-* ``python -m emullm.standalone [host] [http_port]`` runs the server in the
-  foreground.
+* ``python -m emullm.standalone [host] [http_port]`` (or the explicit
+  ``serve`` subcommand) runs the server in the foreground.
+* ``python -m emullm.standalone install <dir>`` creates the ``emullm_runtime``
+  container inside ``<dir>`` (``<dir>/emullm_runtime``) and seeds a live config
+  from the shipped default, so the server can be run against a self-contained
+  directory.
 * :func:`launch` spawns the server as a *detached* background process. It is
   idempotent: if something is already serving the target port it does nothing.
   The workbench plugin uses this in "standalone" mode and reaches the server
   through its ``web_proxy`` (see ``plugin.json``).
+
+Run ``python -m emullm.standalone --help`` for the full command reference.
 
 Contrast with :mod:`emullm.embedded`, which mounts the service in-process.
 """
@@ -15,7 +21,9 @@ Contrast with :mod:`emullm.embedded`, which mounts the service in-process.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -55,33 +63,91 @@ def is_listening(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: fl
         return False
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Run the standalone server in the foreground.
+# Subcommands recognised at the top level. Anything else (a bare ``[host]
+# [port]`` / flag form, or nothing at all) is treated as the implicit ``serve``
+# command so the historical invocation -- and :func:`launch` -- keep working.
+_SUBCOMMANDS = frozenset({"serve", "run", "install"})
 
-    ``python -m emullm.standalone [host] [port]`` is the single canonical way to
-    run the relay directly. ``--reload`` enables autoreload for development
-    (this replaces the former ``run.py`` / ``emullm-serve --reload`` runners).
-    """
 
-    import uvicorn
-
-    from . import paths
-
-    parser = argparse.ArgumentParser(description=__doc__)
+def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("host_pos", nargs="?", default=None, help="host to bind (positional)")
     parser.add_argument("port_pos", nargs="?", type=int, default=None, help="port to bind (positional)")
     parser.add_argument("--host", default=None, help="host to bind to")
     parser.add_argument("--port", type=int, default=None, help="port to bind to")
     parser.add_argument("--reload", action="store_true", help="enable autoreload (development)")
     parser.add_argument("--no-reload", action="store_true", help="disable autoreload (default)")
-    args = parser.parse_args(argv)
 
-    host = args.host_pos or args.host or DEFAULT_HOST
-    port = args.port_pos or args.port or DEFAULT_PORT
+
+def _config_host_port() -> tuple[str | None, int | None]:
+    """Read ``host`` / ``http_port`` from the live config, if present."""
+
+    from . import paths
+
+    try:
+        data = json.loads(paths.config_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return (None, None)
+    if not isinstance(data, dict):
+        return (None, None)
+    host_raw = data.get("host")
+    port_raw = data.get("http_port", data.get("port"))
+    host = host_raw.strip() if isinstance(host_raw, str) and host_raw.strip() else None
+    port: int | None = None
+    if isinstance(port_raw, bool):
+        port = None
+    elif isinstance(port_raw, int):
+        port = port_raw
+    elif isinstance(port_raw, str) and port_raw.strip().isdigit():
+        port = int(port_raw.strip())
+    return (host, port)
+
+
+def _resolve_host_port(cli_host: str | None, cli_port: int | None) -> tuple[str, int]:
+    """Resolve the bind host/port: CLI > env > config file > built-in default."""
+
+    cfg_host, cfg_port = _config_host_port()
+    env_host = os.environ.get("EMULLM_HOST") or None
+    env_port_raw = os.environ.get("EMULLM_HTTP_PORT")
+    env_port = int(env_port_raw) if env_port_raw and env_port_raw.isdigit() else None
+
+    host = cli_host or env_host or cfg_host or "127.0.0.1"
+    port = cli_port or env_port or cfg_port or 8801
+    return (host, port)
+
+
+def _patch_config_host_port(
+    config_file: Path, host: str | None, port: int | None
+) -> None:
+    """Write ``host`` / ``http_port`` into an existing (or new) config file."""
+
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if host is not None:
+        data["host"] = host
+    if port is not None:
+        data["http_port"] = port
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _serve(args: argparse.Namespace) -> None:
+    """Run the relay server in the foreground (the ``serve`` subcommand)."""
+
+    import uvicorn
+
+    from . import paths
 
     # First-run bootstrap: create the config/runtime layout and seed the config
-    # so a fresh (including non-editable) install works out of the box.
+    # so a fresh (including non-editable) install works out of the box. Done
+    # first so the config is present when we resolve the bind host/port from it.
     paths.ensure_layout()
+
+    host, port = _resolve_host_port(
+        args.host_pos or args.host, args.port_pos or args.port
+    )
 
     os.environ["EMULLM_HOST"] = host
     os.environ["EMULLM_HTTP_PORT"] = str(port)
@@ -115,6 +181,163 @@ def main(argv: list[str] | None = None) -> None:
         server.run()
     finally:
         process_control.register_shutdown_callback(None)
+
+
+def _install(
+    directory: str,
+    *,
+    force: bool = False,
+    host: str | None = None,
+    port: int | None = None,
+) -> Path:
+    """Create the runtime container under ``directory`` and seed the config.
+
+    ``directory`` is the *parent*: the ``emullm_runtime`` container is created
+    inside it (``<directory>/emullm_runtime``) and gains ``config/``, ``logs/``,
+    ``metrics/`` and ``state/`` subdirectories plus a live
+    ``config/server_config.json`` seeded from the shipped default. Pointing
+    ``EMULLM_RUNTIME_DIR`` at the container then serves from this install.
+
+    ``host`` / ``port``, when given, are written into the seeded config's
+    top-level ``host`` / ``http_port`` keys so ``serve`` picks them up -- this
+    also works as an in-place edit of an existing install (no ``--force``
+    needed just to change the port).
+    """
+
+    from . import paths
+
+    parent = Path(directory).expanduser()
+    container_root = parent / paths.EmullmRuntime.CONTAINER_NAME
+    # ``env={}`` isolates the install from ambient EMULLM_* overrides so the
+    # layout is always rooted at the container in a predictable way.
+    runtime = paths.EmullmRuntime(root=container_root, env={})
+    root = runtime.root
+
+    for created in (runtime.config_dir, runtime.logs_dir, runtime.metrics_dir, runtime.state_dir):
+        created.mkdir(parents=True, exist_ok=True)
+
+    dist = paths.DIST_CONFIG_PATH
+    config_file = runtime.config_file
+    if dist.exists():
+        # Keep a human-visible reference copy of the shipped default beside the
+        # live file so it can be inspected / diffed.
+        shutil.copy2(dist, runtime.dist_config_reference)
+
+    if config_file.exists() and not force:
+        print(f"emullm: live config already exists, left unchanged -> {config_file}")
+        print("        (re-run with --force to reseed it from the shipped default)")
+    elif dist.exists():
+        shutil.copy2(dist, config_file)
+        print(f"emullm: seeded live config from shipped default -> {config_file}")
+    else:
+        # No packaged default available (unusual); fall back to the standard
+        # best-effort seeding so at least the directories exist.
+        config_file = runtime.ensure_layout()
+        print(f"emullm: created runtime layout -> {config_file}")
+
+    if host is not None or port is not None:
+        _patch_config_host_port(config_file, host, port)
+        changed = ", ".join(
+            part
+            for part in (
+                f"host={host}" if host is not None else "",
+                f"http_port={port}" if port is not None else "",
+            )
+            if part
+        )
+        print(f"emullm: set {changed} in {config_file}")
+
+    print(f"emullm: runtime installed under {root}")
+    print("        (config/  logs/  metrics/  state/)")
+    print()
+    print("Run the server against this install with:")
+    if os.name == "nt":
+        print(f"    set EMULLM_RUNTIME_DIR={root}")
+        print("    python -m emullm.standalone")
+    else:
+        print(f'    EMULLM_RUNTIME_DIR="{root}" python -m emullm.standalone')
+    return root
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Dispatch the standalone CLI.
+
+    ``python -m emullm.standalone [host] [port]`` runs the relay directly
+    (equivalently ``... serve [host] [port]``); ``--reload`` enables autoreload
+    for development (this replaces the former ``run.py`` / ``emullm-serve
+    --reload`` runners). ``python -m emullm.standalone install <dir>`` scaffolds
+    a self-contained config/runtime directory.
+    """
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Backward-compatible dispatch: the historical "[host] [port]" / flag form
+    # (and the empty form used by launch()) is the implicit "serve" command.
+    # Only an explicit subcommand, or a top-level -h/--help, bypasses it so the
+    # subcommand help remains reachable.
+    if not raw:
+        raw = ["serve"]
+    elif raw[0] not in _SUBCOMMANDS and raw[0] not in ("-h", "--help"):
+        raw = ["serve", *raw]
+
+    parser = argparse.ArgumentParser(
+        prog="python -m emullm.standalone",
+        description="Run the EMULLM relay server, or install its runtime layout.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python -m emullm.standalone                 serve on 127.0.0.1:8801\n"
+            "  python -m emullm.standalone 0.0.0.0 9000    serve on a chosen host/port\n"
+            "  python -m emullm.standalone serve --reload  serve with autoreload (dev)\n"
+            "  python -m emullm.standalone install ./run   create a runtime directory\n"
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    serve_parser = sub.add_parser(
+        "serve",
+        aliases=["run"],
+        help="run the relay server in the foreground (default)",
+        description="Run the EMULLM relay server in the foreground.",
+    )
+    _add_serve_arguments(serve_parser)
+
+    install_parser = sub.add_parser(
+        "install",
+        help="create the emullm_runtime container in a target directory",
+        description=(
+            "Create the emullm_runtime container under DIRECTORY "
+            "(DIRECTORY/emullm_runtime with config/, logs/, metrics/, state/) "
+            "and seed a live config/server_config.json from the shipped default. "
+            "Set EMULLM_RUNTIME_DIR to the created container to serve from it."
+        ),
+    )
+    install_parser.add_argument(
+        "directory",
+        help="parent directory the emullm_runtime container is created in",
+    )
+    install_parser.add_argument(
+        "--host",
+        default=None,
+        help="host to write into the seeded config (top-level 'host')",
+    )
+    install_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="port to write into the seeded config (top-level 'http_port')",
+    )
+    install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="reseed the live config even if it already exists",
+    )
+
+    args = parser.parse_args(raw)
+
+    if args.command == "install":
+        _install(args.directory, force=args.force, host=args.host, port=args.port)
+        return
+    _serve(args)
 
 
 def launch(

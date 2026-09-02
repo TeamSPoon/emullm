@@ -151,6 +151,117 @@ def test_standalone_main_runs_existing_app(monkeypatch) -> None:
     assert process_control.shutdown_available() is False
 
 
+def test_standalone_install_creates_container_in_directory(tmp_path) -> None:
+    from emullm import paths
+
+    parent = tmp_path / "site"
+    standalone.main(["install", str(parent)])
+
+    container = parent / paths.EmullmRuntime.CONTAINER_NAME
+    assert container.is_dir()
+    for sub in ("config", "logs", "metrics", "state"):
+        assert (container / sub).is_dir()
+    config_file = container / "config" / "server_config.json"
+    assert config_file.is_file()
+    assert (container / "config" / "server_config_dist.json").is_file()
+    # Seeded from the shipped default template.
+    assert json.loads(config_file.read_text(encoding="utf-8")) == json.loads(
+        paths.DIST_CONFIG_PATH.read_text(encoding="utf-8")
+    )
+
+
+def test_standalone_install_writes_host_and_port_to_config(tmp_path) -> None:
+    from emullm import paths
+
+    parent = tmp_path / "site"
+    standalone.main(["install", str(parent), "--host", "0.0.0.0", "--port", "9123"])
+
+    config_file = parent / paths.EmullmRuntime.CONTAINER_NAME / "config" / "server_config.json"
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    assert data["host"] == "0.0.0.0"
+    assert data["http_port"] == 9123
+
+    # Changing just the port on an existing install (no --force) is an in-place
+    # edit: it must not reseed and must preserve the previously set host.
+    standalone.main(["install", str(parent), "--port", "9999"])
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    assert data["host"] == "0.0.0.0"
+    assert data["http_port"] == 9999
+
+
+def test_standalone_serve_resolves_port_from_config(monkeypatch, tmp_path) -> None:
+    from emullm import paths
+
+    parent = tmp_path / "site"
+    standalone.main(["install", str(parent), "--host", "0.0.0.0", "--port", "9123"])
+    container = parent / paths.EmullmRuntime.CONTAINER_NAME
+
+    for var in ("EMULLM_HOST", "EMULLM_HTTP_PORT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("EMULLM_RUNTIME_DIR", str(container))
+
+    configs: list[dict[str, object]] = []
+
+    class FakeServer:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        def run(self) -> None:  # pragma: no cover - trivial
+            pass
+
+    monkeypatch.setattr("uvicorn.Config", lambda app, **kw: configs.append({"app": app, **kw}) or {})
+    monkeypatch.setattr("uvicorn.Server", lambda config: FakeServer(config))
+
+    standalone.main([])  # implicit serve, no CLI host/port -> config wins
+
+    assert configs == [{"app": "emullm.app:app", "host": "0.0.0.0", "port": 9123, "reload": False}]
+
+
+def test_standalone_serve_cli_overrides_config(monkeypatch, tmp_path) -> None:
+    from emullm import paths
+
+    parent = tmp_path / "site"
+    standalone.main(["install", str(parent), "--host", "0.0.0.0", "--port", "9123"])
+    container = parent / paths.EmullmRuntime.CONTAINER_NAME
+
+    for var in ("EMULLM_HOST", "EMULLM_HTTP_PORT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("EMULLM_RUNTIME_DIR", str(container))
+
+    configs: list[dict[str, object]] = []
+
+    class FakeServer:
+        def __init__(self, config) -> None:
+            self.config = config
+
+        def run(self) -> None:  # pragma: no cover - trivial
+            pass
+
+    monkeypatch.setattr("uvicorn.Config", lambda app, **kw: configs.append({"app": app, **kw}) or {})
+    monkeypatch.setattr("uvicorn.Server", lambda config: FakeServer(config))
+
+    # Explicit --host / --port at serve time ignore the installed config values.
+    standalone.main(["127.0.0.5", "7000"])
+
+    assert configs == [{"app": "emullm.app:app", "host": "127.0.0.5", "port": 7000, "reload": False}]
+    from emullm import paths
+
+    parent = tmp_path / "site"
+    standalone.main(["install", str(parent)])
+    config_file = parent / paths.EmullmRuntime.CONTAINER_NAME / "config" / "server_config.json"
+    config_file.write_text('{"customised": true}', encoding="utf-8")
+
+    # A second install without --force must not clobber the live config.
+    standalone.main(["install", str(parent)])
+    assert json.loads(config_file.read_text(encoding="utf-8")) == {"customised": True}
+
+    # --force reseeds it from the shipped default.
+    standalone.main(["install", str(parent), "--force"])
+    assert json.loads(config_file.read_text(encoding="utf-8")) == json.loads(
+        paths.DIST_CONFIG_PATH.read_text(encoding="utf-8")
+    )
+
+
 def test_restart_marks_worker_handoff_for_replacement(monkeypatch) -> None:
     captured = {}
 

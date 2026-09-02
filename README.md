@@ -85,6 +85,41 @@ your client SDK forces an `api_key` / `OPENAI_API_KEY` value, use any
 placeholder (e.g. `sk-no-key-required`); the server ignores
 `Authorization` headers. Press `Ctrl+C` to stop the service.
 
+Run `python -m emullm.standalone --help` for the full command reference
+(`serve` and `install`).
+
+### Install a self-contained runtime directory
+
+To run the relay against a dedicated directory (its own config, logs,
+metrics and state), create an `emullm_runtime` container inside a parent
+directory and point `EMULLM_RUNTIME_DIR` at it:
+
+```console
+python -m emullm.standalone install <dir>   # creates <dir>/emullm_runtime
+```
+
+This scaffolds `<dir>/emullm_runtime/{config,logs,metrics,state}` and seeds
+`config/server_config.json` from the shipped default (re-run with `--force`
+to reseed it). Then serve from it:
+
+```powershell
+set EMULLM_RUNTIME_DIR=<dir>\emullm_runtime
+python -m emullm.standalone
+```
+
+Give the install its own bind address with `--host` / `--port`; they are
+written into the config's top-level `host` / `http_port` keys:
+
+```console
+python -m emullm.standalone install <dir> --host 0.0.0.0 --port 9000
+```
+
+Passing just `--port` (or `--host`) to `install` on an existing directory
+edits that key in place without reseeding the rest of the config. When
+serving, host/port resolve as **CLI flag > `EMULLM_HOST`/`EMULLM_HTTP_PORT`
+env > config file > built-in default** -- so `python -m emullm.standalone
+<host> <port>` (or `--host`/`--port`) always overrides the installed config.
+
 ## Connect a worker
 
 Open a second terminal in the project folder and activate the virtual
