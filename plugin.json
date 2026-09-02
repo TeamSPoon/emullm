@@ -8,7 +8,7 @@
   "scan": "startup",
   "routePrefix": "/emullm",
   "adminPage": "/emullm",
-  "configPage": "http://127.0.0.1:5173/emullm",
+  "configPage": "http://127.0.0.1:5173/emullm/admin/",
   "mailboxEndpoint": {
     "path": "/mailbox/mailboxes",
     "protocol": "ws_collab",
@@ -172,7 +172,7 @@
         "id": "admin",
         "label": "EMULLM Admin",
         "kind": "admin",
-        "descriptor": "http://127.0.0.1:5173/emullm",
+        "descriptor": "http://127.0.0.1:5173/emullm/admin/",
         "glyph": "μ",
         "group": "PLUGINS"
       }
