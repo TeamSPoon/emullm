@@ -4358,12 +4358,22 @@ def _backing_model_alias_entry(worker_id: str) -> dict[str, Any] | None:
 class ChatMessage(BaseModel):
     role: str
     content: Any = ""
+    # Accepted so tool context survives a round-trip. EmuLLM never executes a
+    # tool; these only carry prior tool-call/result text into the relay prompt.
+    tool_calls: Any = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class ChatRequest(BaseModel):
     model: str = _DEFAULT_MODEL_ID
     messages: list[ChatMessage] = Field(default_factory=list)
     required_capabilities: list[str] = Field(default_factory=list, max_length=32)
+    # Accepted for OpenAI tool-calling. EmuLLM asks the worker to act as a plain
+    # tool-calling model and EMIT tool calls (never run them); any calls are
+    # returned to the client, which executes them in its own harness.
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     stream: bool = False
 
@@ -6558,11 +6568,121 @@ def storage_delete(rel_path: str) -> dict[str, Any]:
     return {"deleted": rel_path}
 
 
+_TOOL_RELAY_PREAMBLE = (
+    "You are acting purely as an OpenAI-compatible tool-calling MODEL endpoint. "
+    "You are NOT an autonomous agent, a coding assistant, or a Codex/Copilot "
+    "framework: never run commands, edit files, browse, or take any action "
+    "yourself. Your only job is to reason about the conversation and, when a tool "
+    "is required, EMIT the tool call so the CLIENT can execute it on its side.\n\n"
+    "Tools you may call:\n{tools}\n\n"
+    "When you want to call one or more tools, reply with ONLY this JSON object and "
+    "nothing else -- no prose, no explanation, no markdown code fences:\n"
+    '{{"tool_calls": [{{"name": "<tool_name>", "arguments": {{<json args>}}}}]}}\n'
+    "You may include multiple entries to call several tools at once. If you do NOT "
+    "need a tool, reply normally with your final answer text."
+)
+
+
+def _describe_tools_for_prompt(tools: Any) -> str:
+    lines: list[str] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = fn.get("name")
+        if not name:
+            continue
+        description = fn.get("description") or ""
+        params = fn.get("parameters") or {"type": "object", "properties": {}}
+        lines.append(f"- {name}: {description}\n  arguments JSON schema: {json.dumps(params, ensure_ascii=False)}")
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _build_tool_relay_prompt(body: "ChatRequest") -> str:
+    """Serialize the conversation for a worker asked to behave as a tool-calling model.
+
+    Includes the tool protocol preamble, the tool catalog, and the transcript --
+    with prior assistant tool_calls and tool results rendered as text so the
+    worker has the full loop context.
+    """
+
+    parts = [_TOOL_RELAY_PREAMBLE.format(tools=_describe_tools_for_prompt(body.tools))]
+    for message in body.messages:
+        content = _flatten_content(message.content)
+        calls = message.tool_calls
+        if calls:
+            rendered = []
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") if isinstance(call.get("function"), dict) else call
+                rendered.append(f"{fn.get('name')}({fn.get('arguments') or '{}'})")
+            parts.append(f"[assistant tool_call] {'; '.join(rendered)}".rstrip())
+        elif message.role == "tool":
+            label = message.tool_call_id or message.name or ""
+            parts.append(f"[tool result {label}] {content}".replace("  ", " "))
+        else:
+            parts.append(f"[{message.role}] {content}")
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _extract_tool_calls_from_text(text: str) -> list[dict[str, str]] | None:
+    """Pull a ``{"tool_calls": [...]}`` envelope out of a worker's text reply.
+
+    Lenient: tolerates surrounding prose and ```json fences. Returns a list of
+    ``{"name", "arguments"}`` (arguments as a JSON string) or None.
+    """
+
+    if not text or "tool_call" not in text:
+        return None
+    scan = text.strip()
+    start = scan.find("{")
+    while start != -1:
+        depth = 0
+        for index in range(start, len(scan)):
+            char = scan[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = scan[start:index + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except (ValueError, TypeError):
+                        break
+                    calls = parsed.get("tool_calls") if isinstance(parsed, dict) else None
+                    if isinstance(calls, list) and calls:
+                        normalized: list[dict[str, str]] = []
+                        for call in calls:
+                            if not isinstance(call, dict):
+                                continue
+                            fn = call.get("function") if isinstance(call.get("function"), dict) else call
+                            name = fn.get("name")
+                            args = fn.get("arguments")
+                            if isinstance(args, (dict, list)):
+                                args = json.dumps(args, ensure_ascii=False)
+                            elif args is None:
+                                args = "{}"
+                            elif not isinstance(args, str):
+                                args = json.dumps(args)
+                            if name:
+                                normalized.append({"name": str(name), "arguments": args})
+                        return normalized or None
+                    break
+        start = scan.find("{", start + 1)
+    return None
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatRequest) -> Any:
     if not body.messages:
         raise HTTPException(status_code=400, detail="messages is required")
-    prompt_text = "\n\n".join(f"[{m.role}] {_flatten_content(m.content)}" for m in body.messages)
+    tool_mode = bool(body.tools)
+    if tool_mode:
+        prompt_text = _build_tool_relay_prompt(body)
+    else:
+        prompt_text = "\n\n".join(f"[{m.role}] {_flatten_content(m.content)}" for m in body.messages)
     images: list[str] = []
     audio_inputs: list[tuple[str, str]] = []
     for m in body.messages:
@@ -6599,6 +6719,26 @@ async def chat_completions(body: ChatRequest) -> Any:
         "completion_tokens": _token_count(reply_text),
     }
     usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+
+    # In tool mode, the worker was asked to EMIT tool calls (never run them).
+    # If it did, surface them as real OpenAI tool_calls so the client can run
+    # them; otherwise fall through to a normal text answer.
+    tool_calls = _extract_tool_calls_from_text(reply_text) if tool_mode else None
+    if tool_calls:
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": _new_resource_id("call"), "type": "function",
+                 "function": {"name": call["name"], "arguments": call["arguments"]}}
+                for call in tool_calls
+            ],
+        }
+        finish_reason = "tool_calls"
+    else:
+        assistant_message = {"role": "assistant", "content": reply_text}
+        finish_reason = "stop"
+
     result = {
         "id": completion_id,
         "object": "chat.completion",
@@ -6607,8 +6747,8 @@ async def chat_completions(body: ChatRequest) -> Any:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": reply_text},
-                "finish_reason": "stop",
+                "message": assistant_message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": usage,
@@ -6617,27 +6757,33 @@ async def chat_completions(body: ChatRequest) -> Any:
         return result
 
     async def events() -> Any:
+        first_delta = {"role": "assistant"}
+        second_delta = (
+            {"tool_calls": assistant_message["tool_calls"]}
+            if finish_reason == "tool_calls"
+            else {"content": reply_text}
+        )
         chunks = [
             {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": body.model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                "choices": [{"index": 0, "delta": first_delta, "finish_reason": None}],
             },
             {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": body.model,
-                "choices": [{"index": 0, "delta": {"content": reply_text}, "finish_reason": None}],
+                "choices": [{"index": 0, "delta": second_delta, "finish_reason": None}],
             },
             {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": body.model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             },
         ]
         for chunk in chunks:
