@@ -18,6 +18,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from . import codex_api as _codex
 from . import copilot_api as _copilot
 from . import supervisor as _sup
 from .api import router as emullm_router
@@ -47,6 +48,7 @@ async def _lifespan(app: FastAPI):
     modes = _api._current_modes()
     supervisor = None
     copilot_manager = None
+    codex_manager = None
     mock_worker_ids: list[str] = []
 
     mock_workers = config.get("mock_workers")
@@ -85,6 +87,18 @@ async def _lifespan(app: FastAPI):
         connected=lambda worker_id: worker_id in _api._connected_workers,
     )
     _copilot.set_manager(copilot_manager)
+    codex_definitions = config.get("headless_codexes")
+    if codex_definitions is not None and not isinstance(codex_definitions, list):
+        raise ValueError("config headless_codexes must be a list")
+    codex_manager = _codex.CodexInstanceManager(
+        config_path=_api._CONFIG_PATH,
+        runtime_dir=_api._RUNTIME_DIR / "headless_codexes",
+        base_dir=_api._PLUGIN_ROOT,
+        default_host_ws_url=os.environ.get("EMULLM_HOST_WS_URL", "ws://127.0.0.1:8801"),
+        definitions=codex_definitions or [],
+        connected=lambda worker_id: worker_id in _api._connected_workers,
+    )
+    _codex.set_manager(codex_manager)
     idle_worker_task: asyncio.Task[None] | None = None
     restart_reconcile_task: asyncio.Task[None] | None = None
     try:
@@ -99,9 +113,13 @@ async def _lifespan(app: FastAPI):
                 started = await asyncio.to_thread(
                     copilot_manager.start_autostart
                 )
+                started_codex = await asyncio.to_thread(
+                    codex_manager.start_autostart
+                )
                 print(
                     "[emullm] restart handoff: preserved connected servants; "
-                    f"started missing: {', '.join(started) or '(none)'}",
+                    f"started missing copilots: {', '.join(started) or '(none)'}; "
+                    f"codexes: {', '.join(started_codex) or '(none)'}",
                     flush=True,
                 )
 
@@ -117,6 +135,15 @@ async def _lifespan(app: FastAPI):
             print(
                 f"[emullm] started {len(started_copilots)} headless Copilot servant(s): "
                 f"{', '.join(started_copilots) or '(none)'}",
+                flush=True,
+            )
+        started_codexes = (
+            [] if restart_handoff else codex_manager.start_autostart()
+        )
+        if codex_definitions:
+            print(
+                f"[emullm] started {len(started_codexes)} headless Codex servant(s): "
+                f"{', '.join(started_codexes) or '(none)'}",
                 flush=True,
             )
         yield
@@ -141,6 +168,18 @@ async def _lifespan(app: FastAPI):
                             )
                 copilot_manager.stop_all()
             _copilot.set_manager(None)
+        if codex_manager is not None:
+            if not _api._process_control.restart_in_progress():
+                for instance in codex_manager.list():
+                    worker_id = str(instance["worker_id"])
+                    if instance.get("connected"):
+                        with contextlib.suppress(Exception):
+                            await _api._shutdown_connected_worker(
+                                worker_id,
+                                "server shutdown",
+                            )
+                codex_manager.stop_all()
+            _codex.set_manager(None)
         if supervisor is not None:
             supervisor.stop_all()
             _sup.set_supervisor(None)

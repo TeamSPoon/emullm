@@ -169,6 +169,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.datastructures import UploadFile
 
+from . import codex_api as _codex_api
 from . import copilot_api as _copilot_api
 from . import paths as _paths
 from . import process_control as _process_control
@@ -10013,6 +10014,7 @@ def admin_state() -> dict[str, Any]:
         if request["age_seconds"] >= _STUCK_WORKER_SECONDS
     ]
     headless_copilots = _copilot_api.manager_status()
+    headless_codexes = _codex_api.manager_status()
     connection_errors = []
     for instance in headless_copilots:
         runtime = instance.get("runtime")
@@ -10124,6 +10126,7 @@ def admin_state() -> dict[str, Any]:
         },
         "managed_workers": _sup.get_supervisor().status() if _sup.get_supervisor() else [],
         "headless_copilots": headless_copilots,
+        "headless_codexes": headless_codexes,
         "active_websockets": _active_websocket_rows(),
         "backend": (
             {"name": _b.get("name"), "base_url": _b.get("base_url"), "model": _b.get("model")}
@@ -10734,6 +10737,7 @@ class EmullmConfig(BaseModel):
     # legacy flat forms (still honored by the runtime today):
     workers: list[WorkerConfig] | None = None
     headless_copilots: list[_copilot_api.HeadlessCopilotConfig] | None = None
+    headless_codexes: list[_codex_api.HeadlessCodexConfig] | None = None
     anti_idle: _copilot_api.AntiIdleConfig | None = None
     mock_workers: list[MockWorkerConfig] | None = None
     backends: list[BackendConfig] | None = None
@@ -13212,6 +13216,62 @@ _ADMIN_PAGE_HTML = """<!doctype html>
 </div>
 </section>
 
+<section class="panel" id="codexes">
+<h2>Headless Codex workers <button id="refresh-codexes" type="button">Refresh</button>
+  <span id="codex-note" class="muted"></span></h2>
+<p class="sub">Each servant connects to <code>/emullm/ws</code> as a <code>worker-codex-*</code>
+  worker and answers every relayed request by running <code>codex exec</code> once in its own
+  isolated <code>CODEX_HOME</code> + workspace against the configured model / base URL. The full
+  agentic Codex harness (its own tools) produces the answer; EMULLM only relays it. Route to these
+  via the <code>worker-codex-*</code> target or by worker-in-name.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Worker</th><th>Model / base URL</th><th>Sandbox</th><th>State</th><th>Actions</th></tr></thead>
+  <tbody id="codexes-body"><tr><td colspan="5" class="muted">loading...</td></tr></tbody>
+</table>
+</div>
+<details id="codex-editor">
+  <summary id="codex-editor-title">Add headless Codex worker</summary>
+  <form id="codex-form">
+    <div class="form-grid">
+      <label>Worker ID<input id="cx-worker-id" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" maxlength="128"></label>
+      <label>Model<input id="cx-model" placeholder="e.g. gpt-5.3-codex or a LAN model id"></label>
+      <label>Backing base URL<input id="cx-base-url" placeholder="http://127.0.0.1:1234/v1 (blank = existing CODEX_HOME login)"></label>
+      <label>Wire API
+        <select id="cx-wire-api"><option value="responses">responses</option><option value="chat">chat</option></select>
+      </label>
+      <label>Handled model masks<input id="cx-modelmasks" placeholder="*codex*,router/*"></label>
+      <label>Sandbox mode
+        <select id="cx-sandbox">
+          <option value="workspace-write">workspace-write</option>
+          <option value="read-only">read-only</option>
+          <option value="danger-full-access">danger-full-access</option>
+        </select>
+      </label>
+      <label>Working directory<input id="cx-cwd" placeholder="runtime-managed workspace"></label>
+      <label>Relay WebSocket base<input id="cx-host-ws-url" placeholder="ws://127.0.0.1:8801"></label>
+      <label>Env key for API key<input id="cx-env-key" value="CODEX_API_KEY"></label>
+      <label>API key value<input id="cx-api-key" placeholder="emullm-local"></label>
+      <label>Provider id<input id="cx-provider-id" value="lan"></label>
+      <label>Codex entry override<input id="cx-codex-entry" placeholder="auto-detect codex_cli plugin"></label>
+      <label>Reply timeout (seconds)<input id="cx-reply-timeout" type="number" min="5" max="86400" value="1800"></label>
+      <label>Idle timeout (seconds)<input id="cx-idle-timeout" type="number" min="1" max="600" value="15"></label>
+      <label>Extra codex -c overrides<input id="cx-extra-config" placeholder="model_reasoning_effort=high, disable_response_storage=true"></label>
+    </div>
+    <label for="codex-prompt" style="display:block;margin-top:0.7rem;color:#888;font-size:0.8rem">System prompt</label>
+    <textarea id="codex-prompt" spellcheck="false"></textarea>
+    <div class="checks">
+      <label><input id="cx-autostart" type="checkbox" checked> autostart with EMULLM</label>
+      <label><input id="cx-full-auto" type="checkbox" checked> full-auto (bypass approvals &amp; sandbox, unattended)</label>
+      <label><input id="cx-ephemeral" type="checkbox"> ephemeral (do not persist codex sessions)</label>
+    </div>
+    <button type="submit">Save configuration</button>
+    <button id="codex-new" type="button">Create new worker</button>
+    <span id="codex-msg" class="msg"></span>
+  </form>
+</details>
+</section>
+
 <section class="panel" id="model-configurator">
 <h2>Models configurator <button id="model-config-refresh" type="button">Pull /v1/models</button></h2>
 <p class="sub">Edit any live <code>/v1/models</code> record, hide/export it, change media and
@@ -13575,7 +13635,7 @@ field('carol-enabled').addEventListener('change', async () => {
   });
   field('carol-note').textContent = r.ok ? (enabled ? 'enabled and registered' : 'disabled') :
     ('update failed (' + r.status + ')');
-  await Promise.all([refreshConfiguredAgents(), refreshWorkers(), refreshCopilots(), loadConfig()]);
+  await Promise.all([refreshConfiguredAgents(), refreshWorkers(), refreshCopilots(), refreshCodexes(), loadConfig()]);
 });
 
 function setBackendMsg(text, cls) {
@@ -14494,6 +14554,132 @@ field('copilot-form').addEventListener('submit', async (event) => {
 function configSectionDefault(section) {
   return CONFIG_SECTIONS[section][1] === 'array' ? [] : {};
 }
+let codexInstances = [];
+let editingCodex = null;
+let codexSuggestedId = 'worker-codex-1';
+function setCodexMsg(text, cls) { const el = field('codex-msg'); if (el) { el.textContent = text; el.className = 'msg ' + (cls || ''); } }
+function codexCsv(v) { return String(v || '').split(',').map(s => s.trim()).filter(Boolean); }
+function codexConfigFromForm() {
+  const config = {
+    worker_id: field('cx-worker-id').value.trim(),
+    modelmasks: codexCsv(field('cx-modelmasks').value),
+    sandbox_mode: field('cx-sandbox').value,
+    wire_api: field('cx-wire-api').value,
+    provider_id: field('cx-provider-id').value.trim() || 'lan',
+    env_key: field('cx-env-key').value.trim() || 'CODEX_API_KEY',
+    autostart: field('cx-autostart').checked,
+    full_auto: field('cx-full-auto').checked,
+    ephemeral: field('cx-ephemeral').checked,
+    extra_config: codexCsv(field('cx-extra-config').value),
+  };
+  const model = field('cx-model').value.trim(); if (model) config.model = model;
+  const baseUrl = field('cx-base-url').value.trim(); if (baseUrl) config.base_url = baseUrl;
+  const cwd = field('cx-cwd').value.trim(); if (cwd) config.cwd = cwd;
+  const hostWs = field('cx-host-ws-url').value.trim(); if (hostWs) config.host_ws_url = hostWs;
+  const apiKey = field('cx-api-key').value.trim(); if (apiKey) config.api_key = apiKey;
+  const entry = field('cx-codex-entry').value.trim(); if (entry) config.codex_entry = entry;
+  const prompt = field('codex-prompt').value.trim(); if (prompt) config.system_prompt = prompt;
+  const replyTimeout = field('cx-reply-timeout').value; if (replyTimeout !== '') config.reply_timeout_seconds = Number(replyTimeout);
+  const idleTimeout = field('cx-idle-timeout').value; if (idleTimeout !== '') config.idle_timeout_seconds = Number(idleTimeout);
+  return config;
+}
+function resetCodexForm() {
+  editingCodex = null;
+  field('codex-form').reset();
+  field('cx-env-key').value = 'CODEX_API_KEY';
+  field('cx-provider-id').value = 'lan';
+  field('cx-autostart').checked = true;
+  field('cx-full-auto').checked = true;
+  field('codex-editor-title').textContent = 'Add headless Codex worker';
+  if (codexSuggestedId) field('cx-worker-id').value = codexSuggestedId;
+}
+function editCodex(cfg) {
+  cfg = cfg || {};
+  editingCodex = cfg.worker_id || null;
+  field('cx-worker-id').value = cfg.worker_id || '';
+  field('cx-model').value = cfg.model || '';
+  field('cx-base-url').value = cfg.base_url || '';
+  field('cx-wire-api').value = cfg.wire_api || 'responses';
+  field('cx-modelmasks').value = (cfg.modelmasks || []).join(', ');
+  field('cx-sandbox').value = cfg.sandbox_mode || 'workspace-write';
+  field('cx-cwd').value = cfg.cwd || '';
+  field('cx-host-ws-url').value = cfg.host_ws_url || '';
+  field('cx-env-key').value = cfg.env_key || 'CODEX_API_KEY';
+  field('cx-api-key').value = cfg.api_key || '';
+  field('cx-provider-id').value = cfg.provider_id || 'lan';
+  field('cx-codex-entry').value = cfg.codex_entry || '';
+  field('cx-reply-timeout').value = cfg.reply_timeout_seconds != null ? cfg.reply_timeout_seconds : 1800;
+  field('cx-idle-timeout').value = cfg.idle_timeout_seconds != null ? cfg.idle_timeout_seconds : 15;
+  field('cx-extra-config').value = (cfg.extra_config || []).join(', ');
+  field('codex-prompt').value = cfg.system_prompt || '';
+  field('cx-autostart').checked = cfg.autostart !== false;
+  field('cx-full-auto').checked = cfg.full_auto !== false;
+  field('cx-ephemeral').checked = !!cfg.ephemeral;
+  field('codex-editor-title').textContent = 'Edit ' + (cfg.worker_id || 'headless Codex worker');
+  field('codex-editor').open = true;
+}
+async function refreshCodexes() {
+  const r = await getJSON(ADMIN + '/codexes', { cache: 'no-store' });
+  const tbody = field('codexes-body');
+  const note = field('codex-note');
+  codexInstances = (r.body && r.body.instances) || [];
+  codexSuggestedId = (r.body && r.body.next_worker_id) || 'worker-codex-1';
+  if (!editingCodex) field('cx-worker-id').value = codexSuggestedId;
+  if (note) note.textContent = !r.body.manager_active ? '(manager unavailable)' :
+    (r.body.codex_available ? ('Codex: ' + ((r.body.codex_launch && r.body.codex_launch.launch) || 'available')) : '(Codex CLI not found - install via codex_cli plugin)');
+  if (!codexInstances.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">none configured</td></tr>';
+    return;
+  }
+  tbody.innerHTML = codexInstances.map(item => {
+    const runtime = item.runtime || {};
+    const state = item.connected ? 'connected' : (item.running ? 'starting / reconnecting' : 'stopped');
+    const online = item.running || item.connected;
+    const masks = (item.modelmasks || []).length ? item.modelmasks.join(', ') : 'all API models';
+    return '<tr><td><span class="dot ' + (item.running ? 'on' : 'off') + '"></span><b>' + esc(item.worker_id) + '</b></td>' +
+      '<td>' + esc(item.model || '(codex default)') + '<br><span class="muted">' + esc(item.base_url || 'CODEX_HOME login') + '</span><br><span class="muted">' + esc(masks) + '</span></td>' +
+      '<td>' + esc(item.full_auto ? 'full-auto' : (item.sandbox_mode || 'workspace-write')) + '</td>' +
+      '<td>' + esc(state) + (item.pid ? (' \u00b7 pid ' + item.pid) : '') + (runtime.requests ? ('<br>' + runtime.requests + ' req') : '') + '</td>' +
+      '<td><button data-cx-act="edit" data-id="' + esc(item.worker_id) + '">Edit</button>' +
+      '<button data-cx-act="start" data-id="' + esc(item.worker_id) + '"' + (online ? ' disabled' : '') + '>Start</button>' +
+      '<button data-cx-act="stop" data-id="' + esc(item.worker_id) + '"' + (!online ? ' disabled' : '') + '>Stop</button>' +
+      '<button data-cx-act="restart" data-id="' + esc(item.worker_id) + '"' + (!online ? ' disabled' : '') + '>Restart</button>' +
+      '<button data-cx-act="delete" data-id="' + esc(item.worker_id) + '">Delete</button>' +
+      '<a class="action-link" href="' + ADMIN + '/codexes/' + encodeURIComponent(item.worker_id) + '/log" target="_blank">log</a></td></tr>';
+  }).join('');
+}
+if (field('refresh-codexes')) field('refresh-codexes').addEventListener('click', refreshCodexes);
+if (field('codex-new')) field('codex-new').addEventListener('click', () => { resetCodexForm(); field('codex-editor').open = true; field('cx-worker-id').focus(); });
+if (field('codexes-body')) field('codexes-body').addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-cx-act]'); if (!button) return;
+  const action = button.dataset.cxAct;
+  const id = button.dataset.id;
+  const item = codexInstances.find(candidate => candidate.worker_id === id);
+  if (action === 'edit') { editCodex((item && item.config) || {}); return; }
+  if (action === 'delete') {
+    if (!confirm('Delete headless Codex worker ' + id + '? Logs are retained.')) return;
+    await getJSON(ADMIN + '/codexes/' + encodeURIComponent(id), { method: 'DELETE' });
+  } else {
+    await getJSON(ADMIN + '/codexes/' + encodeURIComponent(id) + '/' + action, { method: 'POST' });
+  }
+  await refreshCodexes(); await loadConfig();
+});
+if (field('codex-form')) field('codex-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const config = codexConfigFromForm();
+  if (!config.worker_id) { setCodexMsg('worker ID is required', 'err'); return; }
+  const path = editingCodex
+    ? ADMIN + '/codexes/' + encodeURIComponent(editingCodex) + '?restart=true'
+    : ADMIN + '/codexes?start=true';
+  const r = await getJSON(path, {
+    method: editingCodex ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  const detail = r.body && r.body.detail;
+  setCodexMsg(r.ok ? 'saved and active' : ('save failed: ' + (typeof detail === 'string' ? detail : JSON.stringify(detail || r.status))), r.ok ? 'ok' : 'err');
+  if (r.ok) { editCodex(r.body.config); await refreshCodexes(); await loadConfig(); }
+});
 function configSectionSummary(value) {
   if (Array.isArray(value)) return value.length;
   if (value && typeof value === 'object') return Object.keys(value).length;
@@ -16013,5 +16199,9 @@ async def _handle_worker_message(
 
 router.include_router(
     _copilot_api.router,
+    dependencies=[Depends(_require_local_process_control)],
+)
+router.include_router(
+    _codex_api.router,
     dependencies=[Depends(_require_local_process_control)],
 )

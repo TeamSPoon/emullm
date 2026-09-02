@@ -206,6 +206,36 @@ This follows the plugin convention: `GET /<prefix>` is the primary admin UI,
 while `GET /<prefix>/admin` is the unambiguous explicit alias used by plugin
 API metadata.
 
+## Headless Codex workers
+
+The same admin console has a **Headless Codex workers** panel (and a matching
+`/emullm/admin/codexes` REST API) that lets the relay launch OpenAI **Codex
+CLI** processes as `worker-codex-*` workers -- the Codex counterpart to the
+headless Copilot servants. Each Codex worker:
+
+- connects to the shared `WS /emullm/ws` worker endpoint and registers with
+  `worker_kind: "headless-codex"` (so it is routable via the `worker-codex-*`
+  target and by worker-in-name);
+- answers every relayed request by running `codex exec` **once**,
+  non-interactively, in its own isolated `CODEX_HOME` and workspace -- the full
+  agentic Codex harness (its own shell/file tools) produces the answer, and the
+  relay only relays it (EMULLM never executes anything itself);
+- points Codex at any OpenAI-compatible model you configure via `base_url` +
+  `model` + `wire_api` (written into `CODEX_HOME/config.toml`); leave `base_url`
+  blank to reuse an existing `CODEX_HOME` login unchanged;
+- runs unattended by default (`full_auto` -> `codex exec
+  --dangerously-bypass-approvals-and-sandbox`); disable it to enforce a
+  `sandbox_mode` (`read-only` / `workspace-write` / `danger-full-access`);
+- honours the same tool-relay contract as other workers: if a request lists the
+  caller's tools, the Codex worker emits the tool-call envelope for the caller
+  to run rather than executing the caller's tools itself;
+- persists its configuration under `headless_codexes` in `config.json` and
+  writes output to `runtime/headless_codexes/<worker_id>/servant.log`.
+
+The Codex CLI binary is auto-discovered from the sibling `codex_cli` workbench
+plugin's vendored install (`node_modules/@openai/codex/bin/codex.js`), or from a
+native `codex` on `PATH`, or an explicit `codex_entry`/`codex_command` override.
+
 The admin and status dashboards poll every three seconds only while visible.
 Their persisted polling policy can run continuously or automatically pause
 after one, two (the default), or five minutes. **Wake / refresh** starts a new
@@ -876,6 +906,7 @@ types and per-service fallbacks offline.
 | `services` | object | Server-level catalog: `model` (default) + `models` (advertised list) + per-service `{ fallback, description }` entries overriding `capability_fallback`. |
 | `agents` | list | The unified answerer list (below); set `enabled: false` to retain but disable an entry. |
 | `headless_copilots` | list | Persistent-session Copilot CLI servants managed live through the admin GUI/API. |
+| `headless_codexes` | list | Non-interactive OpenAI Codex CLI workers (`worker-codex-*`) managed live through the admin GUI/API; each answers by running `codex exec` per request. |
 | `anti_idle` | object | Shared `{enabled, interval_seconds, timeout_seconds, slow_budget_seconds, prompts}` scheduler configuration. Starts with 50 editable/deprecatable conversational prompts and may grow to 1,000. |
 | `codex_suppliers` | list | Codex model/worker provider declarations. The working config enables GitHub Copilot with `worker-copilot-*`, `copilot/`, and `*codex*` mappings. |
 | `subagent_launch` | string / argv | Worker type for discovered subagents (`copilot`/`worker`/`recruit`/argv). |
