@@ -3529,11 +3529,21 @@ def _flatten_content(content: Any) -> str:
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
-            if isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 parts.append(item)
-        return "\n".join(parts)
+            elif isinstance(item, dict):
+                # OpenAI chat parts carry a top-level {"type": "...", "text": ...};
+                # Responses API items (as sent by Codex) instead nest the text in
+                # a "content" list, e.g. {"role": "user", "content":
+                # [{"type": "input_text", "text": ...}]}. Descend into that so the
+                # nested prompt text is not silently dropped.
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif isinstance(item.get("content"), (list, str)):
+                    nested = _flatten_content(item["content"])
+                    if nested:
+                        parts.append(nested)
+        return "\n".join(part for part in parts if part)
     return str(content)
 
 
@@ -4366,8 +4376,16 @@ class CompletionRequest(BaseModel):
 
 
 class ResponsesRequest(BaseModel):
+    # ``tools``/``tool_choice`` are accepted for OpenAI /v1 wire compliance and
+    # relayed as context only. EmuLLM is a relay: it NEVER executes a tool. Any
+    # tool-call a model emits is passed back to the client verbatim, so tools run
+    # in the client's harness (e.g. the Codex CLI, in its local workspace) --
+    # never on the EmuLLM server.
     model: str = _DEFAULT_MODEL_ID
     input: Any = ""
+    instructions: Any = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     stream: bool = False
 
@@ -6756,6 +6774,9 @@ async def completions(body: CompletionRequest) -> Any:
 @router.post("/v1/responses")
 async def responses(body: ResponsesRequest) -> Any:
     prompt_text = _flatten_content(body.input)
+    instructions = _flatten_content(body.instructions) if body.instructions else ""
+    if instructions:
+        prompt_text = f"{instructions}\n\n{prompt_text}".strip() if prompt_text else instructions
     if not prompt_text:
         raise HTTPException(status_code=400, detail="input is required")
     reply_text = await _relay(body.model, prompt_text)
@@ -6780,7 +6801,7 @@ async def responses(body: ResponsesRequest) -> Any:
                 "type": "message",
                 "role": "assistant",
                 "status": "completed",
-                "content": [{"type": "output_text", "text": reply_text}],
+                "content": [{"type": "output_text", "text": reply_text, "annotations": []}],
             }
         ],
         "usage": usage,
@@ -6789,23 +6810,48 @@ async def responses(body: ResponsesRequest) -> Any:
         return result
 
     async def events() -> Any:
+        # Emit the full OpenAI Responses streaming sequence. Clients such as the
+        # Codex CLI build their output from output_item.added/content_part.added
+        # before applying output_text.delta, and validate a monotonic
+        # sequence_number -- a minimal created/delta/completed stream leaves the
+        # delta with no item to attach to, so the reply is dropped.
+        seq = 0
+
+        def frame(event_type: str, payload: dict[str, Any]) -> str:
+            nonlocal seq
+            data = {**payload, "type": event_type, "sequence_number": seq}
+            seq += 1
+            return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
         started = {**result, "status": "in_progress", "output": [], "output_text": ""}
-        frames = [
-            ("response.created", {"type": "response.created", "response": started}),
-            (
-                "response.output_text.delta",
-                {
-                    "type": "response.output_text.delta",
-                    "item_id": output_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": reply_text,
-                },
-            ),
-            ("response.completed", {"type": "response.completed", "response": result}),
-        ]
-        for event_name, data in frames:
-            yield f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        opening_item = {
+            "id": output_id, "type": "message", "role": "assistant",
+            "status": "in_progress", "content": [],
+        }
+        done_item = {
+            "id": output_id, "type": "message", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": reply_text, "annotations": []}],
+        }
+        yield frame("response.created", {"response": started})
+        yield frame("response.in_progress", {"response": started})
+        yield frame("response.output_item.added", {"output_index": 0, "item": opening_item})
+        yield frame("response.content_part.added", {
+            "item_id": output_id, "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+        })
+        yield frame("response.output_text.delta", {
+            "item_id": output_id, "output_index": 0, "content_index": 0, "delta": reply_text,
+        })
+        yield frame("response.output_text.done", {
+            "item_id": output_id, "output_index": 0, "content_index": 0, "text": reply_text,
+        })
+        yield frame("response.content_part.done", {
+            "item_id": output_id, "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": reply_text, "annotations": []},
+        })
+        yield frame("response.output_item.done", {"output_index": 0, "item": done_item})
+        yield frame("response.completed", {"response": result})
 
     return StreamingResponse(events(), media_type="text/event-stream")
 
